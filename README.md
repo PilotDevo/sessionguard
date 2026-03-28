@@ -257,7 +257,7 @@ SessionGuard is built and maintained by [Droco](https://droco.dev). If you find 
 
 - **Star the repo** — It helps with visibility
 - **Contribute** — Code, tool patterns, bug reports, and docs are all welcome
-- **Sponsor** — [GitHub Sponsors](https://github.com/sponsors/PilotDevo) (coming soon)
+- **Sponsor** — [GitHub Sponsors](https://github.com/sponsors/PilotDevo)
 - **Share** — Tell other developers about SessionGuard
 
 ## FAQ
