@@ -1,3 +1,0 @@
-[   56428ms] [ERROR] Failed to load resource: the server responded with a status of 429 () @ https://github.com/search?q=repo%3APilotDevo%2Fsessionguard++language%3AJust:0
-[   56429ms] [ERROR] p @ https://github.githubassets.com/assets/26533-be3434b1ad736595.js:15
-[   56430ms] [WARNING] A matching frame for #repo-content-turbo-frame was missing from the response, transforming into full-page Visit. @ https://github.githubassets.com/assets/26533-be3434b1ad736595.js:15
