@@ -43,7 +43,7 @@ jobs:
           tar czf ../../../sessionguard-${{ matrix.target }}.tar.gz ${{ matrix.binary }}
 
       - name: Upload artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: sessionguard-${{ matrix.target }}
           path: sessionguard-${{ matrix.target }}.tar.gz
