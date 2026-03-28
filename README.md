@@ -286,6 +286,6 @@ MIT — see [LICENSE](LICENSE).
 
 ---
 
-**Built by [Droco](https://droco.dev) — sovereign infrastructure for builders who ship.**
+**Built by [Droco](https://droco.io) — sovereign infrastructure for builders who ship.**
 
 *SessionGuard is not affiliated with or endorsed by any of the AI tool vendors listed above.*
