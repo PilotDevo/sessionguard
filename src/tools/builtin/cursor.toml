@@ -1,0 +1,17 @@
+[tool]
+name = "cursor"
+display_name = "Cursor"
+version = "1.0"
+on_move = "rewrite_paths"
+
+session_patterns = [
+  ".cursor/",
+  ".cursorignore",
+  ".cursorindexingignore",
+  ".cursor/rules/",
+]
+
+[[tool.path_fields]]
+file = ".cursor/state.json"
+field = "project_root"
+format = "json"

@@ -1,0 +1,28 @@
+# Rust build artifacts
+/target/
+**/*.rs.bk
+
+# Cargo lock for binaries (we want this tracked)
+# Cargo.lock — tracked intentionally for reproducible builds
+
+# Editor/IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# Environment
+.env
+.env.*
+
+# Coverage
+*.profraw
+*.profdata
+lcov.info
+coverage/
+tarpaulin-report.html
+
+# OS
+Thumbs.db

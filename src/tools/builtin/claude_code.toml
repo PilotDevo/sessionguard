@@ -1,0 +1,16 @@
+[tool]
+name = "claude_code"
+display_name = "Claude Code"
+version = "1.0"
+on_move = "rewrite_paths"
+
+session_patterns = [
+  ".claude/",
+  "CLAUDE.md",
+  ".claudeignore",
+]
+
+[[tool.path_fields]]
+file = ".claude/settings.json"
+field = "project_path"
+format = "json"
