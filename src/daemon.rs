@@ -6,7 +6,7 @@
 use std::path::PathBuf;
 
 use tokio::signal;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::config::Config;
 use crate::error::{Error, Result};
@@ -74,9 +74,9 @@ pub async fn run(config: &Config) -> Result<()> {
     info!("daemon started (PID {})", std::process::id());
 
     // Initialize subsystems
-    let _tool_registry = crate::tools::ToolRegistry::new()?;
-    let _registry = crate::registry::Registry::open_default()?;
-    let _event_log = crate::event_log::EventLog::open_default()?;
+    let tool_registry = crate::tools::ToolRegistry::new()?;
+    let registry = crate::registry::Registry::open_default()?;
+    let event_log = crate::event_log::EventLog::open_default()?;
 
     // Start filesystem watcher
     let mut watcher = crate::watcher::FsWatcher::new(&config.watch_roots, &config.watch_mode)?;
@@ -91,7 +91,7 @@ pub async fn run(config: &Config) -> Result<()> {
         tokio::select! {
             Some(event) = watcher.events.recv() => {
                 tracing::debug!(?event, "received filesystem event");
-                // TODO: dispatch to detector → reconciler pipeline
+                handle_session_event(event, &registry, &tool_registry, &event_log);
             }
             _ = shutdown_signal() => {
                 info!("shutdown signal received");
@@ -103,6 +103,76 @@ pub async fn run(config: &Config) -> Result<()> {
     remove_pid_file()?;
     info!("daemon stopped");
     Ok(())
+}
+
+/// Dispatch a filesystem event through the detector → reconciler pipeline.
+fn handle_session_event(
+    event: crate::watcher::SessionEvent,
+    registry: &crate::registry::Registry,
+    tool_registry: &crate::tools::ToolRegistry,
+    event_log: &crate::event_log::EventLog,
+) {
+    use crate::watcher::SessionEvent;
+
+    match event {
+        SessionEvent::Moved {
+            from: Some(old_path),
+            to: Some(new_path),
+        } => {
+            info!(from = %old_path.display(), to = %new_path.display(), "project moved");
+
+            // Detect which AI tools have artifacts at the new location
+            let detected = crate::detector::detect_tools(&new_path, tool_registry);
+            if detected.is_empty() {
+                tracing::debug!("no AI session artifacts at new path, skipping");
+                return;
+            }
+
+            // Reconcile each detected tool
+            for detection in &detected {
+                if let Some(tool) = tool_registry.get(&detection.tool_name) {
+                    let result =
+                        crate::reconciler::reconcile(tool, &old_path, &new_path, event_log);
+                    if result.success {
+                        info!(
+                            tool = %detection.display_name,
+                            rewrites = result.actions_taken.len(),
+                            "reconciled session artifacts"
+                        );
+                    } else {
+                        warn!(
+                            tool = %detection.display_name,
+                            error = ?result.error,
+                            "reconciliation failed"
+                        );
+                    }
+                }
+            }
+
+            // Update registry: re-register under new path and drop old entry
+            match registry.register_project(&new_path) {
+                Ok(new_id) => {
+                    for detection in &detected {
+                        let _ = registry.add_artifact(new_id, &detection.tool_name, &new_path);
+                    }
+                }
+                Err(e) => warn!(error = %e, "failed to register new project path"),
+            }
+            if let Err(e) = registry.unregister_project(&old_path) {
+                tracing::debug!(error = %e, "could not remove old registry entry (may not have been watched)");
+            }
+        }
+        SessionEvent::Moved { .. } => {
+            // Partial move event — notify only emits both paths on some platforms
+            tracing::debug!("partial move event (missing from/to), skipping");
+        }
+        SessionEvent::Removed(path) => {
+            tracing::debug!(path = %path.display(), "path removed");
+        }
+        SessionEvent::Created(path) => {
+            tracing::debug!(path = %path.display(), "path created");
+        }
+    }
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).

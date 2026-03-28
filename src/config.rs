@@ -89,7 +89,12 @@ impl Config {
     }
 
     /// Default data directory: `~/.local/share/sessionguard/`.
+    ///
+    /// Overridable via `SESSIONGUARD_DATA_DIR` environment variable (used in tests).
     pub fn data_dir() -> PathBuf {
+        if let Ok(dir) = std::env::var("SESSIONGUARD_DATA_DIR") {
+            return PathBuf::from(dir);
+        }
         ProjectDirs::from("dev", "droco", "sessionguard")
             .map(|d| d.data_dir().to_owned())
             .unwrap_or_else(|| PathBuf::from(".sessionguard"))

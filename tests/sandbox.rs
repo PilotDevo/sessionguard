@@ -8,6 +8,14 @@ use predicates::prelude::*;
 use std::fs;
 use tempfile::TempDir;
 
+/// Build a `sessionguard` command with an isolated data directory so tests
+/// don't share (or pollute) the real user registry.
+fn cmd(data_dir: &std::path::Path) -> Command {
+    let mut c = Command::cargo_bin("sessionguard").unwrap();
+    c.env("SESSIONGUARD_DATA_DIR", data_dir);
+    c
+}
+
 /// Create a fake project with Claude Code artifacts.
 fn create_claude_project(root: &std::path::Path, name: &str) -> std::path::PathBuf {
     let project = root.join(name);
@@ -78,8 +86,7 @@ fn sandbox_scan_detects_tools() {
     create_cursor_project(sandbox.path(), "my-ts-app");
     create_plain_project(sandbox.path(), "no-ai-project");
 
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["scan", &sandbox.path().to_string_lossy()])
         .assert()
         .success()
@@ -95,8 +102,7 @@ fn sandbox_watch_registers_project() {
     let sandbox = TempDir::new().unwrap();
     let project = create_claude_project(sandbox.path(), "watched-project");
 
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["watch", &project.to_string_lossy()])
         .assert()
         .success()
@@ -110,15 +116,13 @@ fn sandbox_status_shows_watched() {
     let project = create_claude_project(sandbox.path(), "status-test");
 
     // Register it first
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["watch", &project.to_string_lossy()])
         .assert()
         .success();
 
     // Now check status
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .arg("status")
         .assert()
         .success()
@@ -131,8 +135,7 @@ fn sandbox_simulate_shows_affected_artifacts() {
     let project = create_claude_project(sandbox.path(), "sim-project");
     let dest = sandbox.path().join("sim-project-renamed");
 
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args([
             "simulate",
             "mv",
@@ -151,8 +154,7 @@ fn sandbox_simulate_no_artifacts() {
     let project = create_plain_project(sandbox.path(), "plain-project");
     let dest = sandbox.path().join("plain-renamed");
 
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args([
             "simulate",
             "mv",
@@ -170,8 +172,7 @@ fn sandbox_doctor_detects_stale_paths() {
     let project = create_claude_project(sandbox.path(), "doctor-test");
 
     // Register the project
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["watch", &project.to_string_lossy()])
         .assert()
         .success();
@@ -180,8 +181,7 @@ fn sandbox_doctor_detects_stale_paths() {
     fs::remove_dir_all(&project).unwrap();
 
     // Doctor should detect the stale path
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .arg("doctor")
         .assert()
         .success()
@@ -192,40 +192,36 @@ fn sandbox_doctor_detects_stale_paths() {
 #[test]
 fn sandbox_unwatch_removes_project() {
     let sandbox = TempDir::new().unwrap();
-    let project = create_claude_project(sandbox.path(), "unwatch-unique-xyz");
+    let project = create_claude_project(sandbox.path(), "unwatch-test");
     // canonicalize to match what `watch` stores (macOS /var → /private/var)
     let canonical = fs::canonicalize(&project).unwrap();
 
     // Watch it
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["watch", &project.to_string_lossy()])
         .assert()
         .success();
 
     // Verify it's registered
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("unwatch-unique-xyz"));
+        .stdout(predicate::str::contains("unwatch-test"));
 
     // Unwatch it using the canonical path
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["unwatch", &canonical.to_string_lossy()])
         .assert()
         .success()
         .stdout(predicate::str::contains("unwatched"));
 
-    // Status should no longer show this specific project
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    // Status should no longer show this project
+    cmd(sandbox.path())
         .arg("status")
         .assert()
         .success()
-        .stdout(predicate::str::contains("unwatch-unique-xyz").not());
+        .stdout(predicate::str::contains("unwatch-test").not());
 }
 
 #[test]
@@ -235,15 +231,13 @@ fn sandbox_export_import_round_trip() {
     let export_file = sandbox.path().join("export.json");
 
     // Watch the project
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["watch", &project.to_string_lossy()])
         .assert()
         .success();
 
     // Export
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["export", "-o", &export_file.to_string_lossy()])
         .assert()
         .success()
@@ -254,8 +248,7 @@ fn sandbox_export_import_round_trip() {
     assert!(content.contains("export-test"));
 
     // Import into a fresh state (the registry already has it, but import should not fail)
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["import", "-i", &export_file.to_string_lossy()])
         .assert()
         .success()
@@ -267,8 +260,7 @@ fn sandbox_scan_multi_tool_project() {
     let sandbox = TempDir::new().unwrap();
     create_multi_tool_project(sandbox.path(), "dual-tool");
 
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    cmd(sandbox.path())
         .args(["scan", &sandbox.path().to_string_lossy()])
         .assert()
         .success()
