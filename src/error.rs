@@ -29,8 +29,8 @@ pub enum Error {
     #[error("tool definition error: {0}")]
     ToolDefinition(String),
 
-    #[error("reconciliation failed for {project}: {reason}")]
-    Reconcile { project: PathBuf, reason: String },
+    #[error("reconciliation failed for {path}: {detail}")]
+    Reconcile { path: PathBuf, detail: String },
 
     #[error("daemon error: {0}")]
     Daemon(String),

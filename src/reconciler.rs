@@ -6,6 +6,9 @@
 //! When a project directory moves, the reconciler rewrites internal
 //! path references in AI tool session artifacts so tools can pick up
 //! where they left off.
+//!
+//! Adapters handle format-specific rewriting (JSON, TOML) with a
+//! fallback to plain string replacement for unknown formats.
 
 use std::path::Path;
 
@@ -13,7 +16,7 @@ use tracing::{debug, info, warn};
 
 use crate::error::Result;
 use crate::event_log::{EventLog, ReconcileAction};
-use crate::tools::{ReconcileStrategy, ToolDefinition};
+use crate::tools::{PathFieldSpec, ReconcileStrategy, ToolDefinition};
 
 /// Outcome of a single reconciliation operation.
 #[derive(Debug, Clone)]
@@ -78,7 +81,9 @@ fn rewrite_paths(
             continue;
         }
 
-        match rewrite_file(&artifact_path, &old_root_str, &new_root_str) {
+        let result = rewrite_field(&artifact_path, field_spec, &old_root_str, &new_root_str);
+
+        match result {
             Ok(changed) => {
                 if changed {
                     let action = ReconcileAction {
@@ -116,8 +121,139 @@ fn rewrite_paths(
     }
 }
 
+// ── Adapter dispatch ─────────────────────────────────────────────────────────
+
+/// Rewrite a single field in an artifact file, dispatching to the right adapter.
+fn rewrite_field(
+    path: &Path,
+    field_spec: &PathFieldSpec,
+    old_str: &str,
+    new_str: &str,
+) -> Result<bool> {
+    match field_spec.format.as_str() {
+        "json" => rewrite_json_field(path, &field_spec.field, old_str, new_str),
+        "toml" => rewrite_toml_field(path, &field_spec.field, old_str, new_str),
+        _ => rewrite_text(path, old_str, new_str),
+    }
+}
+
+// ── JSON adapter ─────────────────────────────────────────────────────────────
+
+/// Parse JSON, rewrite only the specified field, write back.
+fn rewrite_json_field(path: &Path, field: &str, old_str: &str, new_str: &str) -> Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let mut value: serde_json::Value =
+        serde_json::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
+            path: path.to_owned(),
+            detail: format!("invalid JSON: {e}"),
+        })?;
+
+    let changed = json_set_field(&mut value, field, old_str, new_str);
+
+    if changed {
+        let updated =
+            serde_json::to_string_pretty(&value).map_err(|e| crate::error::Error::Reconcile {
+                path: path.to_owned(),
+                detail: format!("failed to serialize JSON: {e}"),
+            })?;
+        std::fs::write(path, updated)?;
+        debug!(path = %path.display(), field, "JSON field rewritten");
+    }
+
+    Ok(changed)
+}
+
+/// Walk a dot-separated field path in a JSON value and replace the old string.
+fn json_set_field(
+    value: &mut serde_json::Value,
+    field: &str,
+    old_str: &str,
+    new_str: &str,
+) -> bool {
+    let parts: Vec<&str> = field.split('.').collect();
+    let mut current = value;
+
+    for part in &parts {
+        match current {
+            serde_json::Value::Object(map) => {
+                if let Some(v) = map.get_mut(*part) {
+                    current = v;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    if let serde_json::Value::String(s) = current {
+        if s.contains(old_str) {
+            *s = s.replace(old_str, new_str);
+            return true;
+        }
+    }
+
+    false
+}
+
+// ── TOML adapter ─────────────────────────────────────────────────────────────
+
+/// Parse TOML, rewrite only the specified field, write back.
+fn rewrite_toml_field(path: &Path, field: &str, old_str: &str, new_str: &str) -> Result<bool> {
+    let content = std::fs::read_to_string(path)?;
+    let mut value: toml::Value =
+        toml::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
+            path: path.to_owned(),
+            detail: format!("invalid TOML: {e}"),
+        })?;
+
+    let changed = toml_set_field(&mut value, field, old_str, new_str);
+
+    if changed {
+        let updated =
+            toml::to_string_pretty(&value).map_err(|e| crate::error::Error::Reconcile {
+                path: path.to_owned(),
+                detail: format!("failed to serialize TOML: {e}"),
+            })?;
+        std::fs::write(path, updated)?;
+        debug!(path = %path.display(), field, "TOML field rewritten");
+    }
+
+    Ok(changed)
+}
+
+/// Walk a dot-separated field path in a TOML value and replace the old string.
+fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: &str) -> bool {
+    let parts: Vec<&str> = field.split('.').collect();
+    let mut current = value;
+
+    for part in &parts {
+        match current {
+            toml::Value::Table(table) => {
+                if let Some(v) = table.get_mut(*part) {
+                    current = v;
+                } else {
+                    return false;
+                }
+            }
+            _ => return false,
+        }
+    }
+
+    if let toml::Value::String(s) = current {
+        if s.contains(old_str) {
+            *s = s.replace(old_str, new_str);
+            return true;
+        }
+    }
+
+    false
+}
+
+// ── Text adapter (fallback) ──────────────────────────────────────────────────
+
 /// Simple string replacement in a file. Returns true if any changes were made.
-fn rewrite_file(path: &Path, old_str: &str, new_str: &str) -> Result<bool> {
+fn rewrite_text(path: &Path, old_str: &str, new_str: &str) -> Result<bool> {
     let content = std::fs::read_to_string(path)?;
     if content.contains(old_str) {
         let updated = content.replace(old_str, new_str);
@@ -136,13 +272,15 @@ mod tests {
     use std::fs;
     use tempfile::TempDir;
 
-    #[test]
-    fn rewrite_file_replaces_paths() {
-        let dir = TempDir::new().unwrap();
-        let file = dir.path().join("test.json");
-        fs::write(&file, r#"{"root": "/old/project"}"#).unwrap();
+    // ── Unit tests ───────────────────────────────────────────────────────
 
-        let changed = rewrite_file(&file, "/old/project", "/new/project").unwrap();
+    #[test]
+    fn rewrite_text_replaces_paths() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("test.txt");
+        fs::write(&file, "path = /old/project").unwrap();
+
+        let changed = rewrite_text(&file, "/old/project", "/new/project").unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
@@ -151,14 +289,104 @@ mod tests {
     }
 
     #[test]
-    fn rewrite_file_no_change_returns_false() {
+    fn rewrite_text_no_change_returns_false() {
         let dir = TempDir::new().unwrap();
-        let file = dir.path().join("test.json");
-        fs::write(&file, r#"{"root": "/some/other/path"}"#).unwrap();
+        let file = dir.path().join("test.txt");
+        fs::write(&file, "path = /some/other/path").unwrap();
 
-        let changed = rewrite_file(&file, "/old/project", "/new/project").unwrap();
+        let changed = rewrite_text(&file, "/old/project", "/new/project").unwrap();
         assert!(!changed);
     }
+
+    #[test]
+    fn json_adapter_rewrites_only_target_field() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.json");
+        fs::write(
+            &file,
+            r#"{"project_path": "/old/root", "description": "lives at /old/root too"}"#,
+        )
+        .unwrap();
+
+        let changed = rewrite_json_field(&file, "project_path", "/old/root", "/new/root").unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        // Target field was rewritten
+        assert_eq!(v["project_path"], "/new/root");
+        // Non-target field with same string was NOT touched
+        assert_eq!(v["description"], "lives at /old/root too");
+    }
+
+    #[test]
+    fn json_adapter_handles_nested_fields() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("config.json");
+        fs::write(
+            &file,
+            r#"{"cache": {"dir": "/old/root/.cache"}, "name": "test"}"#,
+        )
+        .unwrap();
+
+        let changed = rewrite_json_field(&file, "cache.dir", "/old/root", "/new/root").unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&file).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(v["cache"]["dir"], "/new/root/.cache");
+        assert_eq!(v["name"], "test");
+    }
+
+    #[test]
+    fn json_adapter_missing_field_returns_false() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.json");
+        fs::write(&file, r#"{"other_field": "value"}"#).unwrap();
+
+        let changed = rewrite_json_field(&file, "project_path", "/old/root", "/new/root").unwrap();
+        assert!(!changed);
+    }
+
+    #[test]
+    fn toml_adapter_rewrites_only_target_field() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(
+            &file,
+            "project_root = \"/old/root\"\ndescription = \"lives at /old/root too\"\n",
+        )
+        .unwrap();
+
+        let changed = rewrite_toml_field(&file, "project_root", "/old/root", "/new/root").unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&file).unwrap();
+        let v: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(v["project_root"].as_str().unwrap(), "/new/root");
+        assert_eq!(v["description"].as_str().unwrap(), "lives at /old/root too");
+    }
+
+    #[test]
+    fn toml_adapter_handles_nested_fields() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("config.toml");
+        fs::write(
+            &file,
+            "[cache]\ndir = \"/old/root/.cache\"\n\n[meta]\nname = \"test\"\n",
+        )
+        .unwrap();
+
+        let changed = rewrite_toml_field(&file, "cache.dir", "/old/root", "/new/root").unwrap();
+        assert!(changed);
+
+        let content = fs::read_to_string(&file).unwrap();
+        let v: toml::Value = toml::from_str(&content).unwrap();
+        assert_eq!(v["cache"]["dir"].as_str().unwrap(), "/new/root/.cache");
+        assert_eq!(v["meta"]["name"].as_str().unwrap(), "test");
+    }
+
+    // ── End-to-end proof tests ───────────────────────────────────────────
 
     /// End-to-end proof: moving a Claude Code project rewrites .claude/settings.json
     #[test]
@@ -196,18 +424,16 @@ mod tests {
         assert_eq!(result.actions_taken.len(), 1, "should rewrite one file");
         assert_eq!(result.actions_taken[0].field, "project_path");
 
-        // Verify the file was actually rewritten
+        // Verify the file was actually rewritten — parse as JSON to check field-level
         let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
-        assert!(
-            content.contains(&new_path.to_string_lossy().to_string()),
-            "settings.json should contain the new path"
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            v["project_path"].as_str().unwrap(),
+            new_path.to_string_lossy()
         );
-        assert!(
-            !content.contains(&old_path.to_string_lossy().to_string()),
-            "settings.json should not contain the old path"
-        );
-        // Verify other JSON content wasn't corrupted
-        assert!(content.contains("\"model\": \"opus\""));
+        // Non-path fields intact
+        assert_eq!(v["model"], "opus");
+        assert_eq!(v["context"], "full");
 
         // Verify event log recorded the action
         let entries = event_log.recent(10).unwrap();
@@ -255,18 +481,14 @@ mod tests {
         assert_eq!(result.actions_taken.len(), 1);
         assert_eq!(result.actions_taken[0].field, "project_root");
 
-        // Verify the file was actually rewritten
+        // Verify field-level rewrite via JSON parsing
         let content = fs::read_to_string(new_path.join(".cursor/state.json")).unwrap();
-        assert!(
-            content.contains(&new_path.to_string_lossy().to_string()),
-            "state.json should contain the new path"
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            v["project_root"].as_str().unwrap(),
+            new_path.to_string_lossy()
         );
-        assert!(
-            !content.contains(&old_path.to_string_lossy().to_string()),
-            "state.json should not contain the old path"
-        );
-        // Verify other JSON content wasn't corrupted
-        assert!(content.contains("\"workspace_id\": \"abc123\""));
+        assert_eq!(v["workspace_id"], "abc123");
 
         // Verify event log
         let entries = event_log.recent(10).unwrap();
@@ -318,5 +540,50 @@ mod tests {
 
         // Event log should have 2 entries
         assert_eq!(event_log.count().unwrap(), 2);
+    }
+
+    /// Proof: JSON adapter doesn't corrupt sibling fields containing the same path
+    #[test]
+    fn json_adapter_surgical_not_global() {
+        let sandbox = TempDir::new().unwrap();
+        let old_path = sandbox.path().join("orig-project");
+        let new_path = sandbox.path().join("dest-project");
+
+        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        // Both fields contain the old path — only project_path should be rewritten
+        fs::write(
+            old_path.join(".claude/settings.json"),
+            format!(
+                r#"{{"project_path": "{0}","notes": "project was cloned from {0}"}}"#,
+                old_path.display()
+            ),
+        )
+        .unwrap();
+
+        fs::rename(&old_path, &new_path).unwrap();
+
+        let registry = ToolRegistry::new().unwrap();
+        let tool = registry.get("claude_code").unwrap();
+        let event_log = EventLog::open_in_memory().unwrap();
+
+        let result = reconcile(tool, &old_path, &new_path, &event_log);
+        assert!(result.success);
+
+        let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+
+        // Target field rewritten
+        assert_eq!(
+            v["project_path"].as_str().unwrap(),
+            new_path.to_string_lossy()
+        );
+        // Non-target field with same string was NOT touched — this is the key proof
+        assert!(
+            v["notes"]
+                .as_str()
+                .unwrap()
+                .contains(&old_path.to_string_lossy().to_string()),
+            "notes field should still contain the OLD path (surgical rewrite)"
+        );
     }
 }
