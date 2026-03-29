@@ -1,0 +1,36 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(cargo *)",
+      "Bash(git *)",
+      "Bash(just *)",
+      "Bash(rustup *)"
+    ]
+  },
+  "hooks": {
+    "PostToolUse": [
+      {
+        "matcher": "Edit|Write",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "jq -r '.tool_input.file_path // \"\"' | { read -r f; case \"$f\" in *.rs) cargo fmt 2>/dev/null || true;; esac; }",
+            "statusMessage": "Formatting Rust…"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cargo clippy -- -D warnings 2>&1 | tail -8 || true",
+            "statusMessage": "Running clippy…",
+            "timeout": 60
+          }
+        ]
+      }
+    ]
+  }
+}

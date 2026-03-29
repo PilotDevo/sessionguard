@@ -23,17 +23,33 @@ just run      # daemon foreground with debug logging
 just test-one <name>  # single test
 ```
 
+## Automated Hooks (via .claude/settings.json)
+
+- **PostToolUse (Edit|Write)** — `cargo fmt` runs automatically after any `.rs` file is edited.
+- **Stop** — `cargo clippy -- -D warnings` runs when Claude finishes a task. Any warnings will appear in the output.
+
+No manual format step needed during development — just edit and the hooks handle it.
+
 ## Architecture
 
 SessionGuard is a filesystem daemon that watches for project directory moves and reconciles AI tool session artifacts so tools don't lose their state.
 
-### Pipeline
+### Pipeline (fully wired as of v0.1.0)
 
 ```
 Filesystem Event → Watcher → Detector → Reconciler → Event Log
                                 ↕              ↕
                           Tool Registry    SQLite Registry
 ```
+
+Events flow:
+1. `notify` fires a rename/move event
+2. `watcher.rs` classifies it as `SessionEvent::Moved { from, to }`
+3. `daemon.rs` calls `handle_session_event()` which dispatches to:
+   - `detector::detect_tools()` — finds AI tool artifacts at new path
+   - `reconciler::reconcile()` — rewrites old path strings in artifact files
+   - `registry` — re-registers project under new path, drops old entry
+4. All actions are recorded to `EventLog` for auditability
 
 ### Binary + Library Split
 
@@ -42,9 +58,9 @@ Filesystem Event → Watcher → Detector → Reconciler → Event Log
 ### Module Map
 
 - **`cli.rs`** — Clap derive definitions for all subcommands. Add new commands here.
-- **`config.rs`** — TOML config loading from `~/.config/sessionguard/config.toml`, defaults.
-- **`daemon.rs`** — Daemon lifecycle: PID file, signal handling, main event loop (`tokio::select!`).
-- **`watcher.rs`** — Wraps `notify` crate. Classifies raw fs events into `SessionEvent` variants.
+- **`config.rs`** — TOML config loading from `~/.config/sessionguard/config.toml`, defaults. Supports `SESSIONGUARD_DATA_DIR` env var override (used by tests for isolation).
+- **`daemon.rs`** — Daemon lifecycle: PID file, signal handling, main event loop (`tokio::select!`). Contains `handle_session_event()` — the pipeline dispatcher.
+- **`watcher.rs`** — Wraps `notify` v8. Classifies raw fs events into `SessionEvent` variants.
 - **`detector.rs`** — Scans a project dir against `ToolRegistry` patterns to find session artifacts.
 - **`tools/mod.rs`** — `ToolDefinition` struct and `ToolRegistry`. Loads patterns at runtime from TOML.
 - **`tools/builtin/`** — Built-in TOML tool patterns compiled into the binary via `include_str!`.
@@ -64,10 +80,22 @@ Tool definitions are **data, not code**. They load from TOML at startup in this 
 
 To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_str!` to `tools/mod.rs`, and register it in `load_builtin()`.
 
+## Testing
+
+Tests use `SESSIONGUARD_DATA_DIR` to point each test at an isolated per-test SQLite registry — no shared state between runs.
+
+```bash
+cargo test                           # all 26 tests
+cargo test sandbox_                  # integration tests only
+cargo test -- --nocapture            # with stdout
+```
+
+The `cmd()` helper in `tests/sandbox.rs` wraps `Command::cargo_bin` and injects the env var automatically — use it for all new sandbox tests.
+
 ## CI/CD
 
 - **`.github/workflows/ci.yml`** — Runs on PR/push to main. Matrix: ubuntu + macos. Checks: fmt, clippy, test, cargo-deny.
-- **`.github/workflows/release.yml`** — On `v*` tags. Builds binaries for linux-x86_64, macos-x86_64, macos-aarch64. Creates GitHub release with `git-cliff` changelog.
+- **`.github/workflows/release.yml`** — On `v*` tags. Builds binaries for linux-x86_64, macos-x86_64, macos-aarch64. Creates GitHub release with `git-cliff` changelog. Publishes to crates.io via `CARGO_REGISTRY_TOKEN` secret.
 - **`.github/dependabot.yml`** — Weekly updates for cargo deps and GH actions.
 
 ## Versioning & Release
@@ -75,15 +103,35 @@ To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_
 Uses conventional commits. Version lives in `Cargo.toml`.
 
 ```bash
-cargo release patch --no-publish --execute  # Bump, tag, push
-git cliff -o CHANGELOG.md                    # Regenerate changelog
+cargo release patch --no-publish --execute  # Bump, tag, push → triggers full release pipeline
+git cliff -o CHANGELOG.md                    # Regenerate changelog locally
 ```
 
-Tags follow `v0.1.0` format. The release workflow auto-builds binaries on tag push.
+Tags follow `v0.1.0` format. Pushing a tag triggers: build → GitHub release → crates.io publish.
+
+## Repository Layout
+
+```
+src/                    # Library + binary source
+tests/
+  cli_smoke.rs          # Basic CLI invocation tests
+  sandbox.rs            # Full integration tests with real project fixtures
+contrib/
+  sessionguard.service  # systemd user service for Linux autostart
+.github/
+  workflows/            # CI and release pipelines
+  ISSUE_TEMPLATE/       # Bug, feature, and tool-pattern issue templates
+  FUNDING.yml           # GitHub Sponsors
+install.sh              # Curl-pipe installer (OS/arch auto-detection)
+cliff.toml              # Changelog generation config
+deny.toml               # cargo-deny license/advisory config
+justfile                # Dev task runner
+```
 
 ## Key Design Decisions
 
 - **Async runtime**: tokio (for concurrent fs event handling + signal trapping).
 - **SQLite bundled**: via `rusqlite` with `bundled` feature — no system SQLite dependency.
-- **`notify` v7**: Cross-platform fs watching (FSEvents on macOS, inotify on Linux).
+- **`notify` v8**: Cross-platform fs watching (FSEvents on macOS, inotify on Linux).
 - **MSRV 1.75**: Set in `Cargo.toml` and `clippy.toml`.
+- **Copyright**: All source files carry `// Copyright 2026 Devin R O'Loughlin / Droco LLC` header.
