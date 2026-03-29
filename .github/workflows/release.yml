@@ -64,7 +64,6 @@ jobs:
           args: --latest --strip header
         env:
           OUTPUT: RELEASE_NOTES.md
-          GITHUB_REPO: ${{ github.repository }}
 
       - name: Download artifacts
         uses: actions/download-artifact@v8
