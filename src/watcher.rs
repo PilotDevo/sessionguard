@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Filesystem event watching.
 //!
 //! Wraps the `notify` crate to watch project root directories for

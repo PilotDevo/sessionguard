@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! CLI definition using clap derive.
 //!
 //! All subcommands from the SessionGuard README are defined here.

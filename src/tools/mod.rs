@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Runtime-loaded AI tool session pattern definitions.
 //!
 //! Tool definitions describe the session artifacts for each AI coding tool.

@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! AI tool session artifact detection.
 //!
 //! Scans a project directory to determine which AI coding tools have

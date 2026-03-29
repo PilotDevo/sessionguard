@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Structured event log for reconciliation actions.
 //!
 //! Every path rewrite, symlink update, and session migration is logged

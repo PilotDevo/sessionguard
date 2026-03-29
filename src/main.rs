@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! SessionGuard CLI entry point.
 
 use anyhow::{Context, Result};

@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Configuration loading and management.
 //!
 //! Config file: `~/.config/sessionguard/config.toml`

@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! SQLite registry mapping projects to their AI session artifacts.
 //!
 //! The registry is the source of truth for which projects are tracked

@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! SessionGuard — a system-level daemon that keeps AI coding sessions intact
 //! when your projects move.
 //!

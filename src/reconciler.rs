@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Path reconciliation engine.
 //!
 //! When a project directory moves, the reconciler rewrites internal

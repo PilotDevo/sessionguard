@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Daemon lifecycle management.
 //!
 //! Handles starting/stopping the SessionGuard daemon, PID file
