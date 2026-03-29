@@ -1,0 +1,34 @@
+# SessionGuard systemd user service
+# Copyright 2026 Devin R O'Loughlin / Droco LLC
+# SPDX-License-Identifier: MIT
+#
+# Install (per-user, recommended):
+#   mkdir -p ~/.config/systemd/user
+#   cp sessionguard.service ~/.config/systemd/user/
+#   systemctl --user enable --now sessionguard
+#   systemctl --user status sessionguard
+#
+# View logs:
+#   journalctl --user -u sessionguard -f
+
+[Unit]
+Description=SessionGuard — AI session artifact reconciliation daemon
+Documentation=https://github.com/PilotDevo/sessionguard
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/sessionguard start --foreground
+Restart=on-failure
+RestartSec=5s
+Environment=RUST_LOG=info
+
+# Security hardening
+PrivateTmp=true
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.local/share/sessionguard %h/.config/sessionguard
+
+[Install]
+WantedBy=default.target
