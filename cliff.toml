@@ -23,6 +23,10 @@ body = """
 footer = ""
 trim = true
 
+[remote.github]
+owner = ""
+repo = ""
+
 [git]
 conventional_commits = true
 filter_unconventional = true
