@@ -61,11 +61,11 @@ Events flow:
 - **`config.rs`** — TOML config loading from `~/.config/sessionguard/config.toml`, defaults. Supports `SESSIONGUARD_DATA_DIR` env var override (used by tests for isolation).
 - **`daemon.rs`** — Daemon lifecycle: PID file, signal handling, main event loop (`tokio::select!`). Contains `handle_session_event()` — the pipeline dispatcher.
 - **`watcher.rs`** — Wraps `notify` v8. Classifies raw fs events into `SessionEvent` variants.
-- **`detector.rs`** — Scans a project dir against `ToolRegistry` patterns to find session artifacts.
-- **`tools/mod.rs`** — `ToolDefinition` struct and `ToolRegistry`. Loads patterns at runtime from TOML.
+- **`detector.rs`** — Scans a project dir against `ToolRegistry` patterns to find session artifacts. Returns `DetectionResult` with resolved artifact file paths.
+- **`tools/mod.rs`** — `ToolDefinition` struct and `ToolRegistry`. `new()` loads builtins only; `new_with_config(config)` loads the full chain (built-in → system → user → project config.tools). Production callers use `new_with_config`.
 - **`tools/builtin/`** — Built-in TOML tool patterns compiled into the binary via `include_str!`.
-- **`registry.rs`** — SQLite-backed project-to-session mapping. Schema auto-migrates on open.
-- **`reconciler.rs`** — Path rewriting engine. String-replaces old paths in session artifacts.
+- **`registry.rs`** — SQLite-backed project-to-session mapping. Stores actual artifact file paths (e.g., `.claude/settings.json`), not just project roots. Schema auto-migrates on open.
+- **`reconciler.rs`** — Adapter-based path rewriting engine. `JsonAdapter` and `TomlAdapter` parse files and surgically rewrite only the declared target field. `TextAdapter` falls back to string replace. Dispatched by `PathFieldSpec.format`.
 - **`event_log.rs`** — SQLite audit log of all reconciliation actions (for undo capability).
 - **`error.rs`** — `thiserror` error enum used across all library modules.
 
@@ -85,8 +85,9 @@ To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_
 Tests use `SESSIONGUARD_DATA_DIR` to point each test at an isolated per-test SQLite registry — no shared state between runs.
 
 ```bash
-cargo test                           # all 26 tests
+cargo test                           # all 41 tests
 cargo test sandbox_                  # integration tests only
+cargo test reconcile_               # end-to-end reconciliation proofs
 cargo test -- --nocapture            # with stdout
 ```
 

@@ -11,7 +11,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: Early Development (v0.1-dev)** — Core scaffold is in place, CLI is functional, session detection works. Reconciliation pipeline is stubbed. Not yet ready for production use.
+> **Status: v0.1.0 Released** — Full pipeline wired end-to-end. CLI, daemon, detection, and reconciliation all functional. Published on [crates.io](https://crates.io/crates/sessionguard) with pre-built binaries. Alpha quality — use on personal projects, report issues.
 
 ---
 
@@ -43,8 +43,8 @@ Tool support is defined via runtime-loaded TOML patterns — add new tools witho
 
 | Tool | Session Artifacts | Status |
 |------|------------------|--------|
-| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` | 🔨 In Progress |
-| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | 🔨 In Progress |
+| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` | ✅ Built-in |
+| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | ✅ Built-in |
 | **Windsurf (Codeium)** | `.windsurf/`, `.windsurfrules`, cascade history | 🔜 Planned |
 | **GitHub Copilot** | `.github/copilot-instructions.md`, VS Code chat history | 🔜 Planned |
 | **Gemini Code Assist** | `.gemini/`, `GEMINI.md`, session context | 🔜 Planned |
@@ -77,7 +77,7 @@ Tool support is defined via runtime-loaded TOML patterns — add new tools witho
 1. **Watcher** — Listens for filesystem events (FSEvents on macOS, inotify on Linux) targeting registered project roots via the [notify](https://crates.io/crates/notify) crate.
 2. **Detector** — Maintains a registry of AI tool session patterns loaded from TOML at runtime. When a move/rename event fires, it identifies which session artifacts are affected.
 3. **Registry** — A lightweight SQLite database mapping project roots to their associated session artifacts and tool configurations.
-4. **Reconciler** — Rewrites internal path references in session artifacts so tools pick up where they left off.
+4. **Reconciler** — Uses format-aware adapters (JSON, TOML) to surgically rewrite only the targeted path field in session artifacts, leaving other content untouched.
 5. **Event Log** — Structured SQLite log of all reconciliation actions for auditability and undo capability.
 
 ## Quick Start
@@ -204,26 +204,28 @@ AI tools evolve fast. New tools appear constantly. By defining tool patterns as 
 
 ## Roadmap
 
-### Phase 1 — Foundation (v0.1) `← current`
+### Phase 1 — Foundation (v0.1) ✅
 - [x] Core daemon with filesystem watching (macOS + Linux)
 - [x] SQLite registry for project-to-session mapping
-- [x] Runtime-loaded tool pattern system (TOML)
+- [x] Runtime-loaded tool pattern system (TOML) — built-in → system → user → project
 - [x] Built-in patterns for Claude Code and Cursor
 - [x] Full CLI (start, stop, status, watch, scan, simulate, doctor, log, export/import, config, completions)
 - [x] Structured event logging with SQLite audit trail
 - [x] CI/CD pipeline (GitHub Actions, cargo-deny, dependabot)
-- [ ] End-to-end reconciliation pipeline (watcher → detector → reconciler)
-- [ ] Path rewriting for Claude Code session databases
-- [ ] Path rewriting for Cursor session state
-- [ ] Integration test suite with sandbox environments
+- [x] End-to-end reconciliation pipeline (watcher → detector → reconciler)
+- [x] Adapter-based path rewriting (JSON, TOML) — surgical field targeting, not global string replace
+- [x] Claude Code reconciliation (`.claude/settings.json` → `project_path`)
+- [x] Cursor reconciliation (`.cursor/state.json` → `project_root`)
+- [x] Integration test suite with sandbox environments (41 tests)
+- [x] Published on crates.io with pre-built binaries (linux + macos)
+- [x] Curl-pipe installer, systemd service, GitHub Sponsors
 
-### Phase 2 — Ecosystem (v0.2)
+### Phase 2 — Ecosystem (v0.2) `← current`
 - [ ] Windsurf, Copilot, Gemini, Codex, Aider tool patterns
 - [ ] `sessionguard undo` — reverse reconciliation actions
 - [ ] Background daemonization (`-d` flag)
 - [ ] Windows support
 - [ ] Homebrew formula
-- [ ] Publish to crates.io
 
 ### Phase 3 — Intelligence (v0.3)
 - [ ] Auto-discovery of new AI tools via heuristics
@@ -280,7 +282,7 @@ Be kind. Be constructive. Ship code. See [CODE_OF_CONDUCT.md](CODE_OF_CONDUCT.md
 
 ## Supporting the Project
 
-SessionGuard is built and maintained by [Droco](https://droco.dev). If you find it useful, consider supporting development:
+SessionGuard is built and maintained by [Droco](https://droco.io). If you find it useful, consider supporting development:
 
 - **Star the repo** — It helps with visibility
 - **Contribute** — Code, tool patterns, bug reports, and docs are all welcome
