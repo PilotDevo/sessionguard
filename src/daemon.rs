@@ -77,7 +77,7 @@ pub async fn run(config: &Config) -> Result<()> {
     info!("daemon started (PID {})", std::process::id());
 
     // Initialize subsystems
-    let tool_registry = crate::tools::ToolRegistry::new()?;
+    let tool_registry = crate::tools::ToolRegistry::new_with_config(config)?;
     let registry = crate::registry::Registry::open_default()?;
     let event_log = crate::event_log::EventLog::open_default()?;
 

@@ -75,7 +75,7 @@ async fn main() -> Result<()> {
             let id = registry.register_project(&path)?;
 
             // Detect tools
-            let tool_registry = ToolRegistry::new()?;
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
             let detected = detector::detect_tools(&path, &tool_registry);
             for d in &detected {
                 registry.add_artifact(id, &d.tool_name, &path)?;
@@ -101,7 +101,7 @@ async fn main() -> Result<()> {
                 Some(p) => vec![p],
                 None => config.watch_roots.clone(),
             };
-            let tool_registry = ToolRegistry::new()?;
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
             let registry = Registry::open_default()?;
 
             for root in &roots {
@@ -131,7 +131,7 @@ async fn main() -> Result<()> {
 
         Command::Simulate { action } => match action {
             SimulateAction::Mv { from, to } => {
-                let tool_registry = ToolRegistry::new()?;
+                let tool_registry = ToolRegistry::new_with_config(&config)?;
                 let detected = detector::detect_tools(&from, &tool_registry);
                 if detected.is_empty() {
                     println!("no AI session artifacts found in {}", from.display());
