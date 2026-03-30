@@ -2,6 +2,7 @@
 
 **A system-level daemon that keeps AI coding sessions intact when your projects move.**
 
+[![Crates.io](https://img.shields.io/crates/v/sessionguard.svg)](https://crates.io/crates/sessionguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![CI](https://github.com/PilotDevo/sessionguard/actions/workflows/ci.yml/badge.svg)](https://github.com/PilotDevo/sessionguard/actions/workflows/ci.yml)
