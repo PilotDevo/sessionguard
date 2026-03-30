@@ -82,7 +82,14 @@ Tool support is defined via runtime-loaded TOML patterns — add new tools witho
 
 ## Quick Start
 
-### Install (Linux & macOS)
+### Homebrew (macOS)
+
+```bash
+brew tap PilotDevo/tap
+brew install sessionguard
+```
+
+### Shell installer (Linux & macOS)
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/PilotDevo/sessionguard/main/install.sh | sh
@@ -90,13 +97,7 @@ curl -fsSL https://raw.githubusercontent.com/PilotDevo/sessionguard/main/install
 
 Auto-detects your OS and architecture, downloads the right pre-built binary, and installs to `/usr/local/bin` (or `~/.local/bin` as fallback).
 
-**Options:**
-```bash
-SESSIONGUARD_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/PilotDevo/sessionguard/main/install.sh | sh
-SESSIONGUARD_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/PilotDevo/sessionguard/main/install.sh | sh
-```
-
-### Install via cargo
+### Cargo (any platform with Rust)
 
 ```bash
 cargo install sessionguard
