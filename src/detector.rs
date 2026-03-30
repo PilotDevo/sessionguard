@@ -18,6 +18,8 @@ pub struct DetectionResult {
     pub tool_name: String,
     pub display_name: String,
     pub matched_patterns: Vec<String>,
+    /// Resolved paths to artifact files that contain rewritable path fields.
+    pub artifact_files: Vec<std::path::PathBuf>,
 }
 
 /// Scan a project directory for AI tool session artifacts.
@@ -42,10 +44,19 @@ fn detect_single_tool(project_root: &Path, tool: &ToolDefinition) -> Option<Dete
     if matched.is_empty() {
         None
     } else {
+        // Collect actual artifact file paths from path_fields
+        let artifact_files: Vec<std::path::PathBuf> = tool
+            .path_fields
+            .iter()
+            .map(|pf| project_root.join(&pf.file))
+            .filter(|p| p.exists())
+            .collect();
+
         Some(DetectionResult {
             tool_name: tool.name.clone(),
             display_name: tool.display_name.clone(),
             matched_patterns: matched,
+            artifact_files,
         })
     }
 }

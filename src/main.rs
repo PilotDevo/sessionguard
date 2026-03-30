@@ -78,11 +78,14 @@ async fn main() -> Result<()> {
             let tool_registry = ToolRegistry::new_with_config(&config)?;
             let detected = detector::detect_tools(&path, &tool_registry);
             for d in &detected {
-                registry.add_artifact(id, &d.tool_name, &path)?;
+                for artifact in &d.artifact_files {
+                    registry.add_artifact(id, &d.tool_name, artifact)?;
+                }
                 println!(
-                    "  detected: {} ({} patterns matched)",
+                    "  detected: {} ({} patterns matched, {} artifact files)",
                     d.display_name,
-                    d.matched_patterns.len()
+                    d.matched_patterns.len(),
+                    d.artifact_files.len()
                 );
             }
 
@@ -117,7 +120,9 @@ async fn main() -> Result<()> {
                             if !detected.is_empty() {
                                 let id = registry.register_project(&path)?;
                                 for d in &detected {
-                                    registry.add_artifact(id, &d.tool_name, &path)?;
+                                    for artifact in &d.artifact_files {
+                                        registry.add_artifact(id, &d.tool_name, artifact)?;
+                                    }
                                 }
                                 let tools: Vec<_> =
                                     detected.iter().map(|d| d.display_name.as_str()).collect();

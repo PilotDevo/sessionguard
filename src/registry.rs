@@ -80,7 +80,8 @@ impl Registry {
                 project_id  INTEGER NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
                 tool_name   TEXT NOT NULL,
                 artifact_path TEXT NOT NULL,
-                created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+                created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+                UNIQUE(project_id, tool_name, artifact_path)
             );
 
             CREATE INDEX IF NOT EXISTS idx_artifacts_project
@@ -197,8 +198,12 @@ mod tests {
     fn registry_round_trip() {
         let reg = Registry::open_in_memory().unwrap();
         let id = reg.register_project(Path::new("/tmp/my-project")).unwrap();
-        reg.add_artifact(id, "claude_code", Path::new(".claude/"))
-            .unwrap();
+        reg.add_artifact(
+            id,
+            "claude_code",
+            Path::new("/tmp/my-project/.claude/settings.json"),
+        )
+        .unwrap();
 
         let projects = reg.list_projects().unwrap();
         assert_eq!(projects.len(), 1);
@@ -207,6 +212,22 @@ mod tests {
         let artifacts = reg.get_artifacts(id).unwrap();
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].tool_name, "claude_code");
+        assert_eq!(
+            artifacts[0].artifact_path,
+            PathBuf::from("/tmp/my-project/.claude/settings.json")
+        );
+    }
+
+    #[test]
+    fn registry_deduplicates_artifacts() {
+        let reg = Registry::open_in_memory().unwrap();
+        let id = reg.register_project(Path::new("/tmp/test")).unwrap();
+        let path = Path::new("/tmp/test/.claude/settings.json");
+        reg.add_artifact(id, "claude_code", path).unwrap();
+        reg.add_artifact(id, "claude_code", path).unwrap(); // duplicate
+
+        let artifacts = reg.get_artifacts(id).unwrap();
+        assert_eq!(artifacts.len(), 1, "duplicates should be deduplicated");
     }
 
     #[test]

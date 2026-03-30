@@ -156,7 +156,9 @@ fn handle_session_event(
             match registry.register_project(&new_path) {
                 Ok(new_id) => {
                     for detection in &detected {
-                        let _ = registry.add_artifact(new_id, &detection.tool_name, &new_path);
+                        for artifact in &detection.artifact_files {
+                            let _ = registry.add_artifact(new_id, &detection.tool_name, artifact);
+                        }
                     }
                 }
                 Err(e) => warn!(error = %e, "failed to register new project path"),
