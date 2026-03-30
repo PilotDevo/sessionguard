@@ -30,6 +30,11 @@ pub fn detect_tools(project_root: &Path, registry: &ToolRegistry) -> Vec<Detecti
         .collect()
 }
 
+/// Check one tool's patterns against a project directory.
+///
+/// Uses a two-phase match: first checks for literal path existence
+/// (e.g., `.claude/` directory), then falls back to glob expansion
+/// for wildcard patterns.
 fn detect_single_tool(project_root: &Path, tool: &ToolDefinition) -> Option<DetectionResult> {
     let matched: Vec<String> = tool
         .session_patterns

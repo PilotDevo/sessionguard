@@ -24,8 +24,8 @@ footer = ""
 trim = true
 
 [remote.github]
-owner = ""
-repo = ""
+owner = "PilotDevo"
+repo = "sessionguard"
 
 [git]
 conventional_commits = true

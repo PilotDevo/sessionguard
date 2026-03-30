@@ -71,6 +71,11 @@ impl FsWatcher {
     }
 }
 
+/// Map a raw `notify` event to a [`SessionEvent`].
+///
+/// For `ModifyKind::Name` (rename/move), `paths[0]` is the source and
+/// `paths[1]` (when present) is the destination, per `notify` v8 semantics.
+/// Some platforms only emit one path, producing a partial `Moved` event.
 fn classify_event(event: &Event) -> Option<SessionEvent> {
     match &event.kind {
         EventKind::Create(_) => event

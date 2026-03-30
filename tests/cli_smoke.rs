@@ -1,3 +1,9 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
+//! CLI smoke tests — basic invocation, flag parsing, and graceful output
+//! when no daemon is running.
+
 use assert_cmd::Command;
 use predicates::prelude::*;
 

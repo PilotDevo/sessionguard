@@ -53,6 +53,9 @@ pub fn read_pid() -> Result<Option<u32>> {
 }
 
 /// Check if a daemon is currently running.
+///
+/// On non-Unix platforms, returns `true` whenever a PID file exists
+/// (process liveness cannot be verified without `kill(pid, 0)`).
 pub fn is_running() -> bool {
     read_pid().ok().flatten().is_some_and(process_exists)
 }
@@ -109,6 +112,11 @@ pub async fn run(config: &Config) -> Result<()> {
 }
 
 /// Dispatch a filesystem event through the detector → reconciler pipeline.
+///
+/// For `Moved` events with both `from` and `to` paths: detects tools at the
+/// new location, reconciles each tool's artifacts, updates the registry.
+/// Errors are logged in place — this function never fails. Partial move events
+/// (missing `from` or `to`) are silently skipped.
 fn handle_session_event(
     event: crate::watcher::SessionEvent,
     registry: &crate::registry::Registry,

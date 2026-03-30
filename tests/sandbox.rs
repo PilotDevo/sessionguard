@@ -1,3 +1,6 @@
+// Copyright 2026 Devin R O'Loughlin / Droco LLC
+// SPDX-License-Identifier: MIT
+
 //! Sandbox integration tests.
 //!
 //! Creates realistic project structures with AI tool session artifacts

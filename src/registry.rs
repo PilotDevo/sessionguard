@@ -136,6 +136,10 @@ impl Registry {
     }
 
     /// Update all path references when a project moves.
+    ///
+    /// Note: the daemon's move pipeline currently uses `register_project` +
+    /// `unregister_project` instead. This method is available for callers
+    /// that prefer an atomic in-place update.
     pub fn update_project_path(&self, old_path: &Path, new_path: &Path) -> Result<()> {
         let old_str = old_path.to_string_lossy();
         let new_str = new_path.to_string_lossy();
