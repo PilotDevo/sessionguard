@@ -94,15 +94,16 @@ impl Registry {
     }
 
     /// Register a project directory. Returns the project ID.
+    ///
+    /// Implemented as a single upsert with `RETURNING id` so we atomically
+    /// get the row id whether it was newly inserted or updated — no separate
+    /// SELECT, no TOCTOU window.
     pub fn register_project(&self, path: &Path) -> Result<i64> {
         let path_str = path.to_string_lossy();
-        self.conn.execute(
+        let id: i64 = self.conn.query_row(
             "INSERT INTO projects (path) VALUES (?1)
-             ON CONFLICT(path) DO UPDATE SET updated_at = datetime('now')",
-            params![path_str.as_ref()],
-        )?;
-        let id = self.conn.query_row(
-            "SELECT id FROM projects WHERE path = ?1",
+             ON CONFLICT(path) DO UPDATE SET updated_at = datetime('now')
+             RETURNING id",
             params![path_str.as_ref()],
             |row| row.get(0),
         )?;

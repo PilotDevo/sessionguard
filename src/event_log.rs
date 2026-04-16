@@ -100,10 +100,14 @@ impl EventLog {
     }
 
     /// Get the most recent N log entries.
+    ///
+    /// Ordered by `id DESC` (insertion order) rather than `timestamp`, because
+    /// SQLite's `datetime('now')` only has 1-second resolution and would
+    /// produce non-deterministic ordering for events in the same second.
     pub fn recent(&self, limit: usize) -> Result<Vec<LogEntry>> {
         let mut stmt = self.conn.prepare(
             "SELECT id, timestamp, tool_name, file_path, field, old_value, new_value
-             FROM events ORDER BY timestamp DESC LIMIT ?1",
+             FROM events ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], |row| {
             Ok(LogEntry {
