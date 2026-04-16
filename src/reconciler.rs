@@ -137,6 +137,26 @@ fn rewrite_field(
     }
 }
 
+/// Rewrite `old_root` → `new_root` at the start of `value` when it is either:
+///   - an exact match of `old_root`, or
+///   - a prefix of `value` followed by a path separator (`/` or `\`).
+///
+/// Returns `Some(rewritten)` on match, `None` otherwise. This protects against
+/// substring collisions like `/home/me/code` being rewritten inside
+/// `/home/me/code-backup/foo`.
+fn replace_path_prefix(value: &str, old_root: &str, new_root: &str) -> Option<String> {
+    if value == old_root {
+        return Some(new_root.to_string());
+    }
+    for sep in ['/', '\\'] {
+        let prefix = format!("{old_root}{sep}");
+        if let Some(rest) = value.strip_prefix(&prefix) {
+            return Some(format!("{new_root}{sep}{rest}"));
+        }
+    }
+    None
+}
+
 // ── JSON adapter ─────────────────────────────────────────────────────────────
 
 /// Parse JSON, rewrite only the specified field, write back.
@@ -163,7 +183,7 @@ fn rewrite_json_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
     Ok(changed)
 }
 
-/// Walk a dot-separated field path in a JSON value and replace the old string.
+/// Walk a dot-separated field path in a JSON value and replace the old path prefix.
 fn json_set_field(
     value: &mut serde_json::Value,
     field: &str,
@@ -187,8 +207,8 @@ fn json_set_field(
     }
 
     if let serde_json::Value::String(s) = current {
-        if s.contains(old_str) {
-            *s = s.replace(old_str, new_str);
+        if let Some(rewritten) = replace_path_prefix(s, old_str, new_str) {
+            *s = rewritten;
             return true;
         }
     }
@@ -222,7 +242,7 @@ fn rewrite_toml_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
     Ok(changed)
 }
 
-/// Walk a dot-separated field path in a TOML value and replace the old string.
+/// Walk a dot-separated field path in a TOML value and replace the old path prefix.
 fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: &str) -> bool {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = value;
@@ -241,8 +261,8 @@ fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: 
     }
 
     if let toml::Value::String(s) = current {
-        if s.contains(old_str) {
-            *s = s.replace(old_str, new_str);
+        if let Some(rewritten) = replace_path_prefix(s, old_str, new_str) {
+            *s = rewritten;
             return true;
         }
     }
@@ -336,6 +356,59 @@ mod tests {
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(v["cache"]["dir"], "/new/root/.cache");
         assert_eq!(v["name"], "test");
+    }
+
+    #[test]
+    fn replace_path_prefix_exact_match() {
+        assert_eq!(
+            replace_path_prefix("/home/me/code", "/home/me/code", "/new/root"),
+            Some("/new/root".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_path_prefix_with_trailing_segment() {
+        assert_eq!(
+            replace_path_prefix("/home/me/code/src/main.rs", "/home/me/code", "/new/root"),
+            Some("/new/root/src/main.rs".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_path_prefix_rejects_substring_collision() {
+        // /home/me/code-backup must NOT match /home/me/code as a prefix.
+        assert_eq!(
+            replace_path_prefix("/home/me/code-backup/foo", "/home/me/code", "/new/root"),
+            None
+        );
+        assert_eq!(
+            replace_path_prefix("/home/me/code_archive", "/home/me/code", "/new/root"),
+            None
+        );
+    }
+
+    #[test]
+    fn replace_path_prefix_windows_separator() {
+        assert_eq!(
+            replace_path_prefix(r"C:\old\project\src", r"C:\old\project", r"D:\new"),
+            Some(r"D:\new\src".to_string())
+        );
+    }
+
+    #[test]
+    fn json_adapter_does_not_corrupt_sibling_path() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.json");
+        // The target field's value is a *sibling* path that shares the prefix
+        // but is not inside old_root. This must NOT be rewritten.
+        fs::write(&file, r#"{"project_path": "/home/me/code-backup/notes"}"#).unwrap();
+
+        let changed =
+            rewrite_json_field(&file, "project_path", "/home/me/code", "/new/root").unwrap();
+        assert!(!changed, "sibling path must not be treated as a prefix");
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("/home/me/code-backup/notes"));
     }
 
     #[test]
