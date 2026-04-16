@@ -43,14 +43,26 @@ async fn main() -> Result<()> {
         }
 
         Command::Stop => {
-            if let Some(pid) = sessionguard::daemon::read_pid()? {
-                #[cfg(unix)]
-                unsafe {
-                    libc::kill(pid as i32, libc::SIGTERM);
+            match sessionguard::daemon::read_pid()? {
+                Some(pid) if sessionguard::daemon::is_running() => {
+                    #[cfg(unix)]
+                    // SAFETY: `kill(pid, SIGTERM)` with a valid u32-as-i32 PID. We
+                    // verified the process exists above; worst case, the PID races
+                    // and gets recycled between is_running() and kill(), which is
+                    // inherent to any PID-based IPC.
+                    unsafe {
+                        libc::kill(pid as i32, libc::SIGTERM);
+                    }
+                    println!("sent stop signal to daemon (PID {pid})");
                 }
-                println!("sent stop signal to daemon (PID {pid})");
-            } else {
-                println!("no running daemon found");
+                Some(pid) => {
+                    // PID file exists but the process is gone — clean it up.
+                    let _ = sessionguard::daemon::remove_pid_file();
+                    println!("stale PID file removed (PID {pid} no longer running)");
+                }
+                None => {
+                    println!("no running daemon found");
+                }
             }
         }
 
@@ -116,9 +128,14 @@ async fn main() -> Result<()> {
                     for entry in entries.flatten() {
                         let path = entry.path();
                         if path.is_dir() {
-                            let detected = detector::detect_tools(&path, &tool_registry);
+                            // Canonicalize so registered paths match what the
+                            // daemon sees from filesystem events (e.g. on macOS,
+                            // `/var/foo` → `/private/var/foo`). `Watch` already
+                            // does this — `Scan` must match for consistency.
+                            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
+                            let detected = detector::detect_tools(&canonical, &tool_registry);
                             if !detected.is_empty() {
-                                let id = registry.register_project(&path)?;
+                                let id = registry.register_project(&canonical)?;
                                 for d in &detected {
                                     for artifact in &d.artifact_files {
                                         registry.add_artifact(id, &d.tool_name, artifact)?;
@@ -126,7 +143,7 @@ async fn main() -> Result<()> {
                                 }
                                 let tools: Vec<_> =
                                     detected.iter().map(|d| d.display_name.as_str()).collect();
-                                println!("  found: {} [{}]", path.display(), tools.join(", "));
+                                println!("  found: {} [{}]", canonical.display(), tools.join(", "));
                             }
                         }
                     }

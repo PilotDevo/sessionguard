@@ -8,8 +8,6 @@
 
 use std::path::Path;
 
-use glob::Pattern;
-
 use crate::tools::{ToolDefinition, ToolRegistry};
 
 /// Result of detecting AI tool artifacts in a project directory.
@@ -68,9 +66,10 @@ fn detect_single_tool(project_root: &Path, tool: &ToolDefinition) -> Option<Dete
 
 fn glob_matches_any(root: &Path, pattern: &str) -> bool {
     let full_pattern = root.join(pattern).to_string_lossy().to_string();
-    Pattern::new(&full_pattern)
+    // `glob::glob` returns an iterator on success; we only need to know whether
+    // any entry matches. An invalid pattern means "no match" — not an error here.
+    glob::glob(&full_pattern)
         .ok()
-        .and_then(|_| glob::glob(&full_pattern).ok())
         .is_some_and(|mut entries| entries.next().is_some())
 }
 
