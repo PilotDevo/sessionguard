@@ -20,12 +20,30 @@ fn pid_file_path() -> PathBuf {
 }
 
 /// Write the current process PID to the PID file.
+///
+/// Refuses to overwrite a PID file belonging to a currently-running daemon.
+/// Stale PID files (daemon crashed, PID not alive) are replaced. Writes are
+/// atomic: we write to a tempfile then rename over the target so a crash
+/// mid-write never leaves a truncated PID file.
 pub fn write_pid_file() -> Result<()> {
     let pid_path = pid_file_path();
     if let Some(parent) = pid_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    std::fs::write(&pid_path, std::process::id().to_string())?;
+
+    // Refuse if another daemon is already alive.
+    if let Ok(Some(existing)) = read_pid() {
+        if existing != std::process::id() && process_exists(existing) {
+            return Err(Error::Daemon(format!(
+                "another sessionguard daemon is already running (PID {existing})"
+            )));
+        }
+    }
+
+    // Atomic write: write to a sibling tempfile, then rename.
+    let tmp_path = pid_path.with_extension("pid.tmp");
+    std::fs::write(&tmp_path, std::process::id().to_string())?;
+    std::fs::rename(&tmp_path, &pid_path)?;
     Ok(())
 }
 
@@ -79,6 +97,16 @@ pub async fn run(config: &Config) -> Result<()> {
     write_pid_file()?;
     info!("daemon started (PID {})", std::process::id());
 
+    // RAII guard: removes the PID file on ANY exit from this scope (normal
+    // shutdown, early error, panic-recovered drop).
+    struct PidGuard;
+    impl Drop for PidGuard {
+        fn drop(&mut self) {
+            let _ = remove_pid_file();
+        }
+    }
+    let _pid_guard = PidGuard;
+
     // Initialize subsystems
     let tool_registry = crate::tools::ToolRegistry::new_with_config(config)?;
     let registry = crate::registry::Registry::open_default()?;
@@ -106,7 +134,6 @@ pub async fn run(config: &Config) -> Result<()> {
         }
     }
 
-    remove_pid_file()?;
     info!("daemon stopped");
     Ok(())
 }
@@ -180,6 +207,22 @@ fn handle_session_event(
             tracing::debug!("partial move event (missing from/to), skipping");
         }
         SessionEvent::Removed(path) => {
+            // On Linux, a rename's "from" half arrives here. Without cookie
+            // pairing we can't confidently reconcile — but if the old path is
+            // in the registry and no longer exists on disk, that's a strong
+            // signal something moved. Logged as info for now; reconciliation
+            // via rename pairing is tracked as a v0.3 feature.
+            if !path.exists() {
+                if let Ok(projects) = registry.list_projects() {
+                    if projects.iter().any(|p| p.path == path) {
+                        info!(
+                            path = %path.display(),
+                            "tracked project path vanished — manual reconcile or wait for matching create"
+                        );
+                        return;
+                    }
+                }
+            }
             tracing::debug!(path = %path.display(), "path removed");
         }
         SessionEvent::Created(path) => {
@@ -189,17 +232,28 @@ fn handle_session_event(
 }
 
 /// Wait for a shutdown signal (SIGINT or SIGTERM).
+///
+/// Signal-registration errors are logged and the failing source is replaced
+/// with a pending future — we never panic inside the daemon event loop.
 async fn shutdown_signal() {
     let ctrl_c = async {
-        signal::ctrl_c().await.expect("failed to listen for ctrl+c");
+        if let Err(e) = signal::ctrl_c().await {
+            warn!(error = %e, "failed to listen for ctrl+c");
+            std::future::pending::<()>().await;
+        }
     };
 
     #[cfg(unix)]
     let terminate = async {
-        signal::unix::signal(signal::unix::SignalKind::terminate())
-            .expect("failed to listen for SIGTERM")
-            .recv()
-            .await;
+        match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+            Ok(mut s) => {
+                s.recv().await;
+            }
+            Err(e) => {
+                warn!(error = %e, "failed to listen for SIGTERM");
+                std::future::pending::<()>().await;
+            }
+        }
     };
 
     #[cfg(not(unix))]

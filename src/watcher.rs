@@ -8,6 +8,7 @@
 
 use std::path::PathBuf;
 
+use notify::event::{ModifyKind, RenameMode};
 use notify::{Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher};
 use tokio::sync::mpsc;
 use tracing::{debug, info, warn};
@@ -37,6 +38,11 @@ pub struct FsWatcher {
 
 impl FsWatcher {
     /// Create a new watcher monitoring the given directories.
+    ///
+    /// `_mode` is reserved for future debouncing / aggressiveness tuning
+    /// (see `WatchMode`). It is currently accepted but ignored — the
+    /// `notify::RecommendedWatcher` runs in its default configuration.
+    /// Tracked as a v0.3 enhancement.
     pub fn new(watch_roots: &[PathBuf], _mode: &WatchMode) -> Result<Self> {
         let (tx, rx) = mpsc::channel(256);
 
@@ -46,8 +52,20 @@ impl FsWatcher {
                 match res {
                     Ok(event) => {
                         if let Some(session_event) = classify_event(&event) {
-                            if event_tx.blocking_send(session_event).is_err() {
-                                warn!("event channel closed");
+                            // `try_send` — never block the notify worker thread. If the
+                            // consumer is backed up, drop the event and log. Using
+                            // `blocking_send` here risks deadlock: the notify thread is
+                            // synchronous and holds OS-level watch handles.
+                            if let Err(e) = event_tx.try_send(session_event) {
+                                use tokio::sync::mpsc::error::TrySendError;
+                                match e {
+                                    TrySendError::Full(_) => {
+                                        warn!("event channel full — dropping event");
+                                    }
+                                    TrySendError::Closed(_) => {
+                                        warn!("event channel closed");
+                                    }
+                                }
                             }
                         }
                     }
@@ -73,9 +91,17 @@ impl FsWatcher {
 
 /// Map a raw `notify` event to a [`SessionEvent`].
 ///
-/// For `ModifyKind::Name` (rename/move), `paths[0]` is the source and
-/// `paths[1]` (when present) is the destination, per `notify` v8 semantics.
-/// Some platforms only emit one path, producing a partial `Moved` event.
+/// Rename semantics differ across platforms:
+/// - **macOS (FSEvents)** typically emits `RenameMode::Both` with paths[0]=from
+///   and paths[1]=to for an atomic rename within the same volume.
+/// - **Linux (inotify)** emits `RenameMode::From` and `RenameMode::To` as two
+///   *separate* events linked by a cookie. Pairing them requires a TTL cache
+///   keyed on `event.attrs.tracker()` — currently a known gap; the half-events
+///   are surfaced as `Created`/`Removed` so the caller at least sees them.
+/// - **`RenameMode::Any`** with two paths is treated like `Both`; with one,
+///   like a half-event.
+///
+/// Tracked as a v0.3 enhancement: full cookie-based rename pairing.
 fn classify_event(event: &Event) -> Option<SessionEvent> {
     match &event.kind {
         EventKind::Create(_) => event
@@ -86,12 +112,35 @@ fn classify_event(event: &Event) -> Option<SessionEvent> {
             .paths
             .first()
             .map(|p| SessionEvent::Removed(p.clone())),
-        EventKind::Modify(notify::event::ModifyKind::Name(_)) => {
-            let from = event.paths.first().cloned();
-            let to = event.paths.get(1).cloned();
-            Some(SessionEvent::Moved { from, to })
-        }
+        EventKind::Modify(ModifyKind::Name(mode)) => classify_rename(mode, &event.paths),
         _ => None,
+    }
+}
+
+/// Decide how to surface a rename event given its `RenameMode` and path list.
+fn classify_rename(mode: &RenameMode, paths: &[PathBuf]) -> Option<SessionEvent> {
+    match mode {
+        RenameMode::Both => {
+            let from = paths.first().cloned();
+            let to = paths.get(1).cloned();
+            if from.is_some() && to.is_some() {
+                Some(SessionEvent::Moved { from, to })
+            } else {
+                None
+            }
+        }
+        RenameMode::From => paths.first().cloned().map(SessionEvent::Removed),
+        RenameMode::To => paths.first().cloned().map(SessionEvent::Created),
+        RenameMode::Any | RenameMode::Other => {
+            if paths.len() >= 2 {
+                Some(SessionEvent::Moved {
+                    from: Some(paths[0].clone()),
+                    to: Some(paths[1].clone()),
+                })
+            } else {
+                paths.first().cloned().map(SessionEvent::Created)
+            }
+        }
     }
 }
 
@@ -109,5 +158,32 @@ mod tests {
             attrs: Default::default(),
         };
         assert!(classify_event(&event).is_none());
+    }
+
+    #[test]
+    fn classify_rename_both_emits_full_move() {
+        let paths = vec![PathBuf::from("/a"), PathBuf::from("/b")];
+        let ev = classify_rename(&RenameMode::Both, &paths);
+        match ev {
+            Some(SessionEvent::Moved { from, to }) => {
+                assert_eq!(from, Some(PathBuf::from("/a")));
+                assert_eq!(to, Some(PathBuf::from("/b")));
+            }
+            other => panic!("expected Moved, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn classify_rename_from_emits_removed() {
+        let paths = vec![PathBuf::from("/a")];
+        let ev = classify_rename(&RenameMode::From, &paths);
+        assert!(matches!(ev, Some(SessionEvent::Removed(p)) if p == PathBuf::from("/a")));
+    }
+
+    #[test]
+    fn classify_rename_to_emits_created() {
+        let paths = vec![PathBuf::from("/b")];
+        let ev = classify_rename(&RenameMode::To, &paths);
+        assert!(matches!(ev, Some(SessionEvent::Created(p)) if p == PathBuf::from("/b")));
     }
 }
