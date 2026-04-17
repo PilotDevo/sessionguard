@@ -15,7 +15,7 @@ use std::path::Path;
 use tracing::{debug, info, warn};
 
 use crate::error::Result;
-use crate::event_log::{EventLog, ReconcileAction};
+use crate::event_log::{EventLog, LogEntry, ReconcileAction};
 use crate::tools::{PathFieldSpec, ReconcileStrategy, ToolDefinition};
 
 /// Outcome of a single reconciliation operation.
@@ -89,6 +89,7 @@ fn rewrite_paths(
                         tool_name: tool.name.clone(),
                         file_path: artifact_path.clone(),
                         field: field_spec.field.clone(),
+                        format: field_spec.format.clone(),
                         old_value: pairs[0].0.clone(),
                         new_value: pairs[0].1.clone(),
                     };
@@ -118,6 +119,46 @@ fn rewrite_paths(
         success: true,
         error: None,
     }
+}
+
+// ── Undo ─────────────────────────────────────────────────────────────────────
+
+/// Reverse a previously-recorded reconciliation event.
+///
+/// Routes to the same adapter used during reconciliation (based on the
+/// `format` stored in the event log) but with `old_value` / `new_value`
+/// swapped — so `new_value` gets rewritten back to `old_value`.
+///
+/// Returns `Ok(true)` if the file was modified, `Ok(false)` if the expected
+/// value wasn't found (file may have been edited since, or the event was
+/// already undone manually). `dry_run = true` only checks that the file
+/// exists and reports what would happen without writing.
+pub fn undo_event(entry: &LogEntry, dry_run: bool) -> Result<bool> {
+    use crate::tools::PathFieldSpec;
+
+    if !entry.file_path.exists() {
+        return Err(crate::error::Error::Reconcile {
+            path: entry.file_path.clone(),
+            detail: "target file no longer exists".to_string(),
+        });
+    }
+
+    if dry_run {
+        return Ok(true);
+    }
+
+    // Synthesise a PathFieldSpec from the event log. The adapters consume
+    // only `field` and `format`; `file` is irrelevant here because we already
+    // have the concrete artifact path.
+    let field_spec = PathFieldSpec {
+        file: String::new(),
+        field: entry.field.clone(),
+        format: entry.format.clone(),
+    };
+
+    // Swap old ↔ new: rewrite new_value back to old_value.
+    let pairs = vec![(entry.new_value.clone(), entry.old_value.clone())];
+    rewrite_field(&entry.file_path, &field_spec, &pairs)
 }
 
 /// Produce paired (old, new) path-string candidates to try in order.
@@ -775,5 +816,128 @@ mod tests {
                 .contains(&old_path.to_string_lossy().to_string()),
             "notes field should still contain the OLD path (surgical rewrite)"
         );
+    }
+
+    // ── Undo tests ───────────────────────────────────────────────────────
+
+    /// Round-trip: reconcile then undo → file is back to original state.
+    #[test]
+    fn undo_restores_json_field() {
+        let sandbox = TempDir::new().unwrap();
+        let old_path = sandbox.path().join("orig");
+        let new_path = sandbox.path().join("dest");
+        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        let settings = old_path.join(".claude/settings.json");
+        let original = format!(
+            r#"{{"project_path": "{}","model": "opus"}}"#,
+            old_path.display()
+        );
+        fs::write(&settings, &original).unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+
+        let registry = ToolRegistry::new().unwrap();
+        let tool = registry.get("claude_code").unwrap();
+        let event_log = EventLog::open_in_memory().unwrap();
+        let r = reconcile(tool, &old_path, &new_path, &event_log);
+        assert!(r.success);
+
+        // Grab the logged entry and run undo
+        let entry = &event_log.recent(1).unwrap()[0];
+        let changed = undo_event(entry, false).unwrap();
+        assert!(changed, "undo should modify the file");
+
+        // File now contains the OLD path again
+        let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+        assert_eq!(
+            v["project_path"].as_str().unwrap(),
+            old_path.to_string_lossy()
+        );
+        assert_eq!(v["model"], "opus");
+    }
+
+    /// Dry-run undo doesn't modify the file.
+    #[test]
+    fn undo_dry_run_leaves_file_alone() {
+        let sandbox = TempDir::new().unwrap();
+        let old_path = sandbox.path().join("dry-orig");
+        let new_path = sandbox.path().join("dry-dest");
+        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        fs::write(
+            old_path.join(".claude/settings.json"),
+            format!(r#"{{"project_path": "{}"}}"#, old_path.display()),
+        )
+        .unwrap();
+        fs::rename(&old_path, &new_path).unwrap();
+
+        let registry = ToolRegistry::new().unwrap();
+        let event_log = EventLog::open_in_memory().unwrap();
+        let _ = reconcile(
+            registry.get("claude_code").unwrap(),
+            &old_path,
+            &new_path,
+            &event_log,
+        );
+        let after_reconcile = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+
+        let entry = &event_log.recent(1).unwrap()[0];
+        let would_undo = undo_event(entry, true).unwrap();
+        assert!(would_undo, "dry run should report it would undo");
+
+        let after_dry_run = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        assert_eq!(
+            after_reconcile, after_dry_run,
+            "dry run must not modify the file"
+        );
+    }
+
+    /// Undoing when the file no longer contains the expected new_value
+    /// returns Ok(false) rather than corrupting things.
+    #[test]
+    fn undo_is_safe_when_file_has_been_modified() {
+        let sandbox = TempDir::new().unwrap();
+        let artifact = sandbox.path().join("settings.json");
+        fs::write(&artifact, r#"{"project_path": "/totally/different"}"#).unwrap();
+
+        let fake_entry = LogEntry {
+            id: 1,
+            timestamp: "2026-01-01 00:00:00".into(),
+            tool_name: "claude_code".into(),
+            file_path: artifact.clone(),
+            field: "project_path".into(),
+            format: "json".into(),
+            old_value: "/orig/path".into(),
+            new_value: "/expected/new/path".into(),
+            undone_at: None,
+        };
+
+        let changed = undo_event(&fake_entry, false).unwrap();
+        assert!(
+            !changed,
+            "undo must report no-change when new_value isn't found"
+        );
+
+        // File untouched
+        let content = fs::read_to_string(&artifact).unwrap();
+        assert!(content.contains("/totally/different"));
+    }
+
+    /// Undo errors cleanly (doesn't panic) when the target file is gone.
+    #[test]
+    fn undo_errors_when_file_missing() {
+        let sandbox = TempDir::new().unwrap();
+        let entry = LogEntry {
+            id: 1,
+            timestamp: "2026-01-01 00:00:00".into(),
+            tool_name: "claude_code".into(),
+            file_path: sandbox.path().join("does-not-exist.json"),
+            field: "project_path".into(),
+            format: "json".into(),
+            old_value: "/old".into(),
+            new_value: "/new".into(),
+            undone_at: None,
+        };
+        let err = undo_event(&entry, false).unwrap_err();
+        assert!(err.to_string().contains("no longer exists"));
     }
 }
