@@ -1,0 +1,22 @@
+[tool]
+name = "aider"
+display_name = "Aider"
+version = "1.0"
+# Aider stores chat history in .aider.chat.history.md and input history in
+# .aider.input.history, both under the project root. These files contain
+# absolute paths to files added to the chat context.
+on_move = "rewrite_paths"
+
+session_patterns = [
+  ".aider.chat.history.md",
+  ".aider.input.history",
+  ".aider.tags.cache.v4",
+  ".aider.conf.yml",
+]
+
+# Aider's chat history contains file references to absolute paths.
+# Use the text adapter as a fallback since chat history is markdown.
+[[tool.path_fields]]
+file = ".aider.chat.history.md"
+field = "_content"
+format = "text"

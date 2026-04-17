@@ -85,6 +85,9 @@ pub struct ToolRegistry {
 // Built-in tool pattern TOML files, compiled into the binary.
 const BUILTIN_CLAUDE_CODE: &str = include_str!("builtin/claude_code.toml");
 const BUILTIN_CURSOR: &str = include_str!("builtin/cursor.toml");
+const BUILTIN_WINDSURF: &str = include_str!("builtin/windsurf.toml");
+const BUILTIN_AIDER: &str = include_str!("builtin/aider.toml");
+const BUILTIN_GEMINI_CLI: &str = include_str!("builtin/gemini_cli.toml");
 
 impl ToolRegistry {
     /// Create a new registry loaded with built-in defaults only.
@@ -137,7 +140,13 @@ impl ToolRegistry {
 
     /// Load built-in tool definitions compiled into the binary.
     fn load_builtin(&mut self) -> Result<()> {
-        for toml_str in [BUILTIN_CLAUDE_CODE, BUILTIN_CURSOR] {
+        for toml_str in [
+            BUILTIN_CLAUDE_CODE,
+            BUILTIN_CURSOR,
+            BUILTIN_WINDSURF,
+            BUILTIN_AIDER,
+            BUILTIN_GEMINI_CLI,
+        ] {
             let tool_file: ToolFile = toml::from_str(toml_str)
                 .map_err(|e| Error::ToolDefinition(format!("invalid built-in tool TOML: {e}")))?;
             self.register(tool_file.tool);
@@ -184,6 +193,9 @@ mod tests {
         let registry = ToolRegistry::new().unwrap();
         assert!(registry.get("claude_code").is_some());
         assert!(registry.get("cursor").is_some());
+        assert!(registry.get("windsurf").is_some());
+        assert!(registry.get("aider").is_some());
+        assert!(registry.get("gemini_cli").is_some());
     }
 
     #[test]
@@ -326,7 +338,8 @@ session_patterns = [".cursor/", ".cursor-custom/"]
         let mut registry = ToolRegistry::new().unwrap();
         registry.load_all(dir.path()).unwrap();
 
-        // Only builtins, no errors from non-TOML files
-        assert_eq!(registry.tools.len(), 2);
+        // Only builtins present, no errors from non-TOML files.
+        // Counts all compiled-in built-in tool TOML files.
+        assert_eq!(registry.tools.len(), 5);
     }
 }

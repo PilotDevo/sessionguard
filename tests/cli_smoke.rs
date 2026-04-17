@@ -54,3 +54,41 @@ fn cli_log_empty() {
         .assert()
         .success();
 }
+
+#[test]
+fn cli_tools_list_shows_builtins() {
+    Command::cargo_bin("sessionguard")
+        .unwrap()
+        .arg("tools")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude_code"))
+        .stdout(predicate::str::contains("cursor"))
+        .stdout(predicate::str::contains("windsurf"))
+        .stdout(predicate::str::contains("aider"))
+        .stdout(predicate::str::contains("gemini_cli"));
+}
+
+#[test]
+fn cli_tools_list_verbose_shows_patterns() {
+    Command::cargo_bin("sessionguard")
+        .unwrap()
+        .args(["tools", "list", "--verbose"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("session_patterns:"))
+        .stdout(predicate::str::contains("path_fields:"));
+}
+
+#[test]
+fn cli_undo_no_events_prints_message() {
+    // Fresh in-process data dir so we know the log is empty
+    let tmp = tempfile::TempDir::new().unwrap();
+    Command::cargo_bin("sessionguard")
+        .unwrap()
+        .env("SESSIONGUARD_DATA_DIR", tmp.path())
+        .arg("undo")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no actions to undo"));
+}

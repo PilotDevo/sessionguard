@@ -263,6 +263,112 @@ async fn main() -> Result<()> {
             }
         },
 
+        Command::Tools { action } => {
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let mut tools: Vec<_> = tool_registry.all().collect();
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+            let verbose = matches!(
+                action,
+                Some(sessionguard::cli::ToolsAction::List { verbose: true })
+            );
+
+            if tools.is_empty() {
+                println!("no tools registered");
+            } else {
+                println!("{:<16} {:<24} VERSION", "NAME", "DISPLAY");
+                for t in &tools {
+                    println!(
+                        "{:<16} {:<24} {}",
+                        t.name,
+                        t.display_name,
+                        t.version.as_deref().unwrap_or("-")
+                    );
+                    if verbose {
+                        if !t.session_patterns.is_empty() {
+                            println!("  session_patterns:");
+                            for p in &t.session_patterns {
+                                println!("    - {p}");
+                            }
+                        }
+                        if !t.path_fields.is_empty() {
+                            println!("  path_fields:");
+                            for pf in &t.path_fields {
+                                println!("    - {} :: {} ({})", pf.file, pf.field, pf.format);
+                            }
+                        }
+                        println!("  on_move: {:?}", t.on_move);
+                        println!();
+                    }
+                }
+                if !verbose {
+                    println!(
+                        "\n{} tools registered. Use --verbose for patterns.",
+                        tools.len()
+                    );
+                }
+            }
+        }
+
+        Command::Undo { last, id, dry_run } => {
+            let event_log = EventLog::open_default()?;
+
+            let entries = match id {
+                Some(event_id) => vec![event_log
+                    .get(event_id)?
+                    .ok_or_else(|| anyhow::anyhow!("no event with id {event_id}"))?],
+                None => event_log.recent_pending_undo(last.max(1))?,
+            };
+
+            if entries.is_empty() {
+                println!("no actions to undo");
+            } else {
+                println!(
+                    "{} {} action(s):",
+                    if dry_run { "would undo" } else { "undoing" },
+                    entries.len()
+                );
+                let mut undone = 0usize;
+                let mut failed = 0usize;
+                for entry in &entries {
+                    match sessionguard::reconciler::undo_event(entry, dry_run) {
+                        Ok(changed) => {
+                            println!(
+                                "  [{}] {} {} :: {} → {}{}",
+                                entry.id,
+                                entry.tool_name,
+                                entry.file_path.display(),
+                                entry.new_value,
+                                entry.old_value,
+                                if !changed {
+                                    " (no match — file may have been modified)"
+                                } else if dry_run {
+                                    " (dry run)"
+                                } else {
+                                    ""
+                                }
+                            );
+                            if changed && !dry_run {
+                                event_log.mark_undone(entry.id)?;
+                                undone += 1;
+                            }
+                        }
+                        Err(e) => {
+                            println!(
+                                "  [{}] FAILED :: {} :: {e}",
+                                entry.id,
+                                entry.file_path.display()
+                            );
+                            failed += 1;
+                        }
+                    }
+                }
+                if !dry_run {
+                    println!("\n{undone} undone, {failed} failed");
+                }
+            }
+        }
+
         Command::Version => {
             println!(
                 "sessionguard {} ({})",

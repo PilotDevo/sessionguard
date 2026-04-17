@@ -1,0 +1,16 @@
+[tool]
+name = "windsurf"
+display_name = "Windsurf"
+version = "1.0"
+on_move = "rewrite_paths"
+
+session_patterns = [
+  ".windsurf/",
+  ".windsurfrules",
+  ".windsurfignore",
+]
+
+[[tool.path_fields]]
+file = ".windsurf/state.json"
+field = "project_root"
+format = "json"

@@ -1,0 +1,16 @@
+[tool]
+name = "gemini_cli"
+display_name = "Gemini CLI"
+version = "1.0"
+on_move = "rewrite_paths"
+
+session_patterns = [
+  ".gemini/",
+  ".geminiignore",
+  "GEMINI.md",
+]
+
+[[tool.path_fields]]
+file = ".gemini/settings.json"
+field = "project_root"
+format = "json"

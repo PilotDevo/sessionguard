@@ -105,6 +105,25 @@ pub enum Command {
         action: Option<ConfigAction>,
     },
 
+    /// Inspect registered tool patterns (built-in + user + project).
+    Tools {
+        #[command(subcommand)]
+        action: Option<ToolsAction>,
+    },
+
+    /// Undo previous reconciliation actions from the event log.
+    Undo {
+        /// Undo the last N actions. Default: 1.
+        #[arg(long, default_value = "1")]
+        last: usize,
+        /// Undo a specific event by id (mutually exclusive with --last).
+        #[arg(long)]
+        id: Option<i64>,
+        /// Show what would be undone without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
     /// Print version info.
     Version,
 
@@ -134,4 +153,14 @@ pub enum ConfigAction {
     Path,
     /// Edit the config file in $EDITOR.
     Edit,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ToolsAction {
+    /// List all registered tools (default).
+    List {
+        /// Show each tool's patterns and path_fields, not just the names.
+        #[arg(short, long)]
+        verbose: bool,
+    },
 }
