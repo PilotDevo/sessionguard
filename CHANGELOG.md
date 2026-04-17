@@ -2,6 +2,38 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.0] - 2026-04-17
+
+### Features
+
+- **`sessionguard undo`** — reverse previously-logged reconciliation actions.
+  Routes to the same adapter used during reconciliation with `old_value` /
+  `new_value` swapped. Supports `--last N` (default 1), `--id <N>` for a
+  specific event, and `--dry-run` for preview-only. Undone events are marked
+  via `undone_at` so they're excluded from future `undo` invocations.
+- **`sessionguard tools [list] [--verbose]`** — inspect registered tool
+  patterns (built-in + user config + project config). `--verbose` shows
+  session patterns and path_fields per tool.
+- **3 new built-in tool patterns**: Windsurf, Aider, Gemini CLI. Built-in
+  count is now 5 (plus any user or project patterns).
+
+### Changes
+
+- **Event log schema**: `format` column (adapter hint for undo) and
+  `undone_at` timestamp column added. Fresh DBs get the full schema; pre-v0.3
+  DBs are migrated in-place via idempotent `ALTER TABLE ADD COLUMN`.
+- **`ReconcileAction`** now carries the `format` field so undo can route to
+  the right adapter without needing the tool definition.
+- **`ROADMAP.md`** added, capturing v0.3 → v1.0 arc and the v0.4 "migrate"
+  thesis shift.
+
+### Internal
+
+- `reconciler::rewrite_field` exposed as `pub(crate)` to support undo reuse
+- Schema migration fixed: index creation on new columns now happens AFTER
+  `ALTER TABLE` (previously both ran in one batch and the index failed,
+  aborting the migration)
+
 ## [0.2.3] - 2026-04-17
 
 ### Bug Fixes (Critical)
