@@ -1,0 +1,16 @@
+[tool]
+name = "opencode"
+display_name = "OpenCode"
+version = "1.0"
+# sst/opencode stores session data under ~/.local/share/opencode/ and
+# respects AGENTS.md plus per-project opencode.json(c) config. Session
+# data is keyed on absolute project path; home-dir reconciliation is
+# v0.4 `migrate` scope, so on_move stays `notify` for now.
+on_move = "notify"
+
+session_patterns = [
+  "AGENTS.md",
+  ".opencodeignore",
+  "opencode.json",
+  "opencode.jsonc",
+]

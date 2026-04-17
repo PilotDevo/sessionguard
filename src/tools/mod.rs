@@ -88,6 +88,8 @@ const BUILTIN_CURSOR: &str = include_str!("builtin/cursor.toml");
 const BUILTIN_WINDSURF: &str = include_str!("builtin/windsurf.toml");
 const BUILTIN_AIDER: &str = include_str!("builtin/aider.toml");
 const BUILTIN_GEMINI_CLI: &str = include_str!("builtin/gemini_cli.toml");
+const BUILTIN_CODEX: &str = include_str!("builtin/codex.toml");
+const BUILTIN_OPENCODE: &str = include_str!("builtin/opencode.toml");
 
 impl ToolRegistry {
     /// Create a new registry loaded with built-in defaults only.
@@ -146,6 +148,8 @@ impl ToolRegistry {
             BUILTIN_WINDSURF,
             BUILTIN_AIDER,
             BUILTIN_GEMINI_CLI,
+            BUILTIN_CODEX,
+            BUILTIN_OPENCODE,
         ] {
             let tool_file: ToolFile = toml::from_str(toml_str)
                 .map_err(|e| Error::ToolDefinition(format!("invalid built-in tool TOML: {e}")))?;
@@ -196,6 +200,8 @@ mod tests {
         assert!(registry.get("windsurf").is_some());
         assert!(registry.get("aider").is_some());
         assert!(registry.get("gemini_cli").is_some());
+        assert!(registry.get("codex").is_some());
+        assert!(registry.get("opencode").is_some());
     }
 
     #[test]
@@ -340,6 +346,6 @@ session_patterns = [".cursor/", ".cursor-custom/"]
 
         // Only builtins present, no errors from non-TOML files.
         // Counts all compiled-in built-in tool TOML files.
-        assert_eq!(registry.tools.len(), 5);
+        assert_eq!(registry.tools.len(), 7);
     }
 }

@@ -1,0 +1,17 @@
+[tool]
+name = "codex"
+display_name = "Codex"
+version = "1.0"
+# OpenAI Codex CLI stores session data under ~/.codex/sessions/ keyed on
+# absolute `cwd`. Nothing project-local to rewrite yet, so on_move is
+# `notify` until v0.4 `migrate` lands home-dir reconciliation.
+#
+# Detection hinges on markers placed inside the project tree: AGENTS.md
+# (the shared multi-agent project manifest) and an optional .codex/
+# directory for per-project config overrides.
+on_move = "notify"
+
+session_patterns = [
+  "AGENTS.md",
+  ".codex/",
+]

@@ -2,6 +2,29 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.1] - 2026-04-17
+
+### Features
+
+- **Two new built-in tool patterns**: Codex and OpenCode. Both declared as
+  `on_move = "notify"` for now — their session data lives under `~/.codex`
+  and `~/.local/share/opencode` respectively, keyed on absolute project
+  paths. Home-dir reconciliation is v0.4 `migrate` scope; until then these
+  patterns surface the tools' presence (via `AGENTS.md` + per-project
+  markers) without touching the home-dir stores. Total built-in count is
+  now **7**.
+- **Dashboard: Sessions tab** — enumerates home-dir session stores for
+  Claude Code, Codex, OpenCode, Cursor, and Gemini CLI. Shows presence,
+  item count, aggregate size, and last-modified time. Walks are capped
+  at 200k files per store and cached for 30 seconds so polling doesn't
+  re-scan multi-GB trees.
+
+### Notes
+
+- Dashboard smoke test on the author's Mac reveals 13 GB of Codex
+  rollouts, 1.6 GB of Claude Code projects, and 6 OpenCode sessions —
+  exactly the kind of data the v0.4 `migrate` feature will target.
+
 ## [0.3.0] - 2026-04-17
 
 ### Features

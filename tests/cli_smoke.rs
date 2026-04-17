@@ -66,7 +66,9 @@ fn cli_tools_list_shows_builtins() {
         .stdout(predicate::str::contains("cursor"))
         .stdout(predicate::str::contains("windsurf"))
         .stdout(predicate::str::contains("aider"))
-        .stdout(predicate::str::contains("gemini_cli"));
+        .stdout(predicate::str::contains("gemini_cli"))
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("opencode"));
 }
 
 #[test]

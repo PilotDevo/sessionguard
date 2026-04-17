@@ -30,6 +30,7 @@ import json
 import os
 import sqlite3
 import subprocess
+import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
@@ -183,6 +184,135 @@ def list_tools() -> list[dict[str, Any]]:
     return tools
 
 
+# ── home-dir session stores ──────────────────────────────────────────────────
+#
+# AI tools split over two storage conventions:
+#   1. *in-project* state — SessionGuard reconciles this automatically
+#      via the tool patterns' `path_fields`.
+#   2. *home-dir* state — session histories under ~/.codex, ~/.local/share,
+#      etc., keyed on absolute project paths. SessionGuard can't rewrite
+#      these yet (v0.4 `migrate` scope), but it CAN surface them so you
+#      know what's there.
+#
+# This section enumerates home-dir stores for visibility. Results are
+# cached for 30 seconds because walking a multi-GB tree on every 3s poll
+# is wasteful.
+
+_HOME_SESSION_STORES = [
+    {
+        "tool": "claude_code",
+        "display": "Claude Code",
+        "path": "~/.claude/projects",
+        "kind": "dir_per_project",
+    },
+    {
+        "tool": "codex",
+        "display": "Codex",
+        "path": "~/.codex/sessions",
+        "kind": "jsonl_tree",
+    },
+    {
+        "tool": "opencode",
+        "display": "OpenCode",
+        "path": "~/.local/share/opencode",
+        "kind": "mixed",
+    },
+    {
+        "tool": "cursor",
+        "display": "Cursor",
+        "path": "~/.cursor",
+        "kind": "mixed",
+    },
+    {
+        "tool": "gemini_cli",
+        "display": "Gemini CLI",
+        "path": "~/.gemini",
+        "kind": "mixed",
+    },
+]
+
+# Max files we'll walk per store before giving up and calling the count
+# an estimate. Protects against pathological cases (millions of files).
+_HOME_WALK_CAP = 200_000
+
+_home_sessions_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _store_summary(store: dict[str, Any]) -> dict[str, Any]:
+    path = Path(os.path.expanduser(store["path"]))
+    out = {
+        "tool": store["tool"],
+        "display": store["display"],
+        "path": str(path),
+        "kind": store["kind"],
+        "present": path.exists(),
+        "count": 0,
+        "size_bytes": 0,
+        "mtime": None,
+        "truncated": False,
+    }
+    if not path.exists():
+        return out
+
+    try:
+        out["mtime"] = path.stat().st_mtime
+    except OSError:
+        pass
+
+    total_files = 0
+    size_bytes = 0
+
+    try:
+        if store["kind"] == "dir_per_project":
+            # Claude Code: one directory per project, usually flat.
+            out["count"] = sum(1 for e in path.iterdir() if e.is_dir())
+        elif store["kind"] == "jsonl_tree":
+            # Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl
+            for root, _, files in os.walk(path):
+                for f in files:
+                    if f.endswith(".jsonl"):
+                        out["count"] += 1
+                    total_files += 1
+                    if total_files >= _HOME_WALK_CAP:
+                        out["truncated"] = True
+                        break
+                if out["truncated"]:
+                    break
+        else:
+            # mixed: count top-level entries and let size speak for itself
+            out["count"] = sum(1 for _ in path.iterdir())
+
+        # Aggregate size (capped).
+        for root, _, files in os.walk(path):
+            for f in files:
+                try:
+                    size_bytes += (Path(root) / f).stat().st_size
+                except OSError:
+                    pass
+                total_files += 1
+                if total_files >= _HOME_WALK_CAP:
+                    out["truncated"] = True
+                    break
+            if out["truncated"]:
+                break
+    except (OSError, PermissionError) as e:
+        out["error"] = str(e)
+
+    out["size_bytes"] = size_bytes
+    return out
+
+
+def list_home_sessions() -> list[dict[str, Any]]:
+    now = time.time()
+    cached = _home_sessions_cache.get("data")
+    if cached is not None and (now - _home_sessions_cache["ts"]) < 30.0:
+        return cached
+    data = [_store_summary(s) for s in _HOME_SESSION_STORES]
+    _home_sessions_cache["ts"] = now
+    _home_sessions_cache["data"] = data
+    return data
+
+
 def daemon_status(data_dir: Path) -> dict[str, Any]:
     pid_file = data_dir / "sessionguard.pid"
     if not pid_file.is_file():
@@ -287,11 +417,13 @@ INDEX_HTML = r"""<!doctype html>
 <nav>
   <button data-tab="projects" class="active">Projects</button>
   <button data-tab="events">Events</button>
+  <button data-tab="sessions">Sessions</button>
   <button data-tab="tools">Tools</button>
 </nav>
 <main>
   <section id="projects"></section>
   <section id="events" class="hidden"></section>
+  <section id="sessions" class="hidden"></section>
   <section id="tools" class="hidden"></section>
 </main>
 <script>
@@ -371,6 +503,56 @@ INDEX_HTML = r"""<!doctype html>
       </div>`;
   };
 
+  const fmtSize = (b) => {
+    if (!b) return "0 B";
+    const units = ["B", "KB", "MB", "GB", "TB"];
+    let i = 0, n = b;
+    while (n >= 1024 && i < units.length - 1) { n /= 1024; i++; }
+    return (n >= 10 ? Math.round(n) : n.toFixed(1)) + " " + units[i];
+  };
+  const fmtMtime = (t) => {
+    if (!t) return "-";
+    const d = new Date(t * 1000);
+    return d.toISOString().replace("T", " ").replace(/\.\d+Z$/, "");
+  };
+
+  const renderSessions = (sessions) => {
+    if (!sessions.length) return `<div class="empty">no session stores known</div>`;
+    const rows = sessions.map(s => {
+      const tag = !s.present
+        ? `<span class="tag muted">absent</span>`
+        : s.error
+          ? `<span class="tag warn">${esc(s.error)}</span>`
+          : `<span class="tag good">present</span>`;
+      const countDisplay = s.truncated
+        ? `${esc(s.count)}+ <span class="muted">(truncated)</span>`
+        : esc(s.count);
+      return `
+        <tr>
+          <td><strong>${esc(s.display)}</strong><br><code>${esc(s.tool)}</code></td>
+          <td><code>${esc(s.path)}</code></td>
+          <td>${tag}</td>
+          <td>${countDisplay}</td>
+          <td>${esc(fmtSize(s.size_bytes))}</td>
+          <td class="muted">${esc(fmtMtime(s.mtime))}</td>
+        </tr>`;
+    }).join("");
+    return `
+      <div class="panel">
+        <table>
+          <thead><tr>
+            <th>Tool</th><th>Path</th><th>State</th><th>Items</th><th>Size</th><th>Last Modified</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="muted" style="margin-top:0.75rem;font-size:12px">
+          Home-dir session stores. SessionGuard reconciles <em>in-project</em> state today;
+          these home-dir stores are visibility-only until v0.4 <code>migrate</code> lands.
+          (cached 30s)
+        </div>
+      </div>`;
+  };
+
   const renderTools = (tools) => {
     if (!tools.length) return `<div class="empty">no tool patterns loaded</div>`;
     return tools.map(t => `
@@ -401,12 +583,13 @@ INDEX_HTML = r"""<!doctype html>
     document.querySelectorAll("nav button").forEach(b => {
       b.classList.toggle("active", b.dataset.tab === state.tab);
     });
-    ["projects", "events", "tools"].forEach(t => {
+    ["projects", "events", "sessions", "tools"].forEach(t => {
       document.getElementById(t).classList.toggle("hidden", state.tab !== t);
     });
 
     document.getElementById("projects").innerHTML = renderProjects(d.projects);
     document.getElementById("events").innerHTML = renderEvents(d.events);
+    document.getElementById("sessions").innerHTML = renderSessions(d.sessions || []);
     document.getElementById("tools").innerHTML = renderTools(d.tools);
   };
 
@@ -467,6 +650,7 @@ class Handler(BaseHTTPRequestHandler):
                     "projects": list_projects(data_dir),
                     "events": list_events(data_dir, limit=200),
                     "tools": list_tools(),
+                    "sessions": list_home_sessions(),
                 }
             )
         elif self.path == "/healthz":
