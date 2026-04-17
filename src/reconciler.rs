@@ -71,8 +71,7 @@ fn rewrite_paths(
     event_log: &EventLog,
 ) -> ReconcileResult {
     let mut actions = Vec::new();
-    let old_root_str = old_root.to_string_lossy();
-    let new_root_str = new_root.to_string_lossy();
+    let pairs: Vec<(String, String)> = path_pair_candidates(old_root, new_root);
 
     for field_spec in &tool.path_fields {
         let artifact_path = new_root.join(&field_spec.file);
@@ -81,7 +80,7 @@ fn rewrite_paths(
             continue;
         }
 
-        let result = rewrite_field(&artifact_path, field_spec, &old_root_str, &new_root_str);
+        let result = rewrite_field(&artifact_path, field_spec, &pairs);
 
         match result {
             Ok(changed) => {
@@ -90,8 +89,8 @@ fn rewrite_paths(
                         tool_name: tool.name.clone(),
                         file_path: artifact_path.clone(),
                         field: field_spec.field.clone(),
-                        old_value: old_root_str.to_string(),
-                        new_value: new_root_str.to_string(),
+                        old_value: pairs[0].0.clone(),
+                        new_value: pairs[0].1.clone(),
                     };
                     if let Err(e) = event_log.record(&action) {
                         warn!(error = %e, "failed to record reconciliation action");
@@ -121,37 +120,83 @@ fn rewrite_paths(
     }
 }
 
+/// Produce paired (old, new) path-string candidates to try in order.
+///
+/// On macOS, `/tmp` is a symlink to `/private/tmp` and `/var/folders/...`
+/// lives under `/private/var/folders/...`. notify reports the canonical
+/// (`/private`-prefixed) form, but user-facing paths in session files are
+/// usually the shorter form. We try both; each candidate rewrites the OLD
+/// form to the matching NEW form, preserving the style the tool originally
+/// used. Try short form first — it's what user-level tooling tends to store.
+fn path_pair_candidates(old: &Path, new: &Path) -> Vec<(String, String)> {
+    let old_raw = old.to_string_lossy().to_string();
+    let new_raw = new.to_string_lossy().to_string();
+    let mut out = Vec::with_capacity(2);
+
+    #[cfg(target_os = "macos")]
+    {
+        // Prefer short form first (what users typically see in their session files).
+        if let (Some(old_short), Some(new_short)) = (
+            old_raw.strip_prefix("/private"),
+            new_raw.strip_prefix("/private"),
+        ) {
+            if !old_short.is_empty() && !new_short.is_empty() {
+                out.push((old_short.to_string(), new_short.to_string()));
+            }
+        }
+    }
+
+    // Always include the raw form.
+    out.push((old_raw, new_raw));
+
+    // Also include the /private-prefixed form if old started with /var or /tmp.
+    #[cfg(target_os = "macos")]
+    {
+        let (raw_old, raw_new) = (&out[out.len() - 1].0, &out[out.len() - 1].1);
+        if raw_old.starts_with("/var/") || raw_old.starts_with("/tmp/") {
+            out.push((format!("/private{raw_old}"), format!("/private{raw_new}")));
+        }
+    }
+
+    out
+}
+
 // ── Adapter dispatch ─────────────────────────────────────────────────────────
 
 /// Rewrite a single field in an artifact file, dispatching to the right adapter.
 fn rewrite_field(
     path: &Path,
     field_spec: &PathFieldSpec,
-    old_str: &str,
-    new_str: &str,
+    pairs: &[(String, String)],
 ) -> Result<bool> {
     match field_spec.format.as_str() {
-        "json" => rewrite_json_field(path, &field_spec.field, old_str, new_str),
-        "toml" => rewrite_toml_field(path, &field_spec.field, old_str, new_str),
-        _ => rewrite_text(path, old_str, new_str),
+        "json" => rewrite_json_field(path, &field_spec.field, pairs),
+        "toml" => rewrite_toml_field(path, &field_spec.field, pairs),
+        _ => rewrite_text(path, pairs),
     }
 }
 
-/// Rewrite `old_root` → `new_root` at the start of `value` when it is either:
-///   - an exact match of `old_root`, or
-///   - a prefix of `value` followed by a path separator (`/` or `\`).
+/// Rewrite the `old` prefix → `new` in `value` for the first matching pair.
 ///
-/// Returns `Some(rewritten)` on match, `None` otherwise. This protects against
-/// substring collisions like `/home/me/code` being rewritten inside
-/// `/home/me/code-backup/foo`.
-fn replace_path_prefix(value: &str, old_root: &str, new_root: &str) -> Option<String> {
-    if value == old_root {
-        return Some(new_root.to_string());
-    }
-    for sep in ['/', '\\'] {
-        let prefix = format!("{old_root}{sep}");
-        if let Some(rest) = value.strip_prefix(&prefix) {
-            return Some(format!("{new_root}{sep}{rest}"));
+/// `pairs` is an ordered list of (old_root, new_root) strings. For each pair,
+/// `value` matches if it equals `old_root` exactly or begins with
+/// `old_root` followed by a path separator (`/` or `\`). When a pair matches,
+/// `value` is rewritten using THAT pair's `new_root` — preserving whichever
+/// form the stored path used (e.g. `/var/...` stays `/var/...`, not
+/// `/private/var/...`).
+///
+/// Protects against substring collisions like `/home/me/code` being
+/// rewritten inside `/home/me/code-backup/foo`.
+fn replace_path_prefix(value: &str, pairs: &[(String, String)]) -> Option<String> {
+    for (old_root, new_root) in pairs {
+        if value == old_root {
+            return Some(new_root.clone());
+        }
+        for sep in ['/', '\\'] {
+            let prefix = format!("{old_root}{sep}");
+            if let Some(rest) = value.strip_prefix(&prefix) {
+                return Some(format!("{new_root}{sep}{rest}"));
+            }
         }
     }
     None
@@ -160,7 +205,7 @@ fn replace_path_prefix(value: &str, old_root: &str, new_root: &str) -> Option<St
 // ── JSON adapter ─────────────────────────────────────────────────────────────
 
 /// Parse JSON, rewrite only the specified field, write back.
-fn rewrite_json_field(path: &Path, field: &str, old_str: &str, new_str: &str) -> Result<bool> {
+fn rewrite_json_field(path: &Path, field: &str, pairs: &[(String, String)]) -> Result<bool> {
     let content = std::fs::read_to_string(path)?;
     let mut value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
@@ -168,7 +213,7 @@ fn rewrite_json_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
             detail: format!("invalid JSON: {e}"),
         })?;
 
-    let changed = json_set_field(&mut value, field, old_str, new_str);
+    let changed = json_set_field(&mut value, field, pairs);
 
     if changed {
         let updated =
@@ -184,12 +229,7 @@ fn rewrite_json_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
 }
 
 /// Walk a dot-separated field path in a JSON value and replace the old path prefix.
-fn json_set_field(
-    value: &mut serde_json::Value,
-    field: &str,
-    old_str: &str,
-    new_str: &str,
-) -> bool {
+fn json_set_field(value: &mut serde_json::Value, field: &str, pairs: &[(String, String)]) -> bool {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = value;
 
@@ -207,7 +247,7 @@ fn json_set_field(
     }
 
     if let serde_json::Value::String(s) = current {
-        if let Some(rewritten) = replace_path_prefix(s, old_str, new_str) {
+        if let Some(rewritten) = replace_path_prefix(s, pairs) {
             *s = rewritten;
             return true;
         }
@@ -219,7 +259,7 @@ fn json_set_field(
 // ── TOML adapter ─────────────────────────────────────────────────────────────
 
 /// Parse TOML, rewrite only the specified field, write back.
-fn rewrite_toml_field(path: &Path, field: &str, old_str: &str, new_str: &str) -> Result<bool> {
+fn rewrite_toml_field(path: &Path, field: &str, pairs: &[(String, String)]) -> Result<bool> {
     let content = std::fs::read_to_string(path)?;
     let mut value: toml::Value =
         toml::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
@@ -227,7 +267,7 @@ fn rewrite_toml_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
             detail: format!("invalid TOML: {e}"),
         })?;
 
-    let changed = toml_set_field(&mut value, field, old_str, new_str);
+    let changed = toml_set_field(&mut value, field, pairs);
 
     if changed {
         let updated =
@@ -243,7 +283,7 @@ fn rewrite_toml_field(path: &Path, field: &str, old_str: &str, new_str: &str) ->
 }
 
 /// Walk a dot-separated field path in a TOML value and replace the old path prefix.
-fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: &str) -> bool {
+fn toml_set_field(value: &mut toml::Value, field: &str, pairs: &[(String, String)]) -> bool {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = value;
 
@@ -261,7 +301,7 @@ fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: 
     }
 
     if let toml::Value::String(s) = current {
-        if let Some(rewritten) = replace_path_prefix(s, old_str, new_str) {
+        if let Some(rewritten) = replace_path_prefix(s, pairs) {
             *s = rewritten;
             return true;
         }
@@ -273,15 +313,20 @@ fn toml_set_field(value: &mut toml::Value, field: &str, old_str: &str, new_str: 
 // ── Text adapter (fallback) ──────────────────────────────────────────────────
 
 /// Simple string replacement in a file. Returns true if any changes were made.
-fn rewrite_text(path: &Path, old_str: &str, new_str: &str) -> Result<bool> {
+/// Tries each candidate in `old_roots`; first whose literal substring is found
+/// is replaced. Unlike the structured JSON/TOML adapters, this is a raw
+/// substring replace and doesn't guard against prefix collisions — reserved
+/// for formats where we have no semantic understanding.
+fn rewrite_text(path: &Path, pairs: &[(String, String)]) -> Result<bool> {
     let content = std::fs::read_to_string(path)?;
-    if content.contains(old_str) {
-        let updated = content.replace(old_str, new_str);
-        std::fs::write(path, updated)?;
-        Ok(true)
-    } else {
-        Ok(false)
+    for (old_str, new_str) in pairs {
+        if content.contains(old_str.as_str()) {
+            let updated = content.replace(old_str.as_str(), new_str);
+            std::fs::write(path, updated)?;
+            return Ok(true);
+        }
     }
+    Ok(false)
 }
 
 #[cfg(test)]
@@ -294,13 +339,18 @@ mod tests {
 
     // ── Unit tests ───────────────────────────────────────────────────────
 
+    /// Test helper: single (old, new) pair as the adapters now expect.
+    fn one_pair(old: &str, new: &str) -> Vec<(String, String)> {
+        vec![(old.to_string(), new.to_string())]
+    }
+
     #[test]
     fn rewrite_text_replaces_paths() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("test.txt");
         fs::write(&file, "path = /old/project").unwrap();
 
-        let changed = rewrite_text(&file, "/old/project", "/new/project").unwrap();
+        let changed = rewrite_text(&file, &one_pair("/old/project", "/new/project")).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
@@ -314,7 +364,7 @@ mod tests {
         let file = dir.path().join("test.txt");
         fs::write(&file, "path = /some/other/path").unwrap();
 
-        let changed = rewrite_text(&file, "/old/project", "/new/project").unwrap();
+        let changed = rewrite_text(&file, &one_pair("/old/project", "/new/project")).unwrap();
         assert!(!changed);
     }
 
@@ -328,14 +378,13 @@ mod tests {
         )
         .unwrap();
 
-        let changed = rewrite_json_field(&file, "project_path", "/old/root", "/new/root").unwrap();
+        let changed =
+            rewrite_json_field(&file, "project_path", &one_pair("/old/root", "/new/root")).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
-        // Target field was rewritten
         assert_eq!(v["project_path"], "/new/root");
-        // Non-target field with same string was NOT touched
         assert_eq!(v["description"], "lives at /old/root too");
     }
 
@@ -349,7 +398,8 @@ mod tests {
         )
         .unwrap();
 
-        let changed = rewrite_json_field(&file, "cache.dir", "/old/root", "/new/root").unwrap();
+        let changed =
+            rewrite_json_field(&file, "cache.dir", &one_pair("/old/root", "/new/root")).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
@@ -361,7 +411,7 @@ mod tests {
     #[test]
     fn replace_path_prefix_exact_match() {
         assert_eq!(
-            replace_path_prefix("/home/me/code", "/home/me/code", "/new/root"),
+            replace_path_prefix("/home/me/code", &one_pair("/home/me/code", "/new/root")),
             Some("/new/root".to_string())
         );
     }
@@ -369,20 +419,28 @@ mod tests {
     #[test]
     fn replace_path_prefix_with_trailing_segment() {
         assert_eq!(
-            replace_path_prefix("/home/me/code/src/main.rs", "/home/me/code", "/new/root"),
+            replace_path_prefix(
+                "/home/me/code/src/main.rs",
+                &one_pair("/home/me/code", "/new/root")
+            ),
             Some("/new/root/src/main.rs".to_string())
         );
     }
 
     #[test]
     fn replace_path_prefix_rejects_substring_collision() {
-        // /home/me/code-backup must NOT match /home/me/code as a prefix.
         assert_eq!(
-            replace_path_prefix("/home/me/code-backup/foo", "/home/me/code", "/new/root"),
+            replace_path_prefix(
+                "/home/me/code-backup/foo",
+                &one_pair("/home/me/code", "/new/root")
+            ),
             None
         );
         assert_eq!(
-            replace_path_prefix("/home/me/code_archive", "/home/me/code", "/new/root"),
+            replace_path_prefix(
+                "/home/me/code_archive",
+                &one_pair("/home/me/code", "/new/root")
+            ),
             None
         );
     }
@@ -390,8 +448,29 @@ mod tests {
     #[test]
     fn replace_path_prefix_windows_separator() {
         assert_eq!(
-            replace_path_prefix(r"C:\old\project\src", r"C:\old\project", r"D:\new"),
+            replace_path_prefix(
+                r"C:\old\project\src",
+                &one_pair(r"C:\old\project", r"D:\new")
+            ),
             Some(r"D:\new\src".to_string())
+        );
+    }
+
+    #[test]
+    fn replace_path_prefix_uses_matching_pairs_new_root() {
+        // value uses short form; first candidate is long form (won't match),
+        // second is short. We must rewrite with the SHORT new_root — not
+        // surprise the user by switching to the long form.
+        let pairs = vec![
+            (
+                "/private/var/folders/xx".to_string(),
+                "/private/var/folders/yy".to_string(),
+            ),
+            ("/var/folders/xx".to_string(), "/var/folders/yy".to_string()),
+        ];
+        assert_eq!(
+            replace_path_prefix("/var/folders/xx/foo", &pairs),
+            Some("/var/folders/yy/foo".to_string())
         );
     }
 
@@ -399,12 +478,14 @@ mod tests {
     fn json_adapter_does_not_corrupt_sibling_path() {
         let dir = TempDir::new().unwrap();
         let file = dir.path().join("settings.json");
-        // The target field's value is a *sibling* path that shares the prefix
-        // but is not inside old_root. This must NOT be rewritten.
         fs::write(&file, r#"{"project_path": "/home/me/code-backup/notes"}"#).unwrap();
 
-        let changed =
-            rewrite_json_field(&file, "project_path", "/home/me/code", "/new/root").unwrap();
+        let changed = rewrite_json_field(
+            &file,
+            "project_path",
+            &one_pair("/home/me/code", "/new/root"),
+        )
+        .unwrap();
         assert!(!changed, "sibling path must not be treated as a prefix");
 
         let content = fs::read_to_string(&file).unwrap();
@@ -417,7 +498,8 @@ mod tests {
         let file = dir.path().join("settings.json");
         fs::write(&file, r#"{"other_field": "value"}"#).unwrap();
 
-        let changed = rewrite_json_field(&file, "project_path", "/old/root", "/new/root").unwrap();
+        let changed =
+            rewrite_json_field(&file, "project_path", &one_pair("/old/root", "/new/root")).unwrap();
         assert!(!changed);
     }
 
@@ -431,7 +513,8 @@ mod tests {
         )
         .unwrap();
 
-        let changed = rewrite_toml_field(&file, "project_root", "/old/root", "/new/root").unwrap();
+        let changed =
+            rewrite_toml_field(&file, "project_root", &one_pair("/old/root", "/new/root")).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
@@ -450,13 +533,47 @@ mod tests {
         )
         .unwrap();
 
-        let changed = rewrite_toml_field(&file, "cache.dir", "/old/root", "/new/root").unwrap();
+        let changed =
+            rewrite_toml_field(&file, "cache.dir", &one_pair("/old/root", "/new/root")).unwrap();
         assert!(changed);
 
         let content = fs::read_to_string(&file).unwrap();
         let v: toml::Value = toml::from_str(&content).unwrap();
         assert_eq!(v["cache"]["dir"].as_str().unwrap(), "/new/root/.cache");
         assert_eq!(v["meta"]["name"].as_str().unwrap(), "test");
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn path_pair_candidates_adds_private_variant_macos() {
+        // /var/folders/... → pairs include both short and /private-prefixed.
+        let pairs = path_pair_candidates(
+            Path::new("/var/folders/xx/abc"),
+            Path::new("/var/folders/xx/def"),
+        );
+        assert!(pairs
+            .iter()
+            .any(|(o, n)| o == "/var/folders/xx/abc" && n == "/var/folders/xx/def"));
+        assert!(
+            pairs
+                .iter()
+                .any(|(o, n)| o == "/private/var/folders/xx/abc"
+                    && n == "/private/var/folders/xx/def")
+        );
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn path_pair_candidates_strips_private_variant_macos() {
+        // /private/tmp/foo → pairs include the short form too.
+        let pairs =
+            path_pair_candidates(Path::new("/private/tmp/foo"), Path::new("/private/tmp/bar"));
+        assert!(pairs
+            .iter()
+            .any(|(o, n)| o == "/tmp/foo" && n == "/tmp/bar"));
+        assert!(pairs
+            .iter()
+            .any(|(o, n)| o == "/private/tmp/foo" && n == "/private/tmp/bar"));
     }
 
     // ── End-to-end proof tests ───────────────────────────────────────────

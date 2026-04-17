@@ -2,6 +2,18 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.2.3] - 2026-04-17
+
+### Bug Fixes (Critical)
+
+- *(watcher)* Rename pairing buffer — `notify` emits renames as two half-events (`From`/`To` on Linux with cookies, back-to-back `Any` events on macOS FSEvents with no cookies). The watcher now buffers half-events and pairs them into proper `Moved` events by cookie match or FIFO-within-TTL fallback. Before this fix, end-to-end reconciliation never fired on macOS or Linux despite the v0.2.2 claims; dogfooding revealed the gap.
+- *(reconciler)* macOS `/private` path aliasing — `notify` reports canonical paths (`/private/var/...`, `/private/tmp/...`), but user tooling stores the short form (`/var/...`, `/tmp/...`). Reconciliation now tries both forms and rewrites with the matching pair's form, so stored paths keep the style the user sees.
+
+### Test
+
+- Added `scripts/dogfood.sh` — end-to-end smoke test that runs the real daemon and verifies reconciliation against a synthetic Claude Code project. Safe to run anywhere; uses isolated config and data dirs.
+- Added `examples/notify_dump.rs` — diagnostic tool that prints every raw `notify` event for a watched directory. Used to reverse-engineer macOS FSEvents behaviour.
+
 ## [0.2.2] - 2026-04-16
 
 ### Bug Fixes
