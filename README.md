@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.1.0 Released** — Full pipeline wired end-to-end. CLI, daemon, detection, and reconciliation all functional. Published on [crates.io](https://crates.io/crates/sessionguard) with pre-built binaries. Alpha quality — use on personal projects, report issues.
+> **Status: v0.3.2** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. `sessionguard undo` wired to the event log. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for the v0.4 `migrate` arc.
 
 ---
 
@@ -42,16 +42,21 @@ SessionGuard is a lightweight filesystem daemon that:
 
 Tool support is defined via runtime-loaded TOML patterns — add new tools without recompiling.
 
-| Tool | Session Artifacts | Status |
-|------|------------------|--------|
-| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` | ✅ Built-in |
-| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | ✅ Built-in |
-| **Windsurf (Codeium)** | `.windsurf/`, `.windsurfrules`, cascade history | 🔜 Planned |
-| **GitHub Copilot** | `.github/copilot-instructions.md`, VS Code chat history | 🔜 Planned |
-| **Gemini Code Assist** | `.gemini/`, `GEMINI.md`, session context | 🔜 Planned |
-| **Codex (OpenAI)** | `codex.md`, `.codex/`, sandbox state | 🔜 Planned |
-| **Aider** | `.aider*`, `.aider.conf.yml`, chat history | 🔜 Planned |
-| **Continue.dev** | `.continue/`, `config.json`, session logs | 🔜 Planned |
+Two support levels today:
+- **Reconcile** — when a project moves, SessionGuard rewrites the tool's in-project session files (e.g. `.claude/settings.json`) to point at the new path, atomically and surgically.
+- **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite yet, because the tool stores its session data in the user's home directory keyed on absolute project paths. Home-dir reconciliation is coming in v0.4 `migrate`.
+
+| Tool | Session Artifacts | Support |
+|------|------------------|---------|
+| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` | ✅ Reconcile |
+| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | ✅ Reconcile |
+| **Windsurf** | `.windsurf/`, `.windsurfrules`, `.windsurfignore` | ✅ Reconcile |
+| **Gemini CLI** | `.gemini/`, `GEMINI.md`, `.geminiignore` | ✅ Reconcile |
+| **Aider** | `.aider.chat.history.md`, `.aider.conf.yml` | ✅ Reconcile *(text adapter)* |
+| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` | 🟡 Detect only |
+| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` | 🟡 Detect only |
+| **GitHub Copilot** | `.github/copilot-instructions.md` | 🔜 Planned |
+| **Continue.dev** | `.continue/`, `config.json` | 🔜 Planned |
 | **Custom / Other** | User-defined patterns via config TOML | ✅ Supported |
 
 > **Tool authors:** We'd love your help defining the canonical session artifact list for your tool. See [Contributing](#contributing).
@@ -131,17 +136,30 @@ sessionguard start --foreground
 # Register a specific project root
 sessionguard watch ~/projects/my-app
 
-# Check status of tracked sessions
-sessionguard status
+# Discover existing AI sessions under a directory
+sessionguard scan ~/projects
 
-# Scan directories to discover existing AI sessions
-sessionguard scan
+# Check status of tracked projects + daemon state
+sessionguard status
+sessionguard status --format json        # machine-readable
+
+# Inspect registered tool patterns (built-in + user + project)
+sessionguard tools list
+sessionguard tools list --verbose        # include session_patterns + path_fields
+sessionguard tools list --format json    # full structured output
 
 # See what would happen if you moved a project (dry run)
 sessionguard simulate mv ~/projects/old-name ~/projects/new-name
 
 # View reconciliation history
 sessionguard log --last 20
+sessionguard log --format json
+
+# Reverse reconciliation actions (single-step undo)
+sessionguard undo                        # undo the last reconciliation
+sessionguard undo --last 5               # undo the five most recent
+sessionguard undo --id 42                # undo a specific event
+sessionguard undo --dry-run              # preview without writing
 
 # Diagnose common issues
 sessionguard doctor
@@ -182,6 +200,28 @@ format = "json"
 
 Tool patterns can also be placed as individual TOML files in `~/.config/sessionguard/tools/`.
 
+## Dashboard
+
+A lightweight **read-only** local web UI lives in `tools/dashboard/app.py`.
+It shows tracked projects, reconciliation events (live + undone), session
+stores in `~/.codex`, `~/.claude/projects`, `~/.local/share/opencode`,
+and every registered tool pattern. Zero dependencies beyond the Python
+standard library — no `pip install`, no `npm`, no build step.
+
+```bash
+python3 tools/dashboard/app.py               # localhost:8787
+python3 tools/dashboard/app.py --host 0.0.0.0 --port 8787   # LAN access
+```
+
+The dashboard opens the SQLite registry with `mode=ro` and talks to
+the daemon only via `sessionguard tools list --format json` — no write
+paths. Action controls (click-to-undo, click-to-migrate) are intentionally
+deferred until the underlying CLI commands they'd drive are fully
+designed; see [ROADMAP.md](ROADMAP.md) for v0.5+ plans.
+
+See [`tools/dashboard/README.md`](tools/dashboard/README.md) for a
+systemd `--user` unit if you want it persistent.
+
 ## Architecture Decisions
 
 ### Why a daemon?
@@ -206,48 +246,38 @@ AI tools evolve fast. New tools appear constantly. By defining tool patterns as 
 
 ## Roadmap
 
-### Phase 1 — Foundation (v0.1) ✅
-- [x] Core daemon with filesystem watching (macOS + Linux)
-- [x] SQLite registry for project-to-session mapping
-- [x] Runtime-loaded tool pattern system (TOML) — built-in → system → user → project
-- [x] Built-in patterns for Claude Code and Cursor
-- [x] Full CLI (start, stop, status, watch, scan, simulate, doctor, log, export/import, config, completions)
-- [x] Structured event logging with SQLite audit trail
-- [x] CI/CD pipeline (GitHub Actions, cargo-deny, dependabot)
-- [x] End-to-end reconciliation pipeline (watcher → detector → reconciler)
-- [x] Adapter-based path rewriting (JSON, TOML) — surgical field targeting, not global string replace
-- [x] Claude Code reconciliation (`.claude/settings.json` → `project_path`)
-- [x] Cursor reconciliation (`.cursor/state.json` → `project_root`)
-- [x] Integration test suite with sandbox environments (41 tests)
-- [x] Published on crates.io with pre-built binaries (linux + macos)
-- [x] Curl-pipe installer, systemd service, GitHub Sponsors
+See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
 
-### Phase 2 — Ecosystem (v0.2) `← current`
-- [ ] Windsurf, Copilot, Gemini, Codex, Aider tool patterns
-- [ ] `sessionguard undo` — reverse reconciliation actions
-- [ ] Background daemonization (`-d` flag)
-- [ ] Windows support
-- [ ] Homebrew formula
+**Shipped** *(v0.1 – v0.3.2)*
+- Full watcher → detector → reconciler pipeline, verified end-to-end on
+  macOS + Linux with real-data dogfooding (not just unit tests)
+- Seven built-in tool patterns (five reconciling, two detect-only)
+- `sessionguard undo` backed by an append-only event log
+- Adapter-based rewriting (JSON, TOML, text fallback) with prefix-safety
+  guarantees — `/home/me/code` never rewrites inside `/home/me/code-backup`
+- `--format json` on `status`, `log`, and `tools` for tooling integration
+- Read-only local dashboard (`tools/dashboard/`)
+- CI dogfood matrix on Ubuntu + macOS (the regression gate for the
+  classes of bugs unit tests historically missed)
+- Homebrew tap + crates.io publishing, both automated on release
 
-### Phase 3 — Intelligence (v0.3)
-- [ ] Auto-discovery of new AI tools via heuristics
-- [ ] Session health scoring (staleness, completeness)
-- [ ] Integration with `git` hooks for branch-aware sessions
-- [ ] Optional session deduplication and cleanup
-- [ ] Plugin API for tool-specific reconciliation logic
+**Next — v0.4 "Migrate"**
+The thesis shift: from *"watches for moves"* to *"the tool that moves
+AI dev environments between disks without breaking them"*. New verbs:
+`sessionguard migrate <tool> --to <path>`, `relocate <src> <dst>`,
+`inventory`. btrfs snapshot integration for atomic rollback. First
+dogfood target: a user's multi-GB Codex/OpenCode history → a fast
+pool, safely.
 
-### Phase 4 — Community (v1.0)
-- [ ] Stable API and configuration format
-- [ ] Comprehensive test suite with CI
-- [ ] Tool vendor partnerships for first-class support
-- [ ] Session export/import for machine migration
-- [ ] Documentation site
+**Later**
+Tool pattern library (community contributions), Tauri-based local UI,
+Windows support, broader launch. See [ROADMAP.md](ROADMAP.md).
 
 ## Project Philosophy
 
 - **Vendor-neutral.** SessionGuard doesn't favor any AI tool. The tool pattern registry is community-maintained and extensible.
 - **Non-invasive.** It never modifies your code. It only touches AI tool session artifacts, and logs every change it makes.
-- **Undo-friendly.** Every reconciliation action can be reversed. If something goes wrong, `sessionguard undo` restores the previous state.
+- **Undo-friendly.** Every reconciliation is append-only in the event log. `sessionguard undo` restores the previous state for the last action (`--last N` for several; `--id <n>` for a specific one; `--dry-run` to preview). Idempotent — already-undone events won't re-undo.
 - **Privacy-first.** SessionGuard never reads your code or session *contents*. It only tracks file paths, timestamps, and structural metadata. Nothing leaves your machine.
 - **Unix philosophy.** It does one thing well. It watches for moves and fixes session paths. That's it.
 
@@ -309,7 +339,13 @@ Not yet. v1.0 focuses on local development. Remote/container support is on the l
 SessionGuard treats each tool's session artifacts independently. It never merges data between tools.
 
 **Q: How do I add support for a new AI tool?**
-Create a TOML file in `~/.config/sessionguard/tools/` following the pattern in `src/tools/builtin/claude_code.toml`. No recompilation needed.
+Create a TOML file in `~/.config/sessionguard/tools/` following the pattern in `src/tools/builtin/claude_code.toml`. No recompilation needed. Or copy one of the built-ins into `sessionguard.toml` under a `[[tools]]` section in your project.
+
+**Q: What happens to session data my AI tool stores in `~/`, not inside the project?**
+Today: SessionGuard detects the project is using the tool but doesn't rewrite the home-dir store on move — that's why Codex and OpenCode are marked *Detect only* in the table above. v0.4's `migrate` command (in active design) will close this gap by safely relocating home-dir stores alongside their project references.
+
+**Q: Is there a GUI?**
+Yes — a minimal read-only one. `python3 tools/dashboard/app.py` serves a local web UI on port 8787 showing tracked projects, event history, home-dir session stores, and registered tool patterns. No dependencies beyond the Python stdlib. An interactive UI that also drives actions (undo, migrate) is planned for v0.5+.
 
 ## License
 
