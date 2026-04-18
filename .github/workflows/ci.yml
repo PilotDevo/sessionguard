@@ -37,6 +37,32 @@ jobs:
       - name: Test
         run: cargo test
 
+  dogfood:
+    name: Dogfood (${{ matrix.os }})
+    # End-to-end smoke test that runs the real daemon against a synthetic
+    # Claude Code project and asserts reconciliation fires. Unit tests
+    # bypass the notify -> daemon pipeline and have historically missed
+    # platform-specific bugs (v0.2.3 rename pairing, macOS /private
+    # aliasing) — this job is the regression gate for those classes.
+    needs: check
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release --quiet
+
+      - name: Run dogfood.sh
+        env:
+          SESSIONGUARD_BIN: ./target/release/sessionguard
+        run: bash scripts/dogfood.sh
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
