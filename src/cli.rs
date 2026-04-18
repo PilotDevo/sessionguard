@@ -7,8 +7,19 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use clap_complete::Shell;
+
+/// Output format for commands that emit structured data (`status`, `log`,
+/// `tools`). `Text` is the default human-readable view; `Json` emits
+/// machine-parseable output — used by the dashboard and scripting.
+#[derive(Debug, Clone, Copy, ValueEnum, Default, PartialEq, Eq)]
+#[value(rename_all = "lowercase")]
+pub enum Format {
+    #[default]
+    Text,
+    Json,
+}
 
 /// SessionGuard — keeps AI coding sessions intact when your projects move.
 #[derive(Debug, Parser)]
@@ -49,7 +60,11 @@ pub enum Command {
     Stop,
 
     /// Show tracked projects and their session health.
-    Status,
+    Status {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
 
     /// Register a directory tree for monitoring.
     Watch {
@@ -80,6 +95,9 @@ pub enum Command {
         /// Number of recent entries to show.
         #[arg(long, default_value = "20")]
         last: usize,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
 
     /// Diagnose common issues (stale refs, orphaned sessions).
@@ -160,7 +178,11 @@ pub enum ToolsAction {
     /// List all registered tools (default).
     List {
         /// Show each tool's patterns and path_fields, not just the names.
+        /// Ignored when `--format json` is used (JSON always includes them).
         #[arg(short, long)]
         verbose: bool,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
     },
 }

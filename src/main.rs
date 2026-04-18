@@ -66,18 +66,30 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Status => {
+        Command::Status { format } => {
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
-            if projects.is_empty() {
-                println!("no tracked projects");
-            } else {
-                println!("{:<6} PATH", "ID");
-                for p in &projects {
-                    println!("{:<6} {}", p.id, p.path.display());
+            let running = sessionguard::daemon::is_running();
+            match format {
+                sessionguard::cli::Format::Json => {
+                    let payload = serde_json::json!({
+                        "daemon_running": running,
+                        "projects": projects,
+                    });
+                    println!("{}", serde_json::to_string_pretty(&payload)?);
+                }
+                sessionguard::cli::Format::Text => {
+                    if projects.is_empty() {
+                        println!("no tracked projects");
+                    } else {
+                        println!("{:<6} PATH", "ID");
+                        for p in &projects {
+                            println!("{:<6} {}", p.id, p.path.display());
+                        }
+                    }
+                    println!("\ndaemon running: {running}");
                 }
             }
-            println!("\ndaemon running: {}", sessionguard::daemon::is_running());
         }
 
         Command::Watch { path } => {
@@ -174,21 +186,34 @@ async fn main() -> Result<()> {
             }
         },
 
-        Command::Log { last } => {
+        Command::Log { last, format } => {
             let event_log = EventLog::open_default()?;
             let entries = event_log.recent(last)?;
-            if entries.is_empty() {
-                println!("no reconciliation events");
-            } else {
-                for e in &entries {
-                    println!(
-                        "[{}] {} {} :: {} -> {}",
-                        e.timestamp,
-                        e.tool_name,
-                        e.file_path.display(),
-                        e.old_value,
-                        e.new_value
-                    );
+            match format {
+                sessionguard::cli::Format::Json => {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                }
+                sessionguard::cli::Format::Text => {
+                    if entries.is_empty() {
+                        println!("no reconciliation events");
+                    } else {
+                        for e in &entries {
+                            let undone = if e.undone_at.is_some() {
+                                " (undone)"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "[{}] {} {} :: {} -> {}{}",
+                                e.timestamp,
+                                e.tool_name,
+                                e.file_path.display(),
+                                e.old_value,
+                                e.new_value,
+                                undone
+                            );
+                        }
+                    }
                 }
             }
         }
@@ -268,12 +293,14 @@ async fn main() -> Result<()> {
             let mut tools: Vec<_> = tool_registry.all().collect();
             tools.sort_by(|a, b| a.name.cmp(&b.name));
 
-            let verbose = matches!(
-                action,
-                Some(sessionguard::cli::ToolsAction::List { verbose: true })
-            );
+            let (verbose, format) = match action {
+                Some(sessionguard::cli::ToolsAction::List { verbose, format }) => (verbose, format),
+                None => (false, sessionguard::cli::Format::Text),
+            };
 
-            if tools.is_empty() {
+            if matches!(format, sessionguard::cli::Format::Json) {
+                println!("{}", serde_json::to_string_pretty(&tools)?);
+            } else if tools.is_empty() {
                 println!("no tools registered");
             } else {
                 println!("{:<16} {:<24} VERSION", "NAME", "DISPLAY");
