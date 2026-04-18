@@ -124,15 +124,18 @@ def list_events(data_dir: Path, limit: int = 100) -> list[dict[str, Any]]:
 
 
 def list_tools() -> list[dict[str, Any]]:
-    """Shell out to `sessionguard tools list --verbose` and parse.
+    """Shell out to `sessionguard tools list --format json` and return the
+    parsed tool definitions.
 
     Delegating to the binary keeps it authoritative — the same resolution
-    chain (built-in + system + user + project) that the daemon uses.
+    chain (built-in + system + user + project) that the daemon uses. JSON
+    output was added in v0.3.2; for older binaries the subprocess will exit
+    non-zero or emit text and we'll return `[]` gracefully.
     """
     binary = os.environ.get("SESSIONGUARD_BIN", "sessionguard")
     try:
         out = subprocess.run(
-            [binary, "tools", "list", "--verbose"],
+            [binary, "tools", "list", "--format", "json"],
             capture_output=True,
             text=True,
             timeout=5,
@@ -140,47 +143,25 @@ def list_tools() -> list[dict[str, Any]]:
         )
     except (FileNotFoundError, subprocess.TimeoutExpired):
         return []
-    tools: list[dict[str, Any]] = []
-    current: dict[str, Any] | None = None
-    for line in out.stdout.splitlines():
-        s = line.rstrip()
-        if not s:
-            continue
-        if s.startswith("NAME") or s.endswith(" registered. Use --verbose for patterns."):
-            continue
-        if not s.startswith(" "):
-            parts = s.split()
-            if len(parts) >= 3:
-                if current:
-                    tools.append(current)
-                current = {
-                    "name": parts[0],
-                    "display_name": " ".join(parts[1:-1]),
-                    "version": parts[-1],
-                    "session_patterns": [],
-                    "path_fields": [],
-                    "on_move": None,
-                }
-        elif current is not None:
-            stripped = s.strip()
-            if stripped.startswith("- "):
-                item = stripped[2:]
-                ctx = current.get("_ctx") or ""
-                if "session_patterns" in ctx:
-                    current["session_patterns"].append(item)
-                elif "path_fields" in ctx:
-                    current["path_fields"].append(item)
-            elif stripped.startswith("session_patterns:"):
-                current["_ctx"] = "session_patterns"
-            elif stripped.startswith("path_fields:"):
-                current["_ctx"] = "path_fields"
-            elif stripped.startswith("on_move:"):
-                current["on_move"] = stripped.split(":", 1)[1].strip()
-                current.pop("_ctx", None)
-    if current:
-        tools.append(current)
+    if out.returncode != 0 or not out.stdout.strip():
+        return []
+    try:
+        tools = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return []
+    # Normalise the `path_fields` entries into a display-friendly form so
+    # the frontend's existing renderer keeps working without changes.
     for t in tools:
-        t.pop("_ctx", None)
+        fields = t.get("path_fields") or []
+        t["path_fields"] = [
+            f"{f.get('file', '')} :: {f.get('field', '')} ({f.get('format', 'text')})"
+            for f in fields
+        ]
+        # on_move comes through as either a string (e.g. "notify") or a
+        # serde-tagged object for the Custom(String) case; flatten both.
+        on_move = t.get("on_move")
+        if isinstance(on_move, dict) and "custom" in on_move:
+            t["on_move"] = f"custom: {on_move['custom']}"
     return tools
 
 
