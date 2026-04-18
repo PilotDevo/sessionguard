@@ -2,6 +2,37 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.2] - 2026-04-18
+
+### Features
+
+- **`--format json`** on `tools list`, `log`, and `status`. Emits the
+  same structured data the library already serialises internally. Text
+  output remains the default; JSON is opt-in via flag. The dashboard
+  now consumes this instead of parsing the human-readable text output,
+  eliminating a class of fragility (CLI text changes breaking the UI).
+- **CI dogfood job** — `scripts/dogfood.sh` now runs in GitHub Actions
+  on both `ubuntu-latest` and `macos-latest` after the Check matrix
+  completes. Regression gate for the class of bugs that historically
+  slipped past unit tests (rename pairing, macOS path aliasing).
+- **Homebrew tap auto-update** — a new `release-homebrew.yml` workflow
+  fires on `release: published`, downloads the asset tarballs, computes
+  SHA256s, renders a fresh `Formula/sessionguard.rb`, and pushes to
+  `PilotDevo/homebrew-tap`. Requires repository secret
+  `HOMEBREW_TAP_TOKEN` (fine-grained PAT, `Contents: write` on the tap).
+  Fails fast with a clear message if the secret isn't configured.
+
+### Changes
+
+- `log` text output now tags undone events with `(undone)` at end of line.
+- Dashboard: `list_tools()` consumes `--format json`; stale text-parsing
+  fallback removed.
+
+### Tests
+
+- 3 new CLI smoke tests verify that `--format json` produces valid JSON
+  for `tools list`, `log`, and `status` (67 tests total).
+
 ## [0.3.1] - 2026-04-17
 
 ### Features
