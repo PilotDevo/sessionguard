@@ -345,7 +345,14 @@ Create a TOML file in `~/.config/sessionguard/tools/` following the pattern in `
 Today: SessionGuard detects the project is using the tool but doesn't rewrite the home-dir store on move — that's why Codex and OpenCode are marked *Detect only* in the table above. v0.4's `migrate` command (in active design) will close this gap by safely relocating home-dir stores alongside their project references.
 
 **Q: Is there a GUI?**
-Yes — a minimal read-only one. `python3 tools/dashboard/app.py` serves a local web UI on port 8787 showing tracked projects, event history, home-dir session stores, and registered tool patterns. No dependencies beyond the Python stdlib. An interactive UI that also drives actions (undo, migrate) is planned for v0.5+.
+Yes — a minimal read-only one. `python3 tools/dashboard/app.py` serves a local web UI on port 8787 with five tabs:
+- **Activity** — per-project view across Claude Code / Codex / OpenCode session stores, showing which assistants have touched each project and when (with live indicators for the last 5 min)
+- **Projects** — every directory the SessionGuard daemon is tracking
+- **Events** — reconciliation history with undone-state badges
+- **Sessions** — total store sizes per assistant
+- **Tools** — registered tool patterns
+
+No dependencies beyond the Python stdlib. An interactive UI that also drives actions (undo, migrate) is planned for v0.5+.
 
 ## License
 

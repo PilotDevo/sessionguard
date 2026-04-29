@@ -27,15 +27,27 @@ Open <http://127.0.0.1:8787/> in a browser. The page auto-refreshes every
 
 ## What it shows
 
+- **Activity** *(default tab)* — per-project view across the three known
+  home-directory session stores: Claude Code (`~/.claude/projects`),
+  Codex (`~/.codex/sessions/*.jsonl`, joined by `cwd` from each session's
+  first JSON line), and OpenCode (`~/.local/share/opencode/opencode.db`,
+  joined by `session.directory`). One row per project; cells show
+  per-assistant session counts and most-recent activity. Projects
+  registered with the SessionGuard daemon are tagged `tracked`.
+  🟢 = touched within 5 min, 🟡 = within 1 hour. Cached 30s.
 - **Projects** — every directory registered via `sessionguard watch` or
   `sessionguard scan`, with its detected artifact files and whether the
   path still exists on disk.
 - **Events** — every reconciliation action from the event log, marked
   **live** or **undone** based on `undone_at`. Rolled back with
   `sessionguard undo` — they stay visible here but show as undone.
+- **Sessions** — total session-store sizes per assistant (counts +
+  bytes + last-modified). Companion view to **Activity**: where
+  Activity flips the axis to "by project," Sessions answers "how big
+  is each store?"
 - **Tools** — every registered tool pattern (built-in, system, user, and
   project-level), with their session patterns and path fields. Sourced
-  from `sessionguard tools list --verbose` so the resolution chain
+  from `sessionguard tools list --format json` so the resolution chain
   matches the daemon's view.
 
 ## Running as a systemd user service

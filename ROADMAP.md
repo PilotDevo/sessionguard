@@ -6,10 +6,16 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.3 (current)** — *Undo + more tool patterns.* The daemon reliably
-detects moves on macOS and Linux (proven via `scripts/dogfood.sh` on real
-hardware) and reconciles five built-in tools. `sessionguard undo` reverses
-any logged action from the event log.
+**v0.3.2 (current)** — Daemon reliably detects moves on macOS and Linux
+(proven via `scripts/dogfood.sh` on real hardware) and reconciles seven
+built-in tools (five reconciling, two detect-only). `sessionguard undo`
+reverses any logged action from the event log. `--format json` available
+on `tools`, `log`, and `status` for tooling integration.
+
+The local read-only **dashboard** (`tools/dashboard/`) now ships with an
+**Activity** tab that gives a per-project, per-assistant view across
+Claude Code, Codex, and OpenCode session stores — answering "where am I
+working, and which assistants have touched what?" at a glance.
 
 ## v0.3 — Undo + More Patterns  *(shipping)*
 
@@ -59,6 +65,32 @@ Goal: let the community extend the pattern catalog safely.
 - `cargo-audit` integration in CI
 - Homebrew formula auto-publish workflow
 
+## Dashboard / Activity tab — incremental
+
+The dashboard's read-only Activity view (added in v0.3.2) covers
+Claude Code, Codex, and OpenCode today. Natural extensions, all
+small enough to land outside the main version track:
+
+- **More assistant stores in Activity** — Cursor, Windsurf, Aider,
+  Gemini CLI. Each needs its own per-store discovery logic since
+  none of them share Claude Code's "dir-per-project" or Codex's
+  "JSONL with `cwd` in line 1" conventions.
+- **Sessions tab → Activity drilldown** — clicking a row in
+  Sessions filters Activity to that store.
+- **Live-update via SSE** — current 3s poll + 30s server-side
+  cache is fine for a dev box; an SSE endpoint pushing updates
+  on filesystem-event triggers would feel snappier without
+  burning CPU on idle pages.
+- **Once `baton` ships** — overlay live `baton` sessions onto
+  Activity rows so we get true "active right now" instead of the
+  current mtime-based "touched within 5 min" heuristic.
+- **Cleanup hints** — flag projects whose decoded path no longer
+  exists on disk (Claude `ENC` rows are already a hint; could
+  add a "stale — N stores still reference this path" pill).
+- **Click-through to session content** — read-only, paginated,
+  for diagnosing "what did Claude do here?" without leaving the
+  browser.
+
 ## v1.0 — UI + Polish
 
 Goal: broad audience.
@@ -72,6 +104,9 @@ Goal: broad audience.
 - Show HN / r/rust launch post
 - `sessionguard doctor` with real checks — artifact paths valid,
   daemon alive, registry consistent
+- Action surface on the dashboard — once `migrate` lands in v0.4,
+  promote the Activity tab from read-only to "click any row to
+  relocate / undo / archive"
 
 ## Deferred / not doing
 

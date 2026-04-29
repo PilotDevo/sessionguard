@@ -294,6 +294,217 @@ def list_home_sessions() -> list[dict[str, Any]]:
     return data
 
 
+# ── per-project activity (Activity tab) ──────────────────────────────────────
+#
+# Where home_sessions counts files per store, list_activity flips the axis:
+# "for each PROJECT, which assistants have touched it and when?" That's the
+# question the user actually asks ("where am I working, in what?").
+#
+# Data sources:
+#   - Claude Code: ~/.claude/projects/<encoded>/ — dir name encodes the path
+#     with `/` replaced by `-`, but path segments themselves can contain
+#     hyphens (e.g. `side-projects`), so naive replace breaks. The decoder
+#     below DFS-walks the filesystem to find the longest valid prefix.
+#   - Codex: ~/.codex/sessions/YYYY/MM/DD/rollout-*.jsonl — `cwd` is in the
+#     first JSON line. Group sessions by cwd.
+#   - OpenCode: ~/.local/share/opencode/opencode.db — Drizzle SQLite. The
+#     `session.directory` column gives the actual project directory (the
+#     `project.worktree` column is often `/` for the global default project).
+#
+# Cached for 30s like the Sessions tab.
+
+_activity_cache: dict[str, Any] = {"ts": 0.0, "data": None}
+
+
+def _decode_claude_project_dir(name: str) -> tuple[str, bool]:
+    """Decode a Claude Code project directory name (e.g.
+    ``-Users-devo-Droco-side-projects-ai-session-track``) into a real
+    filesystem path by DFS-validating each segment against the actual
+    filesystem.
+
+    Returns (path, decoded_ok). When `decoded_ok` is False, `path` is the
+    encoded form unchanged — useful so the dashboard can still show the
+    entry rather than dropping it.
+    """
+    if not name.startswith("-"):
+        return name, False
+    parts = name[1:].split("-")
+
+    def walk(base: Path, remaining: list[str]) -> Path | None:
+        if not remaining:
+            return base
+        # Bias toward shorter (more `/`-split) segments first, so a path like
+        # `/Users/devo/Droco/side-projects` only collapses hyphens when no
+        # `/`-split alternative exists on disk.
+        for k in range(1, len(remaining) + 1):
+            segment = "-".join(remaining[:k])
+            candidate = base / segment
+            if candidate.is_dir():
+                result = walk(candidate, remaining[k:])
+                if result is not None:
+                    return result
+        return None
+
+    found = walk(Path("/"), parts)
+    if found is not None:
+        return str(found), True
+    return name, False
+
+
+def _activity_from_claude(home: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    base = home / ".claude/projects"
+    if not base.exists():
+        return out
+    for d in base.iterdir():
+        if not d.is_dir():
+            continue
+        path, decoded = _decode_claude_project_dir(d.name)
+        try:
+            files = [f for f in d.iterdir() if f.is_file()]
+        except OSError:
+            continue
+        if not files:
+            continue
+        try:
+            latest = max(f.stat().st_mtime for f in files)
+        except OSError:
+            continue
+        entry = out.setdefault(path, {"encoded": not decoded, "tools": {}})
+        # If we re-encounter the same path, keep the more useful encoding flag.
+        if decoded:
+            entry["encoded"] = False
+        cur = entry["tools"].get("claude_code")
+        if cur is None:
+            entry["tools"]["claude_code"] = {"count": len(files), "last_activity": latest}
+        else:
+            cur["count"] += len(files)
+            cur["last_activity"] = max(cur["last_activity"], latest)
+    return out
+
+
+def _activity_from_codex(home: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    base = home / ".codex/sessions"
+    if not base.exists():
+        return out
+    files_seen = 0
+    for f in base.rglob("*.jsonl"):
+        files_seen += 1
+        if files_seen > _HOME_WALK_CAP:
+            break
+        try:
+            with open(f, "r", errors="replace") as fh:
+                first = fh.readline()
+            d = json.loads(first)
+        except (OSError, json.JSONDecodeError):
+            continue
+        cwd = d.get("cwd")
+        if not cwd and isinstance(d.get("payload"), dict):
+            cwd = d["payload"].get("cwd")
+        if not cwd:
+            continue
+        try:
+            mtime = f.stat().st_mtime
+        except OSError:
+            continue
+        entry = out.setdefault(cwd, {"encoded": False, "tools": {}})
+        cur = entry["tools"].get("codex")
+        if cur is None:
+            entry["tools"]["codex"] = {"count": 1, "last_activity": mtime}
+        else:
+            cur["count"] += 1
+            cur["last_activity"] = max(cur["last_activity"], mtime)
+    return out
+
+
+def _activity_from_opencode(home: Path) -> dict[str, dict[str, Any]]:
+    out: dict[str, dict[str, Any]] = {}
+    db = home / ".local/share/opencode/opencode.db"
+    if not db.is_file():
+        return out
+    try:
+        conn = sqlite3.connect(f"file:{db}?mode=ro", uri=True, timeout=2)
+        conn.row_factory = sqlite3.Row
+    except sqlite3.Error:
+        return out
+    try:
+        rows = conn.execute(
+            "SELECT directory, time_updated FROM session "
+            "WHERE time_archived IS NULL"
+        ).fetchall()
+    except sqlite3.Error:
+        return out
+    finally:
+        conn.close()
+
+    for r in rows:
+        path = r["directory"] or ""
+        if not path:
+            continue
+        # OpenCode timestamps are unix-ms epochs.
+        mtime = (r["time_updated"] or 0) / 1000.0
+        entry = out.setdefault(path, {"encoded": False, "tools": {}})
+        cur = entry["tools"].get("opencode")
+        if cur is None:
+            entry["tools"]["opencode"] = {"count": 1, "last_activity": mtime}
+        else:
+            cur["count"] += 1
+            cur["last_activity"] = max(cur["last_activity"], mtime)
+    return out
+
+
+def list_activity(tracked_paths: set[str]) -> list[dict[str, Any]]:
+    """Build a unified per-project view across the three known stores.
+
+    `tracked_paths` is the set of registered project paths from
+    SessionGuard's registry — used to mark which projects the daemon
+    will reconcile on a move (versus those that are merely visible in
+    the assistant's local history).
+    """
+    now = time.time()
+    cached = _activity_cache.get("data")
+    if cached is not None and (now - _activity_cache["ts"]) < 30.0:
+        return cached
+
+    home = Path.home()
+    merged: dict[str, dict[str, Any]] = {}
+    for source in (
+        _activity_from_claude(home),
+        _activity_from_codex(home),
+        _activity_from_opencode(home),
+    ):
+        for path, info in source.items():
+            entry = merged.setdefault(path, {"encoded": info["encoded"], "tools": {}})
+            if not info["encoded"]:
+                entry["encoded"] = False
+            for tool, stats in info["tools"].items():
+                cur = entry["tools"].get(tool)
+                if cur is None:
+                    entry["tools"][tool] = stats
+                else:
+                    cur["count"] += stats["count"]
+                    cur["last_activity"] = max(cur["last_activity"], stats["last_activity"])
+
+    out: list[dict[str, Any]] = []
+    for path, info in merged.items():
+        last = max((t["last_activity"] for t in info["tools"].values()), default=0.0)
+        out.append(
+            {
+                "project_path": path,
+                "encoded": info["encoded"],
+                "tracked": path in tracked_paths,
+                "tools": info["tools"],
+                "last_activity": last,
+            }
+        )
+    out.sort(key=lambda e: e["last_activity"], reverse=True)
+
+    _activity_cache["ts"] = now
+    _activity_cache["data"] = out
+    return out
+
+
 def daemon_status(data_dir: Path) -> dict[str, Any]:
     pid_file = data_dir / "sessionguard.pid"
     if not pid_file.is_file():
@@ -396,20 +607,22 @@ INDEX_HTML = r"""<!doctype html>
   <div class="muted" id="refresh-note">auto-refresh every 3s</div>
 </header>
 <nav>
-  <button data-tab="projects" class="active">Projects</button>
+  <button data-tab="activity" class="active">Activity</button>
+  <button data-tab="projects">Projects</button>
   <button data-tab="events">Events</button>
   <button data-tab="sessions">Sessions</button>
   <button data-tab="tools">Tools</button>
 </nav>
 <main>
-  <section id="projects"></section>
+  <section id="activity"></section>
+  <section id="projects" class="hidden"></section>
   <section id="events" class="hidden"></section>
   <section id="sessions" class="hidden"></section>
   <section id="tools" class="hidden"></section>
 </main>
 <script>
 (() => {
-  const state = { tab: "projects", data: null };
+  const state = { tab: "activity", data: null };
 
   // HTML-escape every database-sourced string before inserting into the DOM.
   // The dashboard reads watched-project paths, tool field values, and file
@@ -423,6 +636,97 @@ INDEX_HTML = r"""<!doctype html>
     .replaceAll("'", "&#39;");
 
   const fmtTime = (t) => t ? String(t).replace("T", " ").replace("Z", "") : "-";
+
+  // Known assistant tools we surface. Order is the column order in the
+  // Activity table — keeping it stable means projects render consistently
+  // across polls. Display labels match the Tools tab.
+  const ACTIVITY_TOOLS = [
+    { id: "claude_code", label: "Claude" },
+    { id: "codex",       label: "Codex" },
+    { id: "opencode",    label: "OpenCode" },
+  ];
+
+  const renderActivity = (activity) => {
+    if (!activity.length) {
+      return `<div class="empty">no activity detected across known assistant stores<br>
+        <span class="muted">checked: <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>, <code>~/.local/share/opencode</code></span></div>`;
+    }
+    const now = Date.now() / 1000;
+    const fmtAge = (t) => {
+      if (!t) return "—";
+      const age = now - t;
+      if (age < 60) return `${Math.round(age)}s`;
+      if (age < 3600) return `${Math.round(age / 60)}m`;
+      if (age < 86400) return `${Math.round(age / 3600)}h`;
+      return `${Math.round(age / 86400)}d`;
+    };
+    const cellTag = (t) => {
+      if (!t) return ` `;
+      const age = now - t;
+      if (age < 300) return "live";        // 5 min
+      if (age < 3600) return "recent";     // 1 hour
+      return "";
+    };
+
+    const headers = ACTIVITY_TOOLS
+      .map(t => `<th>${esc(t.label)}</th>`)
+      .join("");
+
+    const rows = activity.map(p => {
+      const tracked = p.tracked
+        ? `<span class="tag good" title="registered with the SessionGuard daemon — auto-reconciled on move">tracked</span>`
+        : `<span class="tag muted" title="not registered; SessionGuard sees the history but won't reconcile a move">untracked</span>`;
+      const encoded = p.encoded
+        ? ` <span class="tag warn" title="Claude Code dir name could not be decoded to a real path">encoded</span>`
+        : "";
+      const overall = cellTag(p.last_activity);
+      const overallTag = overall === "live"
+        ? `<span class="dot good" title="touched in last 5 min"></span>`
+        : overall === "recent"
+          ? `<span class="dot warn" title="touched in last hour"></span>`
+          : "";
+
+      const cells = ACTIVITY_TOOLS.map(t => {
+        const v = p.tools[t.id];
+        if (!v) return `<td class="muted">—</td>`;
+        const mark = cellTag(v.last_activity);
+        const dot = mark === "live"
+          ? `<span class="dot good"></span>`
+          : mark === "recent" ? `<span class="dot warn"></span>` : "";
+        return `<td>${dot}<code>${esc(v.count)}</code> <span class="muted">${esc(fmtAge(v.last_activity))} ago</span></td>`;
+      }).join("");
+
+      return `
+        <tr>
+          <td>${overallTag}<code>${esc(p.project_path)}</code>${encoded}</td>
+          <td>${tracked}</td>
+          ${cells}
+          <td class="muted">${esc(fmtAge(p.last_activity))} ago</td>
+        </tr>`;
+    }).join("");
+
+    return `
+      <div class="panel">
+        <table>
+          <thead><tr>
+            <th>Project</th>
+            <th>SessionGuard</th>
+            ${headers}
+            <th>Last seen</th>
+          </tr></thead>
+          <tbody>${rows}</tbody>
+        </table>
+        <div class="muted" style="margin-top:0.75rem;font-size:12px">
+          Per-project view across <code>~/.claude/projects</code>,
+          <code>~/.codex/sessions</code>, and <code>~/.local/share/opencode</code>.
+          Cell numbers are session counts; ages reflect file mtime / DB
+          <code>time_updated</code>.
+          <span class="dot good"></span> = touched within 5 min,
+          <span class="dot warn"></span> = within 1 hour.
+          Sorted by most-recent activity. Cached 30s.
+        </div>
+      </div>`;
+  };
 
   const renderProjects = (projects) => {
     if (!projects.length) return `<div class="empty">no projects tracked yet<br><code>sessionguard watch &lt;path&gt;</code> or <code>sessionguard scan ~/projects</code> to add some</div>`;
@@ -564,10 +868,11 @@ INDEX_HTML = r"""<!doctype html>
     document.querySelectorAll("nav button").forEach(b => {
       b.classList.toggle("active", b.dataset.tab === state.tab);
     });
-    ["projects", "events", "sessions", "tools"].forEach(t => {
+    ["activity", "projects", "events", "sessions", "tools"].forEach(t => {
       document.getElementById(t).classList.toggle("hidden", state.tab !== t);
     });
 
+    document.getElementById("activity").innerHTML = renderActivity(d.activity || []);
     document.getElementById("projects").innerHTML = renderProjects(d.projects);
     document.getElementById("events").innerHTML = renderEvents(d.events);
     document.getElementById("sessions").innerHTML = renderSessions(d.sessions || []);
@@ -624,14 +929,17 @@ class Handler(BaseHTTPRequestHandler):
         if self.path == "/":
             self._html(INDEX_HTML)
         elif self.path.startswith("/api/state"):
+            projects = list_projects(data_dir)
+            tracked_paths = {p["path"] for p in projects}
             self._json(
                 {
                     "data_dir": str(data_dir),
                     "daemon": daemon_status(data_dir),
-                    "projects": list_projects(data_dir),
+                    "projects": projects,
                     "events": list_events(data_dir, limit=200),
                     "tools": list_tools(),
                     "sessions": list_home_sessions(),
+                    "activity": list_activity(tracked_paths),
                 }
             )
         elif self.path == "/healthz":
