@@ -65,6 +65,60 @@ Goal: let the community extend the pattern catalog safely.
 - `cargo-audit` integration in CI
 - Homebrew formula auto-publish workflow
 
+## Launcher health (v0.3.x or rolled into v0.4)
+
+Sessions can survive *the project* moving (the original thesis) and
+*the disk* changing (v0.4 `migrate`), but they don't survive *the
+runtime* changing — which is a separate failure mode that SessionGuard
+should be able to surface even if it can't fix it.
+
+**Motivating scenario.** Upgrade Node from v23 → v24. Globally-installed
+npm packages (Claude Code, Codex CLI, Gemini CLI) live under the
+previous Node version's `lib/node_modules/`; the new version has its
+own empty globals tree. The session data at `~/.claude/projects/`,
+`~/.codex/sessions/`, `~/.local/share/opencode/` is untouched, but
+the `claude` / `codex` / `gemini` binaries are no longer on PATH.
+From the user's POV "my sessions are gone" — they aren't, the
+launcher is just unreachable.
+
+This isn't SessionGuard's job to *fix* (that's `nvm install
+--reinstall-packages-from`, `volta`, or each tool vendor's standalone
+installer). But it IS SessionGuard's job to *notice* — we already
+know where the sessions live; we should also know whether the tool
+that wrote them can still launch.
+
+**Design sketch.**
+
+- Add optional `binary` field to `ToolDefinition`:
+  ```toml
+  [tool]
+  name = "claude_code"
+  binary = "claude"             # new — name of the launcher on PATH
+  ```
+- New `src/health.rs` module:
+  - `check_binary(tool: &ToolDefinition) -> BinaryStatus` —
+    runs `which <binary>` (or platform equivalent), reports
+    `{ Present, Missing, NotConfigured }`.
+- Wire into `sessionguard doctor`:
+  ```
+  ⚠  Claude Code — 18 sessions present in ~/.claude/projects/,
+     but `claude` is not on PATH. The launcher may have been lost
+     in a Node/runtime upgrade; sessions themselves are intact.
+  ```
+- Wire into the dashboard Activity tab:
+  - New "Launcher" column per row: ✅ present, ⚠️ missing, — n/a
+  - Surfaced cross-store so even a "history-only" project tells
+    you which tools can still open it
+- Reach goal: `sessionguard restore-launcher <tool>` that shells
+  out to each tool's documented installer (curl-pipe, brew, etc.).
+  Owns no install logic itself — just runs the vendor's. Earns
+  `--dry-run` like every other destructive command.
+
+**Scope.** ~150–200 LOC plus tests. Naturally pairs with v0.4
+`migrate` (both speak the same "tools have state, runtime, and a
+binary on disk" model) but small enough to land standalone as v0.3.3
+if real-world bites surface faster than the migrate design lands.
+
 ## Dashboard / Activity tab — incremental
 
 The dashboard's read-only Activity view (added in v0.3.2) covers
