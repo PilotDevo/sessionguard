@@ -219,23 +219,75 @@ async fn main() -> Result<()> {
         }
 
         Command::Doctor => {
+            use sessionguard::health::{check_binary, BinaryStatus};
+
             println!("running diagnostics...");
+            let mut issues = 0;
+
+            // --- tracked-project paths ---
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
-            let mut issues = 0;
-            for p in &projects {
-                if !p.path.exists() {
-                    println!(
-                        "  [WARN] project path no longer exists: {}",
-                        p.path.display()
-                    );
-                    issues += 1;
+            println!("\ntracked projects:");
+            if projects.is_empty() {
+                println!(
+                    "  (none — `sessionguard watch <path>` or `sessionguard scan` to register)"
+                );
+            } else {
+                for p in &projects {
+                    if p.path.exists() {
+                        println!("  [OK]   {}", p.path.display());
+                    } else {
+                        println!(
+                            "  [WARN] project path no longer exists: {}",
+                            p.path.display()
+                        );
+                        issues += 1;
+                    }
                 }
             }
-            if issues == 0 {
-                println!("no issues found ({} projects checked)", projects.len());
+
+            // --- launcher health for every registered tool ---
+            //
+            // The recurring "I upgraded Node and my sessions are gone" pain
+            // really means "the launcher binary that wrote those sessions is
+            // no longer on PATH" — the data is fine. Report explicitly so
+            // users don't think their history is lost.
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let mut tools: Vec<_> = tool_registry.all().collect();
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+
+            println!("\nlauncher health:");
+            if tools.is_empty() {
+                println!("  (no tools registered)");
             } else {
-                println!("\n{issues} issue(s) found");
+                for t in &tools {
+                    match check_binary(t) {
+                        BinaryStatus::Present { path } => {
+                            println!("  [OK]   {} -> {}", t.display_name, path.display());
+                        }
+                        BinaryStatus::Missing { binary } => {
+                            println!(
+                                "  [WARN] {} - launcher `{}` not on PATH \
+                                 (session data intact; check installer / runtime version)",
+                                t.display_name, binary
+                            );
+                            issues += 1;
+                        }
+                        BinaryStatus::NotConfigured => {
+                            println!(
+                                "  [--]   {} - no launcher binary configured",
+                                t.display_name
+                            );
+                        }
+                    }
+                }
+            }
+
+            println!();
+            if issues == 0 {
+                println!("no issues found");
+            } else {
+                println!("{issues} issue(s) found");
             }
         }
 
@@ -289,6 +341,8 @@ async fn main() -> Result<()> {
         },
 
         Command::Tools { action } => {
+            use sessionguard::health::{check_binary, BinaryStatus};
+
             let tool_registry = ToolRegistry::new_with_config(&config)?;
             let mut tools: Vec<_> = tool_registry.all().collect();
             tools.sort_by(|a, b| a.name.cmp(&b.name));
@@ -298,18 +352,42 @@ async fn main() -> Result<()> {
                 None => (false, sessionguard::cli::Format::Text),
             };
 
+            // Each tool gets its current launcher status alongside its
+            // static definition. The dashboard reads this directly via
+            // `tools list --format json`.
+            #[derive(serde::Serialize)]
+            struct ToolWithHealth<'a> {
+                #[serde(flatten)]
+                tool: &'a sessionguard::tools::ToolDefinition,
+                binary_status: BinaryStatus,
+            }
+
+            let enriched: Vec<ToolWithHealth<'_>> = tools
+                .iter()
+                .map(|t| ToolWithHealth {
+                    tool: t,
+                    binary_status: check_binary(t),
+                })
+                .collect();
+
             if matches!(format, sessionguard::cli::Format::Json) {
-                println!("{}", serde_json::to_string_pretty(&tools)?);
+                println!("{}", serde_json::to_string_pretty(&enriched)?);
             } else if tools.is_empty() {
                 println!("no tools registered");
             } else {
-                println!("{:<16} {:<24} VERSION", "NAME", "DISPLAY");
-                for t in &tools {
+                println!("{:<16} {:<24} {:<8} LAUNCHER", "NAME", "DISPLAY", "VERSION");
+                for (t, e) in tools.iter().zip(enriched.iter()) {
+                    let launcher = match &e.binary_status {
+                        BinaryStatus::Present { path } => path.display().to_string(),
+                        BinaryStatus::Missing { binary } => format!("⚠ `{binary}` not on PATH"),
+                        BinaryStatus::NotConfigured => "—".to_string(),
+                    };
                     println!(
-                        "{:<16} {:<24} {}",
+                        "{:<16} {:<24} {:<8} {}",
                         t.name,
                         t.display_name,
-                        t.version.as_deref().unwrap_or("-")
+                        t.version.as_deref().unwrap_or("-"),
+                        launcher
                     );
                     if verbose {
                         if !t.session_patterns.is_empty() {
