@@ -193,6 +193,71 @@ fn sandbox_doctor_detects_stale_paths() {
 }
 
 #[test]
+fn sandbox_doctor_clean_dry_run_does_not_mutate() {
+    // Register a project, delete its dir, then run --clean --dry-run.
+    // The stale entry must still be flagged on a subsequent doctor run.
+    let sandbox = TempDir::new().unwrap();
+    let project = create_claude_project(sandbox.path(), "dryrun-test");
+
+    cmd(sandbox.path())
+        .args(["watch", &project.to_string_lossy()])
+        .assert()
+        .success();
+    fs::remove_dir_all(&project).unwrap();
+
+    cmd(sandbox.path())
+        .args(["doctor", "--clean", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dry-run"))
+        .stdout(predicate::str::contains("[DRY]"));
+
+    // Re-run plain doctor — entry should still be there.
+    cmd(sandbox.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("dryrun-test"))
+        .stdout(predicate::str::contains("no longer exists"));
+}
+
+#[test]
+fn sandbox_doctor_clean_removes_stale_entries() {
+    // Register two projects, delete one, run --clean.
+    // The deleted one must disappear from `status`; the live one must remain.
+    let sandbox = TempDir::new().unwrap();
+    let live = create_claude_project(sandbox.path(), "clean-live");
+    let stale = create_claude_project(sandbox.path(), "clean-stale");
+
+    cmd(sandbox.path())
+        .args(["watch", &live.to_string_lossy()])
+        .assert()
+        .success();
+    cmd(sandbox.path())
+        .args(["watch", &stale.to_string_lossy()])
+        .assert()
+        .success();
+    fs::remove_dir_all(&stale).unwrap();
+
+    cmd(sandbox.path())
+        .args(["doctor", "--clean"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[DEL]"))
+        .stdout(predicate::str::contains("clean-stale"))
+        .stdout(predicate::str::contains("removed 1 stale"));
+
+    // After cleanup, status should still show the live project
+    // and NOT show the stale one.
+    cmd(sandbox.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("clean-live"))
+        .stdout(predicate::str::contains("clean-stale").not());
+}
+
+#[test]
 fn sandbox_unwatch_removes_project() {
     let sandbox = TempDir::new().unwrap();
     let project = create_claude_project(sandbox.path(), "unwatch-test");

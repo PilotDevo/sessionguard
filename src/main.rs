@@ -218,15 +218,20 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Doctor => {
+        Command::Doctor { clean, dry_run } => {
             use sessionguard::health::{check_binary, BinaryStatus};
 
             println!("running diagnostics...");
-            let mut issues = 0;
+            let mut issues: u32 = 0;
 
             // --- tracked-project paths ---
+            //
+            // Pure report by default. With `--clean`, also unregister
+            // projects whose path no longer exists on disk; with both
+            // `--clean --dry-run`, just print what *would* be removed.
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
+            let mut stale: Vec<&sessionguard::registry::ProjectEntry> = Vec::new();
             println!("\ntracked projects:");
             if projects.is_empty() {
                 println!(
@@ -241,9 +246,48 @@ async fn main() -> Result<()> {
                             "  [WARN] project path no longer exists: {}",
                             p.path.display()
                         );
+                        stale.push(p);
                         issues += 1;
                     }
                 }
+            }
+
+            // If asked to clean, do it (or report the planned cleanup
+            // under --dry-run). ON DELETE CASCADE on session_artifacts
+            // means we don't need to remove artifacts manually.
+            if clean && !stale.is_empty() {
+                println!();
+                if dry_run {
+                    println!(
+                        "--clean --dry-run: would unregister {} stale project(s):",
+                        stale.len()
+                    );
+                    for p in &stale {
+                        println!("  [DRY]  {}", p.path.display());
+                    }
+                } else {
+                    println!("--clean: unregistering {} stale project(s)...", stale.len());
+                    let mut removed = 0;
+                    for p in &stale {
+                        match registry.unregister_project(&p.path) {
+                            Ok(_) => {
+                                println!("  [DEL]  {}", p.path.display());
+                                removed += 1;
+                                issues = issues.saturating_sub(1);
+                            }
+                            Err(e) => {
+                                println!("  [ERR]  {} ({e})", p.path.display());
+                            }
+                        }
+                    }
+                    println!("removed {removed} stale registry entries");
+                }
+            } else if !clean && !stale.is_empty() {
+                println!(
+                    "\n(run `sessionguard doctor --clean` to unregister {} stale entries;\n \
+                     add `--dry-run` to preview without writing)",
+                    stale.len()
+                );
             }
 
             // --- launcher health for every registered tool ---

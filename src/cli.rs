@@ -100,8 +100,17 @@ pub enum Command {
         format: Format,
     },
 
-    /// Diagnose common issues (stale refs, orphaned sessions).
-    Doctor,
+    /// Diagnose common issues (stale registry entries, missing launchers).
+    Doctor {
+        /// Unregister tracked projects whose path no longer exists on
+        /// disk. Without this flag, doctor only reports — never mutates.
+        #[arg(long)]
+        clean: bool,
+        /// With `--clean`, print what would be unregistered without
+        /// touching the registry.
+        #[arg(long)]
+        dry_run: bool,
+    },
 
     /// Export session metadata for backup/migration.
     Export {
