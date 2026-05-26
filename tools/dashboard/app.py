@@ -150,7 +150,9 @@ def list_tools() -> list[dict[str, Any]]:
     except json.JSONDecodeError:
         return []
     # Normalise the `path_fields` entries into a display-friendly form so
-    # the frontend's existing renderer keeps working without changes.
+    # the frontend's existing renderer keeps working without changes. The
+    # CLI also embeds a `binary_status` object per tool (v0.3.3+); pass it
+    # through unchanged so the frontend can render the Launcher column.
     for t in tools:
         fields = t.get("path_fields") or []
         t["path_fields"] = [
@@ -646,7 +648,7 @@ INDEX_HTML = r"""<!doctype html>
     { id: "opencode",    label: "OpenCode" },
   ];
 
-  const renderActivity = (activity) => {
+  const renderActivity = (activity, allTools) => {
     if (!activity.length) {
       return `<div class="empty">no activity detected across known assistant stores<br>
         <span class="muted">checked: <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>, <code>~/.local/share/opencode</code></span></div>`;
@@ -668,8 +670,23 @@ INDEX_HTML = r"""<!doctype html>
       return "";
     };
 
+    // Index tool definitions by name so we can mark a column header
+    // ⚠️ when its launcher binary isn't reachable on PATH. This is the
+    // visibility layer of the launcher-health feature — at a glance you
+    // see "Claude column has 14 sessions but the launcher is gone."
+    const toolByName = Object.fromEntries((allTools || []).map(t => [t.name, t]));
+    const launcherBadge = (toolId) => {
+      const t = toolByName[toolId];
+      if (!t || !t.binary_status) return "";
+      const s = t.binary_status.status;
+      if (s === "missing") {
+        return ` <span class="tag bad" title="launcher \`${esc(t.binary_status.binary || '')}\` not on PATH — sessions are intact, the binary is not">⚠</span>`;
+      }
+      return "";
+    };
+
     const headers = ACTIVITY_TOOLS
-      .map(t => `<th>${esc(t.label)}</th>`)
+      .map(t => `<th>${esc(t.label)}${launcherBadge(t.id)}</th>`)
       .join("");
 
     const rows = activity.map(p => {
@@ -838,12 +855,28 @@ INDEX_HTML = r"""<!doctype html>
       </div>`;
   };
 
+  // Build a per-tool launcher status pill from `binary_status` (v0.3.3+).
+  // Falls back to "no launcher info" when consuming an older CLI.
+  const renderLauncher = (status) => {
+    if (!status || !status.status) {
+      return `<span class="tag muted">no launcher info</span>`;
+    }
+    if (status.status === "present") {
+      return `<span class="tag good">launcher OK</span> <code>${esc(status.path)}</code>`;
+    }
+    if (status.status === "missing") {
+      return `<span class="tag bad">launcher missing</span> <code>${esc(status.binary)}</code> not on PATH — session data intact, check installer / runtime version`;
+    }
+    return `<span class="tag muted">no launcher configured</span>`;
+  };
+
   const renderTools = (tools) => {
     if (!tools.length) return `<div class="empty">no tool patterns loaded</div>`;
     return tools.map(t => `
       <div class="panel">
         <div><strong>${esc(t.display_name)}</strong> <code>${esc(t.name)}</code>
              <span class="muted">v${esc(t.version)}${t.on_move ? ' · on_move: ' + esc(t.on_move) : ''}</span></div>
+        <div style="margin-top:0.5rem">${renderLauncher(t.binary_status)}</div>
         <div style="margin-top:0.5rem"><span class="muted">session_patterns:</span>
           ${t.session_patterns.map(p => `<code>${esc(p)}</code>`).join(" ") || "<span class='muted'>-</span>"}
         </div>
@@ -872,7 +905,9 @@ INDEX_HTML = r"""<!doctype html>
       document.getElementById(t).classList.toggle("hidden", state.tab !== t);
     });
 
-    document.getElementById("activity").innerHTML = renderActivity(d.activity || []);
+    // All renderer outputs are HTML-escaped via the esc() helper before
+    // insertion. The innerHTML assignments below are safe by construction.
+    document.getElementById("activity").innerHTML = renderActivity(d.activity || [], d.tools || []);
     document.getElementById("projects").innerHTML = renderProjects(d.projects);
     document.getElementById("events").innerHTML = renderEvents(d.events);
     document.getElementById("sessions").innerHTML = renderSessions(d.sessions || []);
