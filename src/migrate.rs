@@ -39,7 +39,7 @@ use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
-use crate::tools::{HomeDirDiscovery, ToolDefinition};
+use crate::tools::{HomeDirConfigFile, HomeDirDiscovery, ToolDefinition};
 
 /// One node in the migration state machine. Variants match the eight
 /// stages in `docs/design/migrate.md` §"The migrate state machine".
@@ -396,11 +396,24 @@ pub enum RewriteOutcome {
     /// Dry-run; nothing happened. Carried so the result type can still
     /// claim a final stage of Rewrite without lying.
     DryRunSkipped,
-    /// Discovery is `Env` or `Config`; not yet implemented this step.
+    /// One or more config files were rewritten in place, with backups
+    /// taken first. Each entry is `(original_file, backup_path)` so
+    /// undo can restore by renaming the backup back over the original.
+    ConfigEdited { backups: Vec<ConfigBackup> },
+    /// Discovery branch isn't wired yet. Carried for forward-compat —
+    /// once Env lands too this variant can be deleted.
     Deferred {
         /// Free-form reason. Surfaced verbatim in the event log.
         reason: String,
     },
+}
+
+/// One config-file backup pair. `original` is the file we rewrote;
+/// `backup` is the timestamped sidecar copy we made first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConfigBackup {
+    pub original: PathBuf,
+    pub backup: PathBuf,
 }
 
 /// Install a symlink at `canonical` pointing to `target`, after first
@@ -481,6 +494,136 @@ fn rewrite_via_symlink(canonical: &Path, target: &Path) -> Result<RewriteOutcome
     }
 }
 
+/// Rewrite every config file in `config_files` so the data-dir field
+/// points from `src` to `dst`. Backs each file up first (timestamped
+/// `.sessionguard-backup-<unix>` sidecar); on any per-file failure,
+/// every backup taken so far is restored and the error is returned —
+/// no partial rewrites escape this function.
+///
+/// Used by the `HomeDirDiscovery::Config` rewrite branch. Reuses the
+/// reconciler's adapter dispatch (`json` / `toml` / text fallback)
+/// via `pub(crate) reconciler::rewrite_field`.
+fn rewrite_via_config(
+    config_files: &[HomeDirConfigFile],
+    src: &Path,
+    dst: &Path,
+) -> Result<RewriteOutcome, MigrateError> {
+    use crate::tools::PathFieldSpec;
+
+    if config_files.is_empty() {
+        return Err(MigrateError::StageFailed(
+            Stage::Rewrite,
+            "discovery = Config but no config_files declared".into(),
+        ));
+    }
+
+    let pairs = vec![(
+        src.to_string_lossy().into_owned(),
+        dst.to_string_lossy().into_owned(),
+    )];
+    let stamp = now_unix();
+    let mut backups: Vec<ConfigBackup> = Vec::new();
+
+    for cf in config_files {
+        let file_path = crate::inventory::expand_home(&cf.file);
+        if !file_path.exists() {
+            // Restore anything we already touched, then fail loud.
+            restore_config_backups(&backups);
+            return Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "config file `{}` does not exist; cannot rewrite \
+                     data-dir reference for discovery=Config",
+                    file_path.display()
+                ),
+            ));
+        }
+        let backup_path = file_path.with_file_name(format!(
+            "{}.sessionguard-backup-{stamp}",
+            file_path
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or("config")
+        ));
+        if backup_path.exists() {
+            restore_config_backups(&backups);
+            return Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "backup path `{}` already exists; refusing to clobber. \
+                     Move it aside manually and retry.",
+                    backup_path.display()
+                ),
+            ));
+        }
+        // Copy (not rename) so the in-place rewrite still happens on
+        // the original inode. Tools watching the config via mtime see
+        // a single edit, not a delete+create.
+        if let Err(e) = std::fs::copy(&file_path, &backup_path) {
+            restore_config_backups(&backups);
+            return Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "failed to back up `{}` → `{}`: {e}",
+                    file_path.display(),
+                    backup_path.display()
+                ),
+            ));
+        }
+        backups.push(ConfigBackup {
+            original: file_path.clone(),
+            backup: backup_path.clone(),
+        });
+
+        // Synthesise a PathFieldSpec for the reconciler adapter.
+        let spec = PathFieldSpec {
+            file: String::new(),
+            field: cf.field.clone(),
+            format: cf.format.clone(),
+        };
+        let changed = crate::reconciler::rewrite_field(&file_path, &spec, &pairs).map_err(|e| {
+            // Reconciler failed mid-write — restore everything.
+            restore_config_backups(&backups);
+            MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "config rewrite failed on `{}` (field `{}`, format `{}`): {e}",
+                    file_path.display(),
+                    cf.field,
+                    cf.format
+                ),
+            )
+        })?;
+        if !changed {
+            // Field wasn't present, or didn't carry the src prefix.
+            // That's a misconfigured layout — fail loud rather than
+            // pretend the rewrite happened.
+            restore_config_backups(&backups);
+            return Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "config file `{}` field `{}` did not contain `{}`; \
+                     check the home_dir_layout config_files declaration",
+                    file_path.display(),
+                    cf.field,
+                    src.display()
+                ),
+            ));
+        }
+    }
+
+    Ok(RewriteOutcome::ConfigEdited { backups })
+}
+
+/// Best-effort restore of a list of config backups. Used when a later
+/// step in `rewrite_via_config` fails and we need to back out every
+/// edit we made earlier in the same pass.
+fn restore_config_backups(backups: &[ConfigBackup]) {
+    for b in backups {
+        let _ = std::fs::rename(&b.backup, &b.original);
+    }
+}
+
 /// Undo a [`RewriteOutcome`]. Used when a later stage fails and we
 /// need to roll back the symlink dance.
 fn undo_rewrite(outcome: &RewriteOutcome) -> Result<(), MigrateError> {
@@ -505,6 +648,28 @@ fn undo_rewrite(outcome: &RewriteOutcome) -> Result<(), MigrateError> {
                 })?;
             }
             std::fs::rename(aside, canonical)?;
+            Ok(())
+        }
+        RewriteOutcome::ConfigEdited { backups } => {
+            // Restore each backup over its original — last-write-wins.
+            // Errors here mean the operator's config is now half-rewritten;
+            // surface the first one so they can hand-fix.
+            for b in backups {
+                if !b.backup.exists() {
+                    // Already restored or never created; skip.
+                    continue;
+                }
+                std::fs::rename(&b.backup, &b.original).map_err(|e| {
+                    MigrateError::StageFailed(
+                        Stage::Rewrite,
+                        format!(
+                            "undo failed: could not restore `{}` from backup `{}`: {e}",
+                            b.original.display(),
+                            b.backup.display()
+                        ),
+                    )
+                })?;
+            }
             Ok(())
         }
         RewriteOutcome::SymlinkInstalled {
@@ -732,17 +897,22 @@ pub fn migrate_with(
                     return Err(e);
                 }
             },
-            HomeDirDiscovery::Env | HomeDirDiscovery::Config => {
-                // Env discovery (systemd drop-in or shell rc edit) and
-                // Config discovery (write through reconciler adapters)
-                // both land in step 6b. Until then, dry-run-only.
+            HomeDirDiscovery::Config => match rewrite_via_config(&layout.config_files, src, dst) {
+                Ok(o) => o,
+                Err(e) => {
+                    cleanup_partial_copy(dst);
+                    return Err(e);
+                }
+            },
+            HomeDirDiscovery::Env => {
+                // Env discovery (systemd drop-in or shell rc edit) lands
+                // in step 6b-env. Until then, dry-run-only.
                 cleanup_partial_copy(dst);
                 return Err(MigrateError::StageFailed(
                     Stage::Rewrite,
                     format!(
-                        "discovery = {:?} is not yet implemented in this release; \
-                         only `Symlink` discovery has a working Rewrite. Use \
-                         --dry-run to walk the read-only half of the state machine.",
+                        "discovery = {:?} is not yet implemented in this release. \
+                         Use --dry-run to walk the read-only half of the state machine.",
                         layout.discovery
                     ),
                 ));
@@ -768,6 +938,17 @@ pub fn migrate_with(
         RewriteOutcome::SymlinkInstalled {
             moved_aside: None, ..
         } => "symlink installed (no preserved original recorded)".into(),
+        RewriteOutcome::ConfigEdited { backups } => {
+            let names: Vec<String> = backups
+                .iter()
+                .map(|b| b.original.display().to_string())
+                .collect();
+            format!(
+                "rewrote {} config file(s) [{}]; backups taken alongside each",
+                backups.len(),
+                names.join(", ")
+            )
+        }
         RewriteOutcome::DryRunSkipped => {
             format!(
                 "dry-run: would install symlink for {:?} discovery",
@@ -1538,5 +1719,315 @@ mod tests {
         }
         // Rollback removed the copied dst:
         assert!(!dst.exists(), "rollback must remove dst on Env refusal");
+    }
+
+    // ── New in step 6b-config: Config discovery via reconciler adapters
+
+    /// Build a Config-discovery tool whose data-dir is named in a JSON
+    /// config file. Returns (tool, config_file_path).
+    fn config_tool_json(config_path: &Path, field: &str, data_dir: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: "configtool".into(),
+            display_name: "Config Tool".into(),
+            session_patterns: vec![],
+            path_fields: vec![],
+            on_move: ReconcileStrategy::Notify,
+            version: None,
+            binary: None,
+            home_dir_layout: Some(HomeDirLayout {
+                default_path: data_dir.to_string(),
+                discovery: HomeDirDiscovery::Config,
+                env_var: None,
+                config_files: vec![crate::tools::HomeDirConfigFile {
+                    file: config_path.display().to_string(),
+                    field: field.into(),
+                    format: "json".into(),
+                }],
+                quiesce: HomeDirQuiesce::default(),
+                validate: HomeDirValidate::default(),
+            }),
+        }
+    }
+
+    #[test]
+    fn rewrite_via_config_edits_field_and_backs_up_original() {
+        let tmp = TempDir::new().unwrap();
+        let data_old = tmp.path().join("data-old");
+        let data_new = tmp.path().join("data-new");
+        let cfg = tmp.path().join("config.json");
+        std::fs::create_dir_all(&data_old).unwrap();
+        std::fs::create_dir_all(&data_new).unwrap();
+        std::fs::write(
+            &cfg,
+            format!(
+                r#"{{"data_dir": "{}", "other": "untouched"}}"#,
+                data_old.display()
+            ),
+        )
+        .unwrap();
+
+        let cf = crate::tools::HomeDirConfigFile {
+            file: cfg.display().to_string(),
+            field: "data_dir".into(),
+            format: "json".into(),
+        };
+        let outcome = rewrite_via_config(&[cf], &data_old, &data_new).unwrap();
+
+        match &outcome {
+            RewriteOutcome::ConfigEdited { backups } => {
+                assert_eq!(backups.len(), 1);
+                assert_eq!(backups[0].original, cfg);
+                assert!(backups[0].backup.exists(), "backup should be on disk");
+                // Backup content == pre-rewrite original
+                let backup_content = std::fs::read_to_string(&backups[0].backup).unwrap();
+                assert!(backup_content.contains(&data_old.display().to_string()));
+            }
+            other => panic!("expected ConfigEdited, got {other:?}"),
+        }
+
+        // The live config now names the NEW dir.
+        let live: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(live["data_dir"], data_new.display().to_string());
+        assert_eq!(live["other"], "untouched");
+    }
+
+    #[test]
+    fn rewrite_via_config_fails_loud_when_field_missing() {
+        let tmp = TempDir::new().unwrap();
+        let data_old = tmp.path().join("data-old");
+        let data_new = tmp.path().join("data-new");
+        let cfg = tmp.path().join("config.json");
+        std::fs::create_dir_all(&data_old).unwrap();
+        std::fs::create_dir_all(&data_new).unwrap();
+        // Field exists but doesn't contain the src path → no-op rewrite.
+        std::fs::write(&cfg, r#"{"data_dir": "/some/unrelated/path"}"#).unwrap();
+
+        let cf = crate::tools::HomeDirConfigFile {
+            file: cfg.display().to_string(),
+            field: "data_dir".into(),
+            format: "json".into(),
+        };
+        let err = rewrite_via_config(&[cf], &data_old, &data_new).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Rewrite, msg) => {
+                assert!(
+                    msg.contains("did not contain"),
+                    "expected 'did not contain' refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected StageFailed(Rewrite,...), got {other:?}"),
+        }
+
+        // Live config untouched, no orphan backups
+        let live = std::fs::read_to_string(&cfg).unwrap();
+        assert!(live.contains("/some/unrelated/path"));
+        let siblings: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".sessionguard-backup-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "no backup sidecars must remain on failure"
+        );
+    }
+
+    #[test]
+    fn rewrite_via_config_restores_earlier_files_when_later_one_fails() {
+        // Two config files declared. First one rewrites cleanly; second
+        // is missing → whole op should fail and the first file must be
+        // restored to its pre-rewrite state.
+        let tmp = TempDir::new().unwrap();
+        let data_old = tmp.path().join("data-old");
+        let data_new = tmp.path().join("data-new");
+        std::fs::create_dir_all(&data_old).unwrap();
+        std::fs::create_dir_all(&data_new).unwrap();
+
+        let cfg1 = tmp.path().join("first.json");
+        let original1 = format!(r#"{{"data_dir": "{}"}}"#, data_old.display());
+        std::fs::write(&cfg1, &original1).unwrap();
+
+        let cfg2_missing = tmp.path().join("does-not-exist.json");
+
+        let cfs = vec![
+            crate::tools::HomeDirConfigFile {
+                file: cfg1.display().to_string(),
+                field: "data_dir".into(),
+                format: "json".into(),
+            },
+            crate::tools::HomeDirConfigFile {
+                file: cfg2_missing.display().to_string(),
+                field: "data_dir".into(),
+                format: "json".into(),
+            },
+        ];
+
+        let err = rewrite_via_config(&cfs, &data_old, &data_new).unwrap_err();
+        assert!(matches!(err, MigrateError::StageFailed(Stage::Rewrite, _)));
+
+        // cfg1 must be restored: contents back to the OLD path.
+        let restored = std::fs::read_to_string(&cfg1).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(
+            v["data_dir"],
+            data_old.display().to_string(),
+            "first file must be restored to pre-rewrite state"
+        );
+
+        // No backup sidecars left dangling
+        let siblings: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".sessionguard-backup-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "no backup sidecars must remain after rollback"
+        );
+    }
+
+    #[test]
+    fn undo_rewrite_restores_config_backups() {
+        let tmp = TempDir::new().unwrap();
+        let data_old = tmp.path().join("data-old");
+        let data_new = tmp.path().join("data-new");
+        let cfg = tmp.path().join("config.json");
+        std::fs::create_dir_all(&data_old).unwrap();
+        std::fs::create_dir_all(&data_new).unwrap();
+        let original = format!(r#"{{"data_dir": "{}"}}"#, data_old.display());
+        std::fs::write(&cfg, &original).unwrap();
+
+        let cf = crate::tools::HomeDirConfigFile {
+            file: cfg.display().to_string(),
+            field: "data_dir".into(),
+            format: "json".into(),
+        };
+        let outcome = rewrite_via_config(&[cf], &data_old, &data_new).unwrap();
+
+        // Sanity: live config now names the new dir.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["data_dir"], data_new.display().to_string());
+
+        // Undo restores to the pre-rewrite state.
+        undo_rewrite(&outcome).unwrap();
+        let restored = std::fs::read_to_string(&cfg).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&restored).unwrap();
+        assert_eq!(v["data_dir"], data_old.display().to_string());
+
+        // Backup sidecar consumed by the rename
+        let siblings: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".sessionguard-backup-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            siblings.is_empty(),
+            "undo should consume the backup sidecar"
+        );
+    }
+
+    #[test]
+    fn migrate_with_config_discovery_runs_rewrite_then_rolls_back_at_gate() {
+        // End-to-end: real (non-dry) migrate with discovery=Config. The
+        // driver should run the full Copy/Verify/Rewrite trio, then hit
+        // the NotYetMutating gate at Stage::Resume and unwind everything.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data-src");
+        let dst = tmp.path().join("data-dst");
+        let cfg = tmp.path().join("tool.json");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hello").unwrap();
+        let original = format!(r#"{{"data_dir": "{}"}}"#, src.display());
+        std::fs::write(&cfg, &original).unwrap();
+
+        let t = config_tool_json(&cfg, "data_dir", &src.display().to_string());
+        let err = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap_err();
+        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
+
+        // Rollback removed the dst the Copy stage created
+        assert!(!dst.exists(), "rollback must remove orphan dst");
+        // Config file restored to pre-rewrite contents
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(
+            v["data_dir"],
+            src.display().to_string(),
+            "config file must be restored to pre-rewrite state"
+        );
+        // No leftover backup sidecars
+        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".sessionguard-backup-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rollback must consume backup sidecars: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn migrate_config_discovery_refuses_when_no_config_files_declared() {
+        // discovery = Config but config_files is empty → preflight ok
+        // (read-only), Quiesce ok, Copy ok, Verify ok, then Rewrite
+        // refuses loudly. Tests the "misconfigured layout" guard.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"x").unwrap();
+
+        let t = ToolDefinition {
+            name: "noconfigfiles".into(),
+            display_name: "No Config Files".into(),
+            session_patterns: vec![],
+            path_fields: vec![],
+            on_move: ReconcileStrategy::Notify,
+            version: None,
+            binary: None,
+            home_dir_layout: Some(HomeDirLayout {
+                default_path: src.display().to_string(),
+                discovery: HomeDirDiscovery::Config,
+                env_var: None,
+                config_files: vec![], // empty!
+                quiesce: HomeDirQuiesce::default(),
+                validate: HomeDirValidate::default(),
+            }),
+        };
+
+        let err = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Rewrite, msg) => {
+                assert!(
+                    msg.contains("no config_files declared"),
+                    "expected empty-config_files refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected StageFailed(Rewrite,...), got {other:?}"),
+        }
+        assert!(!dst.exists(), "rollback must remove orphan dst");
     }
 }

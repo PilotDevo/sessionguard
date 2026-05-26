@@ -2,6 +2,47 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.10] - 2026-05-26
+
+### Features
+
+- **Rewrite stage wired for `discovery = "config"`** — v0.4 migrate
+  step 6b-config. Tools that store their data-dir location in a JSON
+  or TOML config file (rather than via env var or symlink) can now
+  reach Stage::Rewrite on a real run. The driver reuses the
+  reconciler's adapter dispatch (`pub(crate) reconciler::rewrite_field`)
+  so the same JSON/TOML/text adapters that rewrite in-project
+  artifacts also rewrite home-dir config references.
+- **Per-file timestamped backups** — each config file is backed up
+  to `<name>.sessionguard-backup-<unix>` before rewriting. On any
+  per-file failure, every earlier backup is rolled back so the
+  operator never sees a half-rewritten config. The backup pairs ride
+  on `RewriteOutcome::ConfigEdited { backups }` so `undo_rewrite`
+  can restore them later when stages 6–8 land.
+- **Loud refusal for misconfigured layouts** — `discovery = "config"`
+  with empty `config_files`, a referenced config that doesn't exist,
+  or a target field that doesn't carry the source path all fail
+  with `MigrateError::StageFailed(Stage::Rewrite, …)` and a precise
+  message naming the offending path/field. No silent no-op rewrites.
+
+### Internal
+
+- `reconciler::rewrite_field` is now `pub(crate)` so the migrate
+  driver can dispatch directly into the same adapter chain used by
+  in-project reconciliation. The function continues to live in
+  reconciler.rs — migrate.rs only consumes it.
+- `NotYetMutating` gate still sits before Stage::Resume; with Config
+  now landing, two of the three discovery branches (Symlink, Config)
+  are live. Env is the last holdout, scheduled for the next ship.
+
+### Testing
+
+- 6 new unit tests covering: clean rewrite + backup; missing-field
+  refusal; multi-file rollback when a later file fails; round-trip
+  undo restoring the backup; end-to-end real migrate with
+  `discovery = "config"` reaching the gate and unwinding cleanly;
+  empty-`config_files` refusal. **94 tests passing total**.
+
 ## [0.3.9] - 2026-05-26
 
 ### Features

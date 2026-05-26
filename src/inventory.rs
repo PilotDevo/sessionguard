@@ -262,7 +262,7 @@ mod tests {
         // One nested file
         fs::create_dir_all(dir.path().join("sub")).unwrap();
         let mut f = fs::File::create(dir.path().join("sub/c.dat")).unwrap();
-        f.write_all(&vec![0u8; 50]).unwrap();
+        f.write_all(&[0u8; 50]).unwrap();
 
         let t = tool_with_layout("dirwalk", dir.path().to_str().unwrap());
         let inv = inventory_tools_impl([&t]);

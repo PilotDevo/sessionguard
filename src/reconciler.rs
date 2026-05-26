@@ -205,7 +205,13 @@ fn path_pair_candidates(old: &Path, new: &Path) -> Vec<(String, String)> {
 // ── Adapter dispatch ─────────────────────────────────────────────────────────
 
 /// Rewrite a single field in an artifact file, dispatching to the right adapter.
-fn rewrite_field(
+///
+/// Exposed `pub(crate)` so the v0.4 migrate driver can reuse the same
+/// adapter dispatch for `HomeDirDiscovery::Config` (rewriting a tool's
+/// `~/.config/<tool>/config.toml`-style data-dir field). The migrate
+/// driver constructs a synthetic `PathFieldSpec` from `HomeDirConfigFile`
+/// and a single `(old_data_dir, new_data_dir)` pair.
+pub(crate) fn rewrite_field(
     path: &Path,
     field_spec: &PathFieldSpec,
     pairs: &[(String, String)],
