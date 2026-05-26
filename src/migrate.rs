@@ -236,6 +236,195 @@ impl Quiescer for SystemdQuiescer {
     }
 }
 
+// ── EnvWriter: abstraction over "set the env var the tool reads" ─────────
+//
+// Used by the `HomeDirDiscovery::Env` rewrite branch. The default
+// implementation drops a `Environment=<VAR>=<value>` override into the
+// tool's systemd unit (user or system scope, mirroring Quiesce), then
+// runs `systemctl daemon-reload`. Tests substitute a fake so they don't
+// depend on the host having systemd or a real unit registered.
+//
+// Design constraint: if the layout declares `discovery = "env"` but
+// has no systemd unit attached, we *refuse* the rewrite — there's no
+// safe automatic place to set the env var system-wide, and we don't
+// want to silently edit shell rc files. The operator's preflight
+// message tells them to declare a unit or set the var manually.
+//
+// Drop-in convention (matches systemd docs and what most operators
+// expect to find when troubleshooting):
+//   user:   ~/.config/systemd/user/<unit>.d/sessionguard-migrate.conf
+//   system: /etc/systemd/system/<unit>.d/sessionguard-migrate.conf
+
+/// Record of an env-rewrite install, used both for the result event
+/// log and to roll the override back during undo. Tagged so the
+/// JSON shape is self-describing for dashboards.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnvOverrideRecord {
+    /// Systemd unit scope: `"user"` or `"system"`.
+    pub scope: String,
+    /// Unit name (e.g. `opencode.service`).
+    pub unit: String,
+    /// The drop-in file that was written.
+    pub drop_in_path: PathBuf,
+    /// Env-var name that was set.
+    pub env_var: String,
+    /// Value the env var was set to (the new data dir).
+    pub value: String,
+}
+
+/// Pluggable env-writer backend so unit tests can verify Env-rewrite
+/// behaviour without spawning real `systemctl` or writing into the
+/// operator's `~/.config/systemd/user`.
+pub trait EnvWriter {
+    /// Install an env override for the layout's declared systemd unit.
+    /// Returns the record so undo can find the drop-in to remove.
+    /// On `dry_run = true`, returns `Ok(None)` and writes nothing.
+    fn install(
+        &self,
+        layout: &crate::tools::HomeDirLayout,
+        env_var: &str,
+        value: &str,
+        dry_run: bool,
+    ) -> Result<Option<EnvOverrideRecord>, MigrateError>;
+
+    /// Remove a previously-installed drop-in. Best-effort: missing
+    /// files are not an error (undo may run twice).
+    fn uninstall(&self, record: &EnvOverrideRecord, dry_run: bool) -> Result<(), MigrateError>;
+}
+
+/// Default real-systemd implementation. Writes the drop-in under the
+/// declared scope's standard location and runs `systemctl daemon-reload`.
+pub struct SystemdEnvWriter;
+
+impl EnvWriter for SystemdEnvWriter {
+    fn install(
+        &self,
+        layout: &crate::tools::HomeDirLayout,
+        env_var: &str,
+        value: &str,
+        dry_run: bool,
+    ) -> Result<Option<EnvOverrideRecord>, MigrateError> {
+        if dry_run {
+            return Ok(None);
+        }
+        let (scope, unit) = pick_unit(layout)?;
+        let drop_in_dir = drop_in_dir_for(&scope, &unit)?;
+        std::fs::create_dir_all(&drop_in_dir)?;
+        let drop_in_path = drop_in_dir.join("sessionguard-migrate.conf");
+        if drop_in_path.exists() {
+            return Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!(
+                    "drop-in `{}` already exists; another migrate may be in flight \
+                     or an earlier one didn't clean up. Remove it manually and retry.",
+                    drop_in_path.display()
+                ),
+            ));
+        }
+        let body = format!("[Service]\nEnvironment={env_var}={value}\n");
+        std::fs::write(&drop_in_path, body)?;
+        let args: Vec<&str> = if scope == "user" {
+            vec!["--user", "daemon-reload"]
+        } else {
+            vec!["daemon-reload"]
+        };
+        if let Err(e) = run_systemctl(&args) {
+            // daemon-reload failed — undo our drop-in to leave the
+            // operator's unit graph untouched.
+            let _ = std::fs::remove_file(&drop_in_path);
+            return Err(e);
+        }
+        Ok(Some(EnvOverrideRecord {
+            scope,
+            unit,
+            drop_in_path,
+            env_var: env_var.into(),
+            value: value.into(),
+        }))
+    }
+
+    fn uninstall(&self, record: &EnvOverrideRecord, dry_run: bool) -> Result<(), MigrateError> {
+        if dry_run {
+            return Ok(());
+        }
+        if record.drop_in_path.exists() {
+            std::fs::remove_file(&record.drop_in_path)?;
+        }
+        let args: Vec<&str> = if record.scope == "user" {
+            vec!["--user", "daemon-reload"]
+        } else {
+            vec!["daemon-reload"]
+        };
+        // daemon-reload may fail if systemd isn't running; we've
+        // already removed the file, so swallow non-fatal errors.
+        let _ = run_systemctl(&args);
+        Ok(())
+    }
+}
+
+/// Pick the (scope, unit) pair from a layout. Prefers user over system
+/// (same convention as Quiescer). Returns a clear error when neither
+/// is declared — env discovery without a unit isn't supported.
+fn pick_unit(layout: &crate::tools::HomeDirLayout) -> Result<(String, String), MigrateError> {
+    if let Some(u) = layout.quiesce.systemd_user_unit.as_deref() {
+        return Ok(("user".into(), u.into()));
+    }
+    if let Some(u) = layout.quiesce.systemd_system_unit.as_deref() {
+        return Ok(("system".into(), u.into()));
+    }
+    Err(MigrateError::StageFailed(
+        Stage::Rewrite,
+        "discovery = \"env\" requires `quiesce.systemd_user_unit` or \
+         `quiesce.systemd_system_unit` to be declared in the layout. \
+         Without a unit there is no safe place to set the env var; \
+         set the var manually in your shell rc and re-run with \
+         --dry-run to walk the rest of the state machine."
+            .into(),
+    ))
+}
+
+/// Path to the systemd drop-in directory for `<scope>/<unit>.d`.
+fn drop_in_dir_for(scope: &str, unit: &str) -> Result<PathBuf, MigrateError> {
+    if scope == "user" {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            MigrateError::StageFailed(
+                Stage::Rewrite,
+                "HOME is unset; cannot resolve user-scope systemd drop-in directory".into(),
+            )
+        })?;
+        Ok(PathBuf::from(home)
+            .join(".config/systemd/user")
+            .join(format!("{unit}.d")))
+    } else {
+        Ok(PathBuf::from("/etc/systemd/system").join(format!("{unit}.d")))
+    }
+}
+
+/// Rewrite via env: install a systemd drop-in pointing the tool's
+/// declared env var at `dst`. Validates the layout has an `env_var`
+/// before doing anything.
+fn rewrite_via_env(
+    layout: &crate::tools::HomeDirLayout,
+    dst: &Path,
+    env_writer: &dyn EnvWriter,
+) -> Result<RewriteOutcome, MigrateError> {
+    let env_var = layout.env_var.as_deref().ok_or_else(|| {
+        MigrateError::StageFailed(
+            Stage::Rewrite,
+            "discovery = \"env\" but `env_var` is not declared in the layout".into(),
+        )
+    })?;
+    let value = dst.to_string_lossy().into_owned();
+    let record = env_writer.install(layout, env_var, &value, false)?;
+    match record {
+        Some(r) => Ok(RewriteOutcome::EnvOverridden { record: r }),
+        None => Err(MigrateError::StageFailed(
+            Stage::Rewrite,
+            "env writer returned no record on a non-dry-run install".into(),
+        )),
+    }
+}
+
 // ── Copy + Verify (stages 3 and 4) ────────────────────────────────────────
 
 /// Summary of one Copy run.
@@ -400,8 +589,13 @@ pub enum RewriteOutcome {
     /// taken first. Each entry is `(original_file, backup_path)` so
     /// undo can restore by renaming the backup back over the original.
     ConfigEdited { backups: Vec<ConfigBackup> },
-    /// Discovery branch isn't wired yet. Carried for forward-compat —
-    /// once Env lands too this variant can be deleted.
+    /// A systemd drop-in was installed setting the tool's data-dir
+    /// env var to the new location. Undo removes the drop-in file
+    /// and runs `daemon-reload` again.
+    EnvOverridden { record: EnvOverrideRecord },
+    /// Discovery branch isn't wired yet. Carried for forward-compat;
+    /// no current variant uses it but keeping the enum non-exhaustive
+    /// for future discovery modes (e.g. `Manifest`, `Plist`).
     Deferred {
         /// Free-form reason. Surfaced verbatim in the event log.
         reason: String,
@@ -625,8 +819,13 @@ fn restore_config_backups(backups: &[ConfigBackup]) {
 }
 
 /// Undo a [`RewriteOutcome`]. Used when a later stage fails and we
-/// need to roll back the symlink dance.
-fn undo_rewrite(outcome: &RewriteOutcome) -> Result<(), MigrateError> {
+/// need to roll back the symlink / config edit / env override.
+///
+/// Takes a `dyn EnvWriter` so the `EnvOverridden` branch can be
+/// undone through the same systemd-aware abstraction the install
+/// used. Tests pass their fake; production callers pass
+/// `&SystemdEnvWriter`.
+fn undo_rewrite(outcome: &RewriteOutcome, env_writer: &dyn EnvWriter) -> Result<(), MigrateError> {
     match outcome {
         RewriteOutcome::SymlinkInstalled {
             canonical,
@@ -672,6 +871,7 @@ fn undo_rewrite(outcome: &RewriteOutcome) -> Result<(), MigrateError> {
             }
             Ok(())
         }
+        RewriteOutcome::EnvOverridden { record } => env_writer.uninstall(record, false),
         RewriteOutcome::SymlinkInstalled {
             moved_aside: None, ..
         }
@@ -702,26 +902,41 @@ fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
 /// Drive a migration. Set `dry_run = true` to walk every implemented
 /// stage without mutating the filesystem.
 ///
-/// Uses the default [`SystemdQuiescer`]; pass a custom one via
-/// [`migrate_with`] for tests or alternate quiesce strategies.
+/// Uses the default [`SystemdQuiescer`] + [`SystemdEnvWriter`]; pass
+/// custom backends via [`migrate_with`] for tests or alternate
+/// strategies.
 pub fn migrate(
     tool: &ToolDefinition,
     src: &Path,
     dst: &Path,
     dry_run: bool,
 ) -> Result<MigrationResult, MigrateError> {
-    migrate_with(tool, src, dst, dry_run, &SystemdQuiescer)
+    migrate_with_backends(tool, src, dst, dry_run, &SystemdQuiescer, &SystemdEnvWriter)
 }
 
-/// Like [`migrate`] but with an injectable [`Quiescer`]. Production
-/// callers use [`migrate`]; tests use this with a fake to avoid
-/// shelling out to real `systemctl`.
+/// Like [`migrate`] but with an injectable [`Quiescer`]. Uses the
+/// default [`SystemdEnvWriter`]. Existing tests built before the
+/// env-rewrite trait landed continue to compile against this signature.
 pub fn migrate_with(
     tool: &ToolDefinition,
     src: &Path,
     dst: &Path,
     dry_run: bool,
     quiescer: &dyn Quiescer,
+) -> Result<MigrationResult, MigrateError> {
+    migrate_with_backends(tool, src, dst, dry_run, quiescer, &SystemdEnvWriter)
+}
+
+/// Fully-injectable migration driver. Tests use this with both fakes
+/// to exercise Env-discovery rewrite without spawning real `systemctl`
+/// or writing into the operator's `~/.config/systemd/user`.
+pub fn migrate_with_backends(
+    tool: &ToolDefinition,
+    src: &Path,
+    dst: &Path,
+    dry_run: bool,
+    quiescer: &dyn Quiescer,
+    env_writer: &dyn EnvWriter,
 ) -> Result<MigrationResult, MigrateError> {
     let mut events: Vec<MigrationEvent> = Vec::new();
     let record = |stage: Stage, detail: &str, events: &mut Vec<MigrationEvent>| {
@@ -904,19 +1119,13 @@ pub fn migrate_with(
                     return Err(e);
                 }
             },
-            HomeDirDiscovery::Env => {
-                // Env discovery (systemd drop-in or shell rc edit) lands
-                // in step 6b-env. Until then, dry-run-only.
-                cleanup_partial_copy(dst);
-                return Err(MigrateError::StageFailed(
-                    Stage::Rewrite,
-                    format!(
-                        "discovery = {:?} is not yet implemented in this release. \
-                         Use --dry-run to walk the read-only half of the state machine.",
-                        layout.discovery
-                    ),
-                ));
-            }
+            HomeDirDiscovery::Env => match rewrite_via_env(layout, dst, env_writer) {
+                Ok(o) => o,
+                Err(e) => {
+                    cleanup_partial_copy(dst);
+                    return Err(e);
+                }
+            },
             HomeDirDiscovery::Compile => {
                 // Already rejected in preflight, but be defensive.
                 cleanup_partial_copy(dst);
@@ -949,6 +1158,15 @@ pub fn migrate_with(
                 names.join(", ")
             )
         }
+        RewriteOutcome::EnvOverridden { record } => format!(
+            "installed systemd {scope} drop-in for `{unit}` at {path} \
+             setting {var}={value}",
+            scope = record.scope,
+            unit = record.unit,
+            path = record.drop_in_path.display(),
+            var = record.env_var,
+            value = record.value
+        ),
         RewriteOutcome::DryRunSkipped => {
             format!(
                 "dry-run: would install symlink for {:?} discovery",
@@ -964,7 +1182,7 @@ pub fn migrate_with(
     // returning the gate error — otherwise the operator is left with
     // a symlink pointing at data the tool isn't yet wired up against.
     if !dry_run {
-        if let Err(undo_err) = undo_rewrite(&rewrite_outcome) {
+        if let Err(undo_err) = undo_rewrite(&rewrite_outcome, env_writer) {
             // Best-effort undo: if it fails we record the failure in
             // the event log but still return NotYetMutating; the
             // operator will see both events and know what to fix.
@@ -1144,6 +1362,90 @@ mod tests {
                 .push(format!("resume({action:?}, dry_run={dry_run})"));
             Ok(())
         }
+    }
+
+    /// Fake env writer that records every install/uninstall in a
+    /// shared scratch dir provided at construction. Lets tests inspect
+    /// the exact drop-in contents without touching real systemd.
+    struct FakeEnvWriter {
+        scratch: PathBuf,
+        installs: std::sync::Mutex<Vec<EnvOverrideRecord>>,
+        uninstalls: std::sync::Mutex<Vec<EnvOverrideRecord>>,
+    }
+
+    impl FakeEnvWriter {
+        fn new(scratch: PathBuf) -> Self {
+            Self {
+                scratch,
+                installs: std::sync::Mutex::new(Vec::new()),
+                uninstalls: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn installs(&self) -> Vec<EnvOverrideRecord> {
+            self.installs.lock().unwrap().clone()
+        }
+        fn uninstalls(&self) -> Vec<EnvOverrideRecord> {
+            self.uninstalls.lock().unwrap().clone()
+        }
+    }
+
+    impl EnvWriter for FakeEnvWriter {
+        fn install(
+            &self,
+            layout: &crate::tools::HomeDirLayout,
+            env_var: &str,
+            value: &str,
+            dry_run: bool,
+        ) -> Result<Option<EnvOverrideRecord>, MigrateError> {
+            if dry_run {
+                return Ok(None);
+            }
+            // Mirror SystemdEnvWriter's unit-pick logic but write into
+            // a scratch dir so tests can inspect the file.
+            let (scope, unit) = pick_unit(layout)?;
+            let drop_in_dir = self.scratch.join(format!("{scope}-{unit}.d"));
+            std::fs::create_dir_all(&drop_in_dir)?;
+            let drop_in_path = drop_in_dir.join("sessionguard-migrate.conf");
+            if drop_in_path.exists() {
+                return Err(MigrateError::StageFailed(
+                    Stage::Rewrite,
+                    format!("fake drop-in already exists at {}", drop_in_path.display()),
+                ));
+            }
+            std::fs::write(
+                &drop_in_path,
+                format!("[Service]\nEnvironment={env_var}={value}\n"),
+            )?;
+            let record = EnvOverrideRecord {
+                scope,
+                unit,
+                drop_in_path,
+                env_var: env_var.into(),
+                value: value.into(),
+            };
+            self.installs.lock().unwrap().push(record.clone());
+            Ok(Some(record))
+        }
+
+        fn uninstall(&self, record: &EnvOverrideRecord, dry_run: bool) -> Result<(), MigrateError> {
+            if dry_run {
+                return Ok(());
+            }
+            if record.drop_in_path.exists() {
+                std::fs::remove_file(&record.drop_in_path)?;
+            }
+            self.uninstalls.lock().unwrap().push(record.clone());
+            Ok(())
+        }
+    }
+
+    /// Convenience constructor: a FakeEnvWriter rooted in a temp dir
+    /// the test owns. Returns (writer, tempdir-handle) so the dir
+    /// outlives the writer.
+    fn fake_env_writer() -> (FakeEnvWriter, TempDir) {
+        let dir = TempDir::new().unwrap();
+        let w = FakeEnvWriter::new(dir.path().to_path_buf());
+        (w, dir)
     }
 
     fn populate(dir: &Path, files: &[(&str, &[u8])]) {
@@ -1687,7 +1989,8 @@ mod tests {
             .file_type()
             .is_symlink());
 
-        undo_rewrite(&outcome).unwrap();
+        let (ew, _scratch) = fake_env_writer();
+        undo_rewrite(&outcome, &ew).unwrap();
 
         // canonical is a real directory again, with its original file
         let meta = std::fs::symlink_metadata(&canonical).unwrap();
@@ -1696,23 +1999,24 @@ mod tests {
     }
 
     #[test]
-    fn migrate_refuses_env_discovery_until_step_6b() {
-        // Env-var rewrite branch isn't wired yet (systemd drop-in /
-        // shell rc edits land in step 6b). A real-run attempt against
-        // a tool with discovery = Env should refuse with a clear
-        // message and roll back the copy.
+    fn migrate_refuses_env_discovery_when_no_unit_declared() {
+        // discovery=Env with `env_var` set but NO systemd unit declared
+        // → preflight/copy/verify succeed, then Rewrite refuses loudly.
+        // Operator gets actionable instructions, not silent dotfile edit.
         let t = tool(HomeDirDiscovery::Env, Some("TEST_HOME"), None);
         let src = TempDir::new().unwrap();
         populate(src.path(), &[("a.txt", b"hello")]);
         let dst_dir = TempDir::new().unwrap();
         let dst = dst_dir.path().join("new");
 
-        let err = migrate_with(&t, src.path(), &dst, false, &FakeQuiescer::default()).unwrap_err();
+        let (ew, _scratch) = fake_env_writer();
+        let err = migrate_with_backends(&t, src.path(), &dst, false, &FakeQuiescer::default(), &ew)
+            .unwrap_err();
         match err {
             MigrateError::StageFailed(Stage::Rewrite, msg) => {
                 assert!(
-                    msg.contains("not yet implemented"),
-                    "expected discovery=Env refusal, got: {msg}"
+                    msg.contains("requires `quiesce.systemd_user_unit`"),
+                    "expected unit-required refusal, got: {msg}"
                 );
             }
             other => panic!("expected StageFailed(Rewrite, ...), got {other:?}"),
@@ -1921,7 +2225,8 @@ mod tests {
         assert_eq!(v["data_dir"], data_new.display().to_string());
 
         // Undo restores to the pre-rewrite state.
-        undo_rewrite(&outcome).unwrap();
+        let (ew, _scratch) = fake_env_writer();
+        undo_rewrite(&outcome, &ew).unwrap();
         let restored = std::fs::read_to_string(&cfg).unwrap();
         let v: serde_json::Value = serde_json::from_str(&restored).unwrap();
         assert_eq!(v["data_dir"], data_old.display().to_string());
@@ -2029,5 +2334,190 @@ mod tests {
             other => panic!("expected StageFailed(Rewrite,...), got {other:?}"),
         }
         assert!(!dst.exists(), "rollback must remove orphan dst");
+    }
+
+    // ── New in step 6b-env: Env discovery via systemd drop-in ────────────
+
+    #[test]
+    fn rewrite_via_env_writes_drop_in_with_correct_contents() {
+        // Direct unit test of the env rewrite helper. Layout has
+        // user-scope unit + env_var declared; the fake env writer
+        // captures the install and lets us inspect the on-disk
+        // drop-in file.
+        let dst = TempDir::new().unwrap();
+        let layout = HomeDirLayout {
+            default_path: "/ignored".into(),
+            discovery: HomeDirDiscovery::Env,
+            env_var: Some("OPENCODE_HOME".into()),
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("opencode.service".into()),
+                systemd_system_unit: None,
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let (ew, _scratch) = fake_env_writer();
+        let outcome = rewrite_via_env(&layout, dst.path(), &ew).unwrap();
+
+        match &outcome {
+            RewriteOutcome::EnvOverridden { record } => {
+                assert_eq!(record.scope, "user");
+                assert_eq!(record.unit, "opencode.service");
+                assert_eq!(record.env_var, "OPENCODE_HOME");
+                assert_eq!(record.value, dst.path().display().to_string());
+                let body = std::fs::read_to_string(&record.drop_in_path).unwrap();
+                assert!(body.contains("[Service]"));
+                assert!(body.contains(&format!(
+                    "Environment=OPENCODE_HOME={}",
+                    dst.path().display()
+                )));
+            }
+            other => panic!("expected EnvOverridden, got {other:?}"),
+        }
+
+        let installs = ew.installs();
+        assert_eq!(installs.len(), 1, "fake should have recorded one install");
+    }
+
+    #[test]
+    fn rewrite_via_env_prefers_user_over_system_scope() {
+        // Both scopes declared; user wins (cheaper, no sudo).
+        let dst = TempDir::new().unwrap();
+        let layout = HomeDirLayout {
+            default_path: "/ignored".into(),
+            discovery: HomeDirDiscovery::Env,
+            env_var: Some("FOO".into()),
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("user.service".into()),
+                systemd_system_unit: Some("system.service".into()),
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let (ew, _scratch) = fake_env_writer();
+        let outcome = rewrite_via_env(&layout, dst.path(), &ew).unwrap();
+        if let RewriteOutcome::EnvOverridden { record } = outcome {
+            assert_eq!(record.scope, "user");
+            assert_eq!(record.unit, "user.service");
+        } else {
+            panic!("expected EnvOverridden");
+        }
+    }
+
+    #[test]
+    fn rewrite_via_env_falls_back_to_system_when_only_system_declared() {
+        let dst = TempDir::new().unwrap();
+        let layout = HomeDirLayout {
+            default_path: "/ignored".into(),
+            discovery: HomeDirDiscovery::Env,
+            env_var: Some("FOO".into()),
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: None,
+                systemd_system_unit: Some("nginx.service".into()),
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let (ew, _scratch) = fake_env_writer();
+        let outcome = rewrite_via_env(&layout, dst.path(), &ew).unwrap();
+        if let RewriteOutcome::EnvOverridden { record } = outcome {
+            assert_eq!(record.scope, "system");
+            assert_eq!(record.unit, "nginx.service");
+        } else {
+            panic!("expected EnvOverridden");
+        }
+    }
+
+    #[test]
+    fn rewrite_via_env_refuses_when_env_var_missing() {
+        // Layout declares discovery=Env but no env_var → caller bug,
+        // not operator bug. Refuse loudly.
+        let dst = TempDir::new().unwrap();
+        let layout = HomeDirLayout {
+            default_path: "/ignored".into(),
+            discovery: HomeDirDiscovery::Env,
+            env_var: None,
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("x.service".into()),
+                systemd_system_unit: None,
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let (ew, _scratch) = fake_env_writer();
+        let err = rewrite_via_env(&layout, dst.path(), &ew).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Rewrite, msg) => {
+                assert!(
+                    msg.contains("`env_var` is not declared"),
+                    "expected env_var-missing message, got: {msg}"
+                );
+            }
+            other => panic!("expected StageFailed, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn undo_rewrite_removes_env_drop_in() {
+        let dst = TempDir::new().unwrap();
+        let layout = HomeDirLayout {
+            default_path: "/ignored".into(),
+            discovery: HomeDirDiscovery::Env,
+            env_var: Some("BAR".into()),
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("bar.service".into()),
+                systemd_system_unit: None,
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let (ew, _scratch) = fake_env_writer();
+        let outcome = rewrite_via_env(&layout, dst.path(), &ew).unwrap();
+        let drop_in = if let RewriteOutcome::EnvOverridden { ref record } = outcome {
+            record.drop_in_path.clone()
+        } else {
+            panic!("expected EnvOverridden");
+        };
+        assert!(drop_in.exists(), "drop-in should exist before undo");
+
+        undo_rewrite(&outcome, &ew).unwrap();
+        assert!(!drop_in.exists(), "drop-in should be removed by undo");
+        assert_eq!(ew.uninstalls().len(), 1, "fake should record one uninstall");
+    }
+
+    #[test]
+    fn migrate_with_env_discovery_runs_rewrite_then_rolls_back_at_gate() {
+        // End-to-end: real (non-dry) migrate with discovery=Env. The
+        // driver runs Copy + Verify + Rewrite (installing drop-in),
+        // then hits NotYetMutating and unwinds everything.
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("src");
+        let dst = tmp.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hi").unwrap();
+
+        let t = tool(
+            HomeDirDiscovery::Env,
+            Some("MYTOOL_HOME"),
+            Some("mytool.service"),
+        );
+
+        let (ew, _scratch) = fake_env_writer();
+        let err = migrate_with_backends(&t, &src, &dst, false, &FakeQuiescer::default(), &ew)
+            .unwrap_err();
+        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
+
+        // Rollback removed the dst Copy created
+        assert!(!dst.exists(), "rollback must remove orphan dst");
+        // Install happened, then uninstall on rollback
+        assert_eq!(ew.installs().len(), 1, "one install during Rewrite");
+        assert_eq!(ew.uninstalls().len(), 1, "one uninstall during rollback");
+        // Drop-in file should be gone
+        let leftover = &ew.installs()[0].drop_in_path;
+        assert!(
+            !leftover.exists(),
+            "drop-in must be removed after rollback: {}",
+            leftover.display()
+        );
     }
 }

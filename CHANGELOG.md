@@ -2,6 +2,53 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.11] - 2026-05-26
+
+### Features
+
+- **Rewrite stage wired for `discovery = "env"`** — v0.4 migrate
+  step 6b-env, the third and final discovery branch. Tools that
+  read their data-dir location from an environment variable now
+  get a systemd drop-in installed at:
+  - `~/.config/systemd/user/<unit>.d/sessionguard-migrate.conf` (user scope)
+  - `/etc/systemd/system/<unit>.d/sessionguard-migrate.conf` (system scope)
+  Containing `[Service]\nEnvironment=<VAR>=<new_data_dir>` and
+  followed by `systemctl daemon-reload` in the right scope.
+- **Loud refusal when no systemd unit declared** — `discovery = "env"`
+  requires `quiesce.systemd_user_unit` or `quiesce.systemd_system_unit`.
+  Without one there is no safe automatic place to set the env var,
+  and we won't silently edit operator dotfiles. The refusal message
+  tells the operator exactly what to declare or to set the var
+  manually in their shell rc.
+- **`EnvWriter` trait** — pluggable backend mirroring the existing
+  `Quiescer` pattern. Production uses `SystemdEnvWriter`; tests use
+  `FakeEnvWriter` to verify drop-in contents without touching real
+  systemd. Add the new `migrate_with_backends(...)` entry point for
+  tests that need both backends fake; `migrate_with(...)` keeps
+  working with the real env writer for existing callers.
+- **`RewriteOutcome::EnvOverridden { record }`** — carries the
+  `EnvOverrideRecord` (scope, unit, drop-in path, env var, value)
+  so `undo_rewrite` can remove the drop-in and `daemon-reload`
+  again. Round-trip undo proven by tests.
+
+### Discovery branch coverage
+
+All three real discovery branches are now live:
+- ✅ `Symlink` — v0.3.9 (step 6)
+- ✅ `Config` — v0.3.10 (step 6b-config)
+- ✅ `Env` — this release (step 6b-env)
+
+`NotYetMutating` still gates real runs at Stage::Resume — stages
+6 (Resume) + 7 (Validate) + 8 (Retain) land in v0.4 step 7.
+
+### Testing
+
+- 6 new unit tests covering: drop-in contents + path; user-over-system
+  scope preference; system-only fallback; missing-env-var refusal;
+  round-trip undo removes drop-in; end-to-end real migrate with
+  `discovery = "env"` reaching the gate and unwinding cleanly.
+  **100 tests passing total**.
+
 ## [0.3.10] - 2026-05-26
 
 ### Features
