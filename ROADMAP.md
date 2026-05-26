@@ -70,22 +70,38 @@ Goal: let the community extend the pattern catalog safely.
 Sessions can survive *the project* moving (the original thesis) and
 *the disk* changing (v0.4 `migrate`), but they don't survive *the
 runtime* changing — which is a separate failure mode that SessionGuard
-should be able to surface even if it can't fix it.
+should be able to surface even if it can't fix it. The operator has
+hit this repeatedly across runtime upgrades (Node, Python, others).
 
-**Motivating scenario.** Upgrade Node from v23 → v24. Globally-installed
-npm packages (Claude Code, Codex CLI, Gemini CLI) live under the
-previous Node version's `lib/node_modules/`; the new version has its
-own empty globals tree. The session data at `~/.claude/projects/`,
-`~/.codex/sessions/`, `~/.local/share/opencode/` is untouched, but
-the `claude` / `codex` / `gemini` binaries are no longer on PATH.
-From the user's POV "my sessions are gone" — they aren't, the
-launcher is just unreachable.
+**Motivating scenarios.** Same shape across runtimes:
 
-This isn't SessionGuard's job to *fix* (that's `nvm install
---reinstall-packages-from`, `volta`, or each tool vendor's standalone
-installer). But it IS SessionGuard's job to *notice* — we already
-know where the sessions live; we should also know whether the tool
-that wrote them can still launch.
+- Upgrade Node v23 → v24. Globally-installed npm packages
+  (Claude Code, Codex CLI, Gemini CLI, OpenCode) live under the
+  previous Node version's `lib/node_modules/`; the new version has
+  its own empty globals tree.
+- Upgrade Python 3.11 → 3.12 with `pyenv`. `pipx`-installed AI
+  tooling (Aider, etc.) is rooted in the previous Python's venv;
+  the new Python sees nothing.
+- Same pattern for any rbenv/asdf/system-package upgrade that
+  swaps the runtime under tools installed against it.
+
+In all of these the session data at `~/.claude/projects/`,
+`~/.codex/sessions/`, `~/.local/share/opencode/` is untouched —
+but the launcher binaries are gone from PATH. From the user's
+POV "my sessions are gone" — they aren't, the launcher is just
+unreachable.
+
+**Two paths through this problem, scoped honestly:**
+
+| | A — *Visibility* | B — *Availability* |
+|---|---|---|
+| What | SessionGuard *notices* missing launchers and tells you | SessionGuard *restores* launchers across runtime changes |
+| Scope | ~200 LOC, fits v0.3.3 cleanly | Big. Effectively reimplements parts of nvm/volta/pyenv/pipx |
+| Risk | Low | Scope-creep into territory existing tools cover well |
+| Recommendation | **Ship now** | Defer until A is in real use and we know if visibility alone is enough |
+
+This entry covers A. B is captured as a reach goal below — likely
+folded into v0.4 *if* A doesn't reduce the pain enough on its own.
 
 **Design sketch.**
 
