@@ -2,6 +2,53 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.9] - 2026-05-26
+
+### Features
+
+- **Rewrite stage wired for `discovery = "symlink"`** — v0.4 migrate
+  step 6 (partial). After Copy + Verify succeed, the original source
+  directory is renamed aside to `<src>.migrated-<unix_seconds>` and a
+  symlink is installed at the canonical path pointing to the new
+  destination. The tool keeps reading the canonical path; data lives
+  at the new location.
+- **Rollback that survives Rewrite** — on later-stage failure, the
+  Rewrite is undone (symlink removed, preserved sidecar renamed back)
+  before any error returns. Source filesystem state is byte-identical
+  to pre-migration after a rolled-back attempt.
+
+### Internal
+
+- New `RewriteOutcome` enum: `SymlinkInstalled { canonical, target,
+  moved_aside }` / `DryRunSkipped` / `Deferred { reason }`. Tagged
+  JSON repr; carried in the event log for `undo` consumption.
+- New `rewrite_via_symlink(canonical, target)` — performs the
+  rename-aside + symlink-install dance. Refuses when the timestamped
+  preserved name already exists (rare but possible if two migrations
+  collide in the same second).
+- New `undo_rewrite(outcome)` — reverses a SymlinkInstalled outcome.
+  Used by the gate-after-Rewrite block; will also be used by
+  `sessionguard undo` for stale half-migrates once event-log
+  integration lands in step 7.
+- The `NotYetMutating` gate moved from BEFORE Stage::Rewrite to AFTER.
+  Rewrite now runs on real migrations; the gate sits before Resume
+  (which doesn't exist yet) so we still can't complete a migration.
+  On gate trip, the just-installed symlink is undone and the dst is
+  cleaned up before the error returns.
+- `discovery = "config"` and `discovery = "env"` return a typed
+  `StageFailed(Rewrite, ...)` error explaining they're slated for
+  step 6b; rollback removes the dst.
+- Four new unit tests (Unix only, since symlinks): symlink-install
+  swaps + preserves, refusal on preserved-name collision, undo
+  restores the original, Env-discovery refusal rolls back cleanly.
+  114 tests total (was 110).
+
+### Still gated
+
+Resume + Validate + Retain (step 7). The `Env` and `Config`
+discovery branches (step 6b). After step 7, real migrations
+complete end-to-end and the gate finally comes down.
+
 ## [0.3.8] - 2026-05-26
 
 ### Features
