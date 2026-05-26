@@ -3,6 +3,7 @@ name = "cursor"
 display_name = "Cursor"
 version = "1.0"
 on_move = "rewrite_paths"
+binary = "cursor"
 
 session_patterns = [
   ".cursor/",

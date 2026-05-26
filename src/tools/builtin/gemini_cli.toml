@@ -3,6 +3,7 @@ name = "gemini_cli"
 display_name = "Gemini CLI"
 version = "1.0"
 on_move = "rewrite_paths"
+binary = "gemini"
 
 session_patterns = [
   ".gemini/",

@@ -68,6 +68,13 @@ pub struct ToolDefinition {
     /// Version of this tool definition.
     #[serde(default)]
     pub version: Option<String>,
+    /// Name of the launcher binary on PATH (e.g. `claude`, `codex`). Optional —
+    /// some "tools" are IDEs without a CLI; leave unset for those. Used by the
+    /// `health` module and `sessionguard doctor` to warn when session data
+    /// exists but the binary that wrote it is no longer reachable (typical
+    /// after a Node/Python runtime upgrade).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
 }
 
 /// TOML wrapper for a file containing a single tool definition.
@@ -214,6 +221,7 @@ mod tests {
             path_fields: vec![],
             on_move: ReconcileStrategy::Notify,
             version: Some("99.0".to_string()),
+            binary: None,
         };
         registry.register(custom);
         assert_eq!(
@@ -298,6 +306,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 path_fields: vec![],
                 on_move: ReconcileStrategy::Notify,
                 version: Some("1.0".to_string()),
+                binary: None,
             }],
             ..Default::default()
         };
@@ -322,6 +331,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 path_fields: vec![],
                 on_move: ReconcileStrategy::RewritePaths,
                 version: Some("99.0".to_string()),
+                binary: None,
             }],
             ..Default::default()
         };

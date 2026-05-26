@@ -10,6 +10,7 @@ version = "1.0"
 # (the shared multi-agent project manifest) and an optional .codex/
 # directory for per-project config overrides.
 on_move = "notify"
+binary = "codex"
 
 session_patterns = [
   "AGENTS.md",

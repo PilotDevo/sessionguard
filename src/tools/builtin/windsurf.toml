@@ -3,6 +3,7 @@ name = "windsurf"
 display_name = "Windsurf"
 version = "1.0"
 on_move = "rewrite_paths"
+binary = "windsurf"
 
 session_patterns = [
   ".windsurf/",

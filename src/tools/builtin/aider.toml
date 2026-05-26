@@ -6,6 +6,7 @@ version = "1.0"
 # .aider.input.history, both under the project root. These files contain
 # absolute paths to files added to the chat context.
 on_move = "rewrite_paths"
+binary = "aider"
 
 session_patterns = [
   ".aider.chat.history.md",

@@ -3,6 +3,7 @@ name = "claude_code"
 display_name = "Claude Code"
 version = "1.0"
 on_move = "rewrite_paths"
+binary = "claude"
 
 session_patterns = [
   ".claude/",

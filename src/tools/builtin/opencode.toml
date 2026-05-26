@@ -7,6 +7,7 @@ version = "1.0"
 # data is keyed on absolute project path; home-dir reconciliation is
 # v0.4 `migrate` scope, so on_move stays `notify` for now.
 on_move = "notify"
+binary = "opencode"
 
 session_patterns = [
   "AGENTS.md",
