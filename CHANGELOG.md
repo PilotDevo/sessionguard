@@ -2,6 +2,44 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.5] - 2026-05-26
+
+### Features
+
+- **`sessionguard inventory`** — pure read-only command that walks every
+  registered tool with a `home_dir_layout` declaration and reports
+  `{tool, location, size, last_activity}`. The lead-in to v0.4
+  `migrate`: answers *"what should I move and how big is it?"*
+  - Text mode renders a compact table with human-friendly size + age
+    formatting.
+  - `--format json` for tooling integration.
+  - Walks capped at 200k files per store; result includes a
+    `truncated` flag when the cap was hit.
+  - Symlinks are skipped (don't follow).
+- **`home_dir_layout` schema on `ToolDefinition`** — declarative
+  description of where each tool stores user-scoped data and how
+  `sessionguard migrate` (v0.4, in flight) should rewrite its
+  self-references. Optional; tools without it behave exactly as
+  before. Full schema in `docs/design/migrate.md`.
+- **Codex** and **OpenCode** builtins populated with home_dir_layout:
+  - Codex: `discovery = "env"`, `env_var = "CODEX_HOME"`.
+  - OpenCode: `discovery = "symlink"` (default XDG path; no env var
+    or config file declares the data dir).
+
+### Internal
+
+- New `src/inventory.rs` module with `inventory_tools_impl()` plus
+  9 unit tests (5 inventory module + 3 home_dir_layout schema + 1
+  per-builtin assertion). 88 tests total (was 79).
+- New `src/main.rs` helpers `fmt_size` and `fmt_ago` for the
+  inventory text table, both with unit tests.
+
+### Roadmap
+
+- v0.3.4 docs/design/migrate.md captured the v0.4 contract. v0.3.5
+  delivers schema + inventory (steps 1–2 of the implementation
+  order). Next: state-machine skeleton (step 3).
+
 ## [0.3.4] - 2026-05-26
 
 ### Features
