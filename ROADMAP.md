@@ -6,16 +6,25 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.3.2 (current)** — Daemon reliably detects moves on macOS and Linux
+**v0.3.4 (current)** — Daemon reliably detects moves on macOS and Linux
 (proven via `scripts/dogfood.sh` on real hardware) and reconciles seven
 built-in tools (five reconciling, two detect-only). `sessionguard undo`
 reverses any logged action from the event log. `--format json` available
-on `tools`, `log`, and `status` for tooling integration.
+on `tools`, `log`, and `status` for tooling integration. **Launcher
+health** check (v0.3.3) tells you when a tool's binary is missing from
+PATH versus when the session data itself is gone. **`doctor --clean`**
+(v0.3.4) prunes stale registry entries without further mutation.
 
-The local read-only **dashboard** (`tools/dashboard/`) now ships with an
+The local read-only **dashboard** (`tools/dashboard/`) ships with an
 **Activity** tab that gives a per-project, per-assistant view across
-Claude Code, Codex, and OpenCode session stores — answering "where am I
-working, and which assistants have touched what?" at a glance.
+Claude Code, Codex, and OpenCode session stores, and surfaces launcher
+health in the Tools tab — answering "where am I working, which
+assistants have touched what, and can the tool actually run?" at a
+glance.
+
+The v0.4 *migrate* design is captured in
+[`docs/design/migrate.md`](docs/design/migrate.md) — code follows once
+the design is reviewed.
 
 ## v0.3 — Undo + More Patterns  *(shipping)*
 
@@ -33,6 +42,10 @@ Goal: build trust. Users won't run an auto-reconciler they can't reverse.
 - [ ] `scripts/dogfood.sh` as a required CI check *(deferred)*
 
 ## v0.4 — Migrate
+
+> **Design**: [`docs/design/migrate.md`](docs/design/migrate.md) — read
+> first; this section is the bullet-list summary, the design doc is the
+> contract.
 
 Goal: ship the feature conversation suggested by the fedora fastpool work.
 Turn SessionGuard from *"watches for moves"* into *"the tool that moves
