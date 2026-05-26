@@ -2,6 +2,52 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.6] - 2026-05-26
+
+### Features
+
+- **`sessionguard migrate <tool> --to <path> --dry-run`** — the
+  read-only half of v0.4 migrate. New `Command::Migrate` wired to
+  the state-machine skeleton in `src/migrate.rs`. Walks every
+  implemented stage (preflight → snapshot → quiesce → copy → verify)
+  and emits the per-stage event log without touching the filesystem.
+- **Real (non-dry-run) migration is intentionally gated** — returns
+  `MigrateError::NotYetMutating` until stages 5–7 (rewrite / resume /
+  validate) land. Refusal text is actionable and points the operator
+  at `--dry-run`. This is enforced in the library, not just the CLI,
+  so future callers can't accidentally route around it.
+
+### Internal
+
+- New `src/migrate.rs` module:
+  - `Stage` enum matching the design doc's eight-stage diagram
+  - `MigrationEvent` (per-stage record; flat shape for event-log
+    JSON storage when step 6 lands)
+  - `MigrationResult` (terminal state + full event trail)
+  - `MigrateError` typed variants for every refusal path
+  - `migrate(tool, src, dst, dry_run) -> Result` driver
+  - Iterative file walker for verify-stage size/count
+- `inventory::expand_home()` exposed `pub` so migrate can reuse the
+  same `~`-expansion semantics. Both the inventory CLI and the new
+  migrate CLI consume tool definitions' `default_path` identically.
+- 7 new unit tests cover every refusal path (NoLayout, CompileBaked,
+  SourceMissing, DestinationExists, NotYetMutating) and dry-run
+  happy paths (full stage sequence + quiesce-intent recording).
+  95 tests total (was 88).
+
+### Live data this release surfaces
+
+On the operator's fedora hub, `sessionguard inventory` reports:
+
+```
+codex     /home/devo/.codex                    198.4 MB   3571 files    2d ago
+opencode  /home/devo/.local/share/opencode      19.8 GB 144385 files  108d ago
+```
+
+The OpenCode store is the v0.4 migrate test target named in
+`docs/design/migrate.md`. v0.3.6 is the last "read-only" step
+before the mutating stages land.
+
 ## [0.3.5] - 2026-05-26
 
 ### Features
