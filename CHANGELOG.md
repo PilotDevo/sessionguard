@@ -2,6 +2,54 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.3] - 2026-04-18
+
+### Features
+
+- **Launcher health checks** — the *visibility* path of the "runtime
+  upgrade lost my launcher" problem. When you upgrade Node, Python, or
+  any runtime that hosts AI tooling, the global package installs under
+  the previous version vanish from PATH; your session data is intact
+  but `claude` / `codex` / etc. become "command not found." Sessions
+  appear gone — they aren't.
+  - New optional `binary` field on `ToolDefinition` declares the
+    launcher binary expected on PATH.
+  - All 7 built-in patterns populated: `claude_code → claude`,
+    `cursor → cursor`, `windsurf → windsurf`, `aider → aider`,
+    `gemini_cli → gemini`, `codex → codex`, `opencode → opencode`.
+  - New `src/health.rs` module with `check_binary()` that resolves
+    against PATH via a built-in `which(1)`-equivalent walker (no
+    subprocess, works on minimal Linux images).
+  - `BinaryStatus` enum: `Present { path }`, `Missing { binary }`,
+    `NotConfigured`. Tagged JSON repr for dashboard consumption.
+
+### CLI
+
+- `sessionguard doctor` now reports a `launcher health` section
+  alongside the existing tracked-project check. Missing launchers
+  are flagged with a `[WARN]` line that explicitly notes
+  *"session data intact; check installer / runtime version"* so
+  users don't think their history is lost.
+- `sessionguard tools list` gains a `LAUNCHER` column in the text
+  output and a `binary_status` field in the `--format json` output.
+
+### Dashboard
+
+- **Tools tab** — per-tool block now shows a launcher status pill
+  (`launcher OK` / `launcher missing` / `no launcher configured`)
+  with the resolved path or actionable diagnostic.
+- **Activity tab** — column headers for stores whose launcher binary
+  is missing get a ⚠ badge, so at a glance you can see "this column
+  has 14 sessions but the tool can't run."
+
+### Roadmap
+
+- Path B from the v0.3.x launcher-health roadmap entry (active
+  *availability* — actually restoring launchers across runtime
+  changes via `sessionguard restore-launcher`) remains deferred.
+  Path A (visibility, this release) ships first to let real-world
+  data inform whether visibility alone is enough.
+
 ## [0.3.2] - 2026-04-18
 
 ### Features
