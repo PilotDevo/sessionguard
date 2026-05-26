@@ -2,6 +2,49 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.8] - 2026-05-26
+
+### Features
+
+- **Copy + Verify stages wired** — v0.4 migrate steps 3-4. The Copy
+  stage now actually walks the source tree and writes the files to
+  the destination; the Verify stage walks both sides and compares
+  `{file_count, total_bytes}`. Symlinks are deliberately skipped
+  (cycles + off-tree pointers); Unix mode bits are mirrored so
+  executables stay executable.
+- **Automatic rollback** — when migrate aborts after the Copy stage
+  (e.g. because the still-gated Rewrite stage refuses), the partial
+  destination is removed before the error returns. Source is left
+  untouched. The operator never sees orphan data.
+
+### Internal
+
+- New `copy_tree(src, dst) -> CopySummary` recursive copier with
+  symlink skip + Unix mode mirroring. No external deps; uses
+  `std::fs::copy` per file.
+- New `verify_copy(src, dst) -> VerifyOutcome` — best-effort walk
+  of both sides returning mismatched fields when they disagree.
+- New `cleanup_partial_copy(dst)` — best-effort rollback. Idempotent
+  (no-op when dst doesn't exist).
+- The `NotYetMutating` gate moved from BEFORE Stage::Copy to BEFORE
+  Stage::Rewrite. Copy + Verify are read-only on source and write
+  fully-cleanupable bytes to dst, so they ship as real operations
+  now; Rewrite / Resume / Validate / Retain remain gated until
+  later steps.
+- Nine new unit tests cover copy_tree (basic, refuses-existing-dst,
+  skips-symlinks, mirrors-executable-bit), verify_copy (match,
+  mismatch-on-removal), cleanup (idempotent), and end-to-end driver
+  behavior (real run copies, hits Rewrite gate, rolls back cleanly,
+  src untouched). 110 tests total (was 101).
+
+### Still gated
+
+Rewrite / Resume / Validate / Retain — landing in steps 6-7. After
+Verify succeeds, the migrate driver removes the dst it just created
+and returns `NotYetMutating`. The operator can `migrate --dry-run`
+to walk the read-only half, but cannot complete a real migration
+until those stages ship.
+
 ## [0.3.7] - 2026-05-26
 
 ### Features
