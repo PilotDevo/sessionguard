@@ -236,6 +236,144 @@ impl Quiescer for SystemdQuiescer {
     }
 }
 
+// ── Copy + Verify (stages 3 and 4) ────────────────────────────────────────
+
+/// Summary of one Copy run.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CopySummary {
+    /// Number of regular files written into the destination.
+    pub files_copied: usize,
+    /// Total bytes written into the destination.
+    pub bytes_copied: u64,
+    /// Number of directories created under the destination.
+    pub dirs_created: usize,
+}
+
+/// Recursively copy every regular file under `src` into `dst`,
+/// creating intermediate directories as needed.
+///
+/// Design constraints from `docs/design/migrate.md`:
+/// - Symlinks are **skipped** (cycles + off-tree pointers). Use rsync
+///   externally if you need symlink semantics; the migrate target tools
+///   (Codex, OpenCode) store regular files only.
+/// - File permissions are mirrored (Unix mode bits) so executables and
+///   read-only files preserve their character.
+/// - **No-overwrite**: `dst` must not exist before the call. The
+///   migrate driver enforces this in preflight; this function asserts
+///   it again as a defensive belt-and-suspenders.
+/// - On any error, `dst` may be left partially populated. The caller
+///   is responsible for cleanup (see `cleanup_partial_copy`).
+///
+/// Equivalent to `cp -r src dst` for the practical AI-tool-data case,
+/// minus symlinks. Not a full `rsync` — no delta detection, no
+/// resumability. For the v0.4 target (one-shot migration of stable
+/// data), this is sufficient.
+pub fn copy_tree(src: &Path, dst: &Path) -> Result<CopySummary, MigrateError> {
+    if dst.exists() {
+        return Err(MigrateError::DestinationExists(dst.to_path_buf()));
+    }
+    if !src.is_dir() {
+        return Err(MigrateError::StageFailed(
+            Stage::Copy,
+            format!("source `{}` is not a directory", src.display()),
+        ));
+    }
+    let mut summary = CopySummary {
+        files_copied: 0,
+        bytes_copied: 0,
+        dirs_created: 0,
+    };
+
+    std::fs::create_dir_all(dst)?;
+    summary.dirs_created += 1;
+
+    copy_tree_inner(src, dst, &mut summary)?;
+    Ok(summary)
+}
+
+fn copy_tree_inner(src: &Path, dst: &Path, summary: &mut CopySummary) -> Result<(), MigrateError> {
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        // Use `symlink_metadata` so we don't follow symlinks at the
+        // type check; that lets us detect (and skip) them explicitly.
+        let meta = entry.metadata()?;
+        let src_path = entry.path();
+        let dst_path = dst.join(entry.file_name());
+
+        if meta.file_type().is_symlink() {
+            // Skip silently. Design doc says symlinks aren't followed;
+            // tools whose data dirs contain symlinks need a future
+            // `follow_symlinks` opt-in.
+            continue;
+        }
+        if meta.is_dir() {
+            std::fs::create_dir_all(&dst_path)?;
+            summary.dirs_created += 1;
+            copy_tree_inner(&src_path, &dst_path, summary)?;
+        } else if meta.is_file() {
+            let bytes = std::fs::copy(&src_path, &dst_path)?;
+            summary.bytes_copied = summary.bytes_copied.saturating_add(bytes);
+            summary.files_copied = summary.files_copied.saturating_add(1);
+
+            // Mirror Unix mode bits so executables stay executable
+            // and read-only files stay read-only. On non-Unix this
+            // is a no-op (Windows perms are richer and need their
+            // own pass when we add Windows support).
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                let mode = meta.permissions().mode();
+                if let Err(e) =
+                    std::fs::set_permissions(&dst_path, std::fs::Permissions::from_mode(mode))
+                {
+                    return Err(MigrateError::StageFailed(
+                        Stage::Copy,
+                        format!("set_permissions failed on {}: {e}", dst_path.display()),
+                    ));
+                }
+            }
+        }
+        // Other file types (block/char devs, FIFOs, sockets) are
+        // unexpected in AI-tool data dirs — skip silently.
+    }
+    Ok(())
+}
+
+/// Remove a partially-populated `dst` after a failed copy. Best-effort:
+/// errors are swallowed (we're already in a failure path).
+pub fn cleanup_partial_copy(dst: &Path) {
+    if dst.exists() {
+        let _ = std::fs::remove_dir_all(dst);
+    }
+}
+
+/// Output of a Verify run — symmetric counts/sizes if the migration is
+/// good; mismatched fields if something went wrong mid-copy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VerifyOutcome {
+    pub src_files: usize,
+    pub dst_files: usize,
+    pub src_bytes: u64,
+    pub dst_bytes: u64,
+    /// `true` iff src and dst agree on file count *and* total bytes.
+    pub matches: bool,
+}
+
+/// Walk both `src` and `dst`, comparing file count and total bytes.
+/// Returns `Ok(VerifyOutcome)` regardless of whether they match; the
+/// caller decides whether to fail the migration on `matches == false`.
+pub fn verify_copy(src: &Path, dst: &Path) -> Result<VerifyOutcome, MigrateError> {
+    let (src_files, src_bytes) = walk_size(src);
+    let (dst_files, dst_bytes) = walk_size(dst);
+    Ok(VerifyOutcome {
+        src_files,
+        dst_files,
+        src_bytes,
+        dst_bytes,
+        matches: src_files == dst_files && src_bytes == dst_bytes,
+    })
+}
+
 fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
     let output = std::process::Command::new("systemctl")
         .args(args)
@@ -352,9 +490,11 @@ pub fn migrate_with(
     };
     record(Stage::Quiesce, &detail, &mut events);
 
-    // Stage 3: copy — under dry-run, just enumerate. Under real run we
-    // gate on NotYetMutating until rewrite/resume/validate land, so
-    // the half-built path can't produce a half-migrated FS.
+    // Stage 3: copy — dry-run enumerates the work; real run actually
+    // copies via `copy_tree`. The `NotYetMutating` gate now sits BEFORE
+    // Stage::Rewrite rather than here; Copy + Verify are read-only on
+    // source and write fully-cleanupable bytes to dst, so it's safe
+    // to land them ahead of the rewrite/resume/validate trio.
     if dry_run {
         let summary = describe_copy(src, dst)?;
         record(
@@ -363,18 +503,85 @@ pub fn migrate_with(
             &mut events,
         );
     } else {
-        return Err(MigrateError::NotYetMutating);
+        match copy_tree(src, dst) {
+            Ok(s) => {
+                record(
+                    Stage::Copy,
+                    &format!(
+                        "copied {} files ({} bytes) into {} directories at {}",
+                        s.files_copied,
+                        s.bytes_copied,
+                        s.dirs_created,
+                        dst.display()
+                    ),
+                    &mut events,
+                );
+            }
+            Err(e) => {
+                // Belt-and-suspenders: clean up the partial dst before
+                // surfacing the error, so the operator isn't left with
+                // an orphaned half-copy.
+                cleanup_partial_copy(dst);
+                record(
+                    Stage::Copy,
+                    &format!("copy failed and partial dst removed: {e}"),
+                    &mut events,
+                );
+                return Err(e);
+            }
+        }
     }
 
     // Stage 4: verify — under dry-run, sanity-checks the source
     // independently so we'd catch e.g. "src has zero readable files".
-    // Real run will compare {file count, total size} src vs. dst.
-    let (src_files, src_bytes) = walk_size(src);
-    record(
-        Stage::Verify,
-        &format!("dry-run: source has {src_files} files, {src_bytes} bytes total"),
-        &mut events,
-    );
+    // Under real run, walks both sides and compares {file count,
+    // total bytes}. Mismatch is treated as a hard failure: cleanup
+    // dst and abort.
+    if dry_run {
+        let (src_files, src_bytes) = walk_size(src);
+        record(
+            Stage::Verify,
+            &format!("dry-run: source has {src_files} files, {src_bytes} bytes total"),
+            &mut events,
+        );
+    } else {
+        match verify_copy(src, dst) {
+            Ok(v) if v.matches => {
+                record(
+                    Stage::Verify,
+                    &format!(
+                        "verify ok: {} files, {} bytes in both src and dst",
+                        v.src_files, v.src_bytes
+                    ),
+                    &mut events,
+                );
+            }
+            Ok(v) => {
+                cleanup_partial_copy(dst);
+                let detail = format!(
+                    "verify mismatch — src: {} files / {} bytes, \
+                     dst: {} files / {} bytes (partial dst removed)",
+                    v.src_files, v.src_bytes, v.dst_files, v.dst_bytes
+                );
+                record(Stage::Verify, &detail, &mut events);
+                return Err(MigrateError::StageFailed(Stage::Verify, detail));
+            }
+            Err(e) => {
+                cleanup_partial_copy(dst);
+                return Err(e);
+            }
+        }
+    }
+
+    // Stage 5+ gate — Rewrite / Resume / Validate / Retain are not
+    // wired yet. Under dry-run we return clean now; under real run
+    // we refuse to proceed (after cleaning up the dst we just copied)
+    // so the operator isn't left with orphan data the tool can't yet
+    // be told to read from.
+    if !dry_run {
+        cleanup_partial_copy(dst);
+        return Err(MigrateError::NotYetMutating);
+    }
 
     // Stages 5–8 are not wired yet. Dry-run returns success at this
     // point so the operator can validate the read-only half of the
@@ -806,5 +1013,167 @@ mod tests {
         let n = ResumeAction::None;
         let j = serde_json::to_value(&n).unwrap();
         assert_eq!(j["kind"], "none");
+    }
+
+    // ── New in step 5: copy_tree + verify_copy
+
+    #[test]
+    fn copy_tree_copies_files_and_subdirs() {
+        let src = TempDir::new().unwrap();
+        populate(
+            src.path(),
+            &[
+                ("top.txt", b"hello"),
+                ("sub/nested.bin", &[0u8; 1024]),
+                ("sub/deep/leaf.dat", b"leaf"),
+                ("sub/another/x.json", b"{\"k\":\"v\"}"),
+            ],
+        );
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("new-tree");
+
+        let summary = copy_tree(src.path(), &dst).unwrap();
+        assert_eq!(summary.files_copied, 4);
+        assert_eq!(summary.bytes_copied, 5 + 1024 + 4 + 9);
+        assert!(summary.dirs_created >= 1);
+
+        // Spot-check content survived
+        assert_eq!(
+            std::fs::read_to_string(dst.join("top.txt")).unwrap(),
+            "hello"
+        );
+        assert_eq!(
+            std::fs::read_to_string(dst.join("sub/another/x.json")).unwrap(),
+            "{\"k\":\"v\"}"
+        );
+    }
+
+    #[test]
+    fn copy_tree_refuses_existing_destination() {
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("a", b"b")]);
+        let dst = TempDir::new().unwrap(); // already exists
+        let err = copy_tree(src.path(), dst.path()).unwrap_err();
+        assert!(matches!(err, MigrateError::DestinationExists(_)));
+    }
+
+    #[test]
+    fn copy_tree_skips_symlinks() {
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("real.txt", b"data")]);
+        // Add a symlink alongside the regular file
+        #[cfg(unix)]
+        {
+            std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("link.txt"))
+                .unwrap();
+        }
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        let summary = copy_tree(src.path(), &dst).unwrap();
+        // Symlink should be skipped on Unix; on other platforms the
+        // create above is a no-op so the count is still 1.
+        assert_eq!(summary.files_copied, 1, "symlinks must not be followed");
+        assert!(dst.join("real.txt").exists());
+        assert!(!dst.join("link.txt").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_mirrors_executable_bit() {
+        use std::os::unix::fs::PermissionsExt;
+        let src = TempDir::new().unwrap();
+        let bin = src.path().join("exec.sh");
+        std::fs::write(&bin, b"#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        copy_tree(src.path(), &dst).unwrap();
+
+        let mode = std::fs::metadata(dst.join("exec.sh"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755, "expected 0755, got {:o}", mode & 0o777);
+    }
+
+    #[test]
+    fn verify_copy_returns_matches_for_clean_copy() {
+        let src = TempDir::new().unwrap();
+        populate(
+            src.path(),
+            &[
+                ("a.txt", b"x"),
+                ("sub/b.txt", b"yz"),
+                ("c.bin", &[0u8; 128]),
+            ],
+        );
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        copy_tree(src.path(), &dst).unwrap();
+
+        let outcome = verify_copy(src.path(), &dst).unwrap();
+        assert!(outcome.matches, "verify should match: {outcome:?}");
+        assert_eq!(outcome.src_files, outcome.dst_files);
+        assert_eq!(outcome.src_bytes, outcome.dst_bytes);
+    }
+
+    #[test]
+    fn verify_copy_detects_mismatch_when_file_removed() {
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("keep", b"k"), ("drop", b"d")]);
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        copy_tree(src.path(), &dst).unwrap();
+        // Simulate corruption: remove a file from the dst.
+        std::fs::remove_file(dst.join("drop")).unwrap();
+
+        let outcome = verify_copy(src.path(), &dst).unwrap();
+        assert!(!outcome.matches, "verify must catch missing dst file");
+        assert_eq!(outcome.src_files, 2);
+        assert_eq!(outcome.dst_files, 1);
+    }
+
+    #[test]
+    fn cleanup_partial_copy_removes_dst() {
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("partial");
+        std::fs::create_dir_all(dst.join("nested")).unwrap();
+        std::fs::write(dst.join("nested/file"), b"x").unwrap();
+        assert!(dst.exists());
+        cleanup_partial_copy(&dst);
+        assert!(!dst.exists());
+    }
+
+    #[test]
+    fn cleanup_partial_copy_is_noop_when_dst_absent() {
+        // Must not panic when called on a path that was never created.
+        let tmp = TempDir::new().unwrap();
+        cleanup_partial_copy(&tmp.path().join("never-existed"));
+    }
+
+    #[test]
+    fn migrate_real_run_now_actually_copies_then_rolls_back() {
+        // With the NotYetMutating gate moved to AFTER Verify, a real
+        // (non-dry-run) call now performs Copy + Verify successfully,
+        // hits the gate at Stage::Rewrite, and rolls back by removing
+        // the dst it just populated. The migrate() observer sees
+        // NotYetMutating; the FS is left in its original state.
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let src = TempDir::new().unwrap();
+        populate(
+            src.path(),
+            &[("a.txt", b"first"), ("nested/b.bin", &[0u8; 32])],
+        );
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("not-yet-existing");
+
+        let err = migrate_with(&t, src.path(), &dst, false, &FakeQuiescer::default()).unwrap_err();
+        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
+        // Rollback removed the dst the Copy stage created:
+        assert!(!dst.exists(), "real-run rollback must remove orphan dst");
+        // Source still intact:
+        assert!(src.path().join("a.txt").exists());
+        assert!(src.path().join("nested/b.bin").exists());
     }
 }
