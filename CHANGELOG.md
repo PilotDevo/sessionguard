@@ -2,6 +2,37 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.4] - 2026-05-26
+
+### Features
+
+- **`sessionguard doctor --clean`** — unregister tracked projects whose
+  directory no longer exists on disk. Pure report mode remains the
+  default; cleanup is opt-in. Add `--dry-run` to preview without
+  writing. Cascades through SQLite's `ON DELETE CASCADE` to drop any
+  associated `session_artifacts` rows in one shot.
+  - Operator's own Mac registry had ~33 stale entries from sandbox
+    test fixture leftovers accumulated over months. One command
+    cleared the lot.
+
+### Tests
+
+- Two new sandbox tests cover the new flag:
+  - `sandbox_doctor_clean_dry_run_does_not_mutate` — verifies the
+    registry survives a `--clean --dry-run` invocation
+  - `sandbox_doctor_clean_removes_stale_entries` — registers two
+    projects, deletes one, runs `--clean`, asserts the stale entry is
+    gone and the live one survives
+
+### Docs
+
+- New `docs/ops/homebrew-tap-token.md` walking through the one-time
+  `HOMEBREW_TAP_TOKEN` fine-grained PAT setup that the release
+  workflow's `homebrew` job needs. The job has been failing loud (by
+  design) on every release since v0.3.2 until the secret is created.
+  Cross-referenced from the v0.3.2 changelog entry and the README
+  roadmap "Shipped" section.
+
 ## [0.3.3] - 2026-04-18
 
 ### Features
