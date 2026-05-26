@@ -374,6 +374,147 @@ pub fn verify_copy(src: &Path, dst: &Path) -> Result<VerifyOutcome, MigrateError
     })
 }
 
+// ── Rewrite (stage 5) ────────────────────────────────────────────────────
+
+/// What happened during Rewrite, so subsequent stages (Resume,
+/// Retain, undo) know how to reverse it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RewriteOutcome {
+    /// The original source path was renamed aside and a symlink was
+    /// installed in its place pointing at `dst`. Tool keeps reading
+    /// the canonical path; data lives at the new location.
+    SymlinkInstalled {
+        /// The original `src` (now a symlink).
+        canonical: PathBuf,
+        /// Where `canonical` now points to (`dst`).
+        target: PathBuf,
+        /// The renamed-aside original directory. Empty when the source
+        /// hasn't been moved yet (e.g. Retain stage handles renames).
+        moved_aside: Option<PathBuf>,
+    },
+    /// Dry-run; nothing happened. Carried so the result type can still
+    /// claim a final stage of Rewrite without lying.
+    DryRunSkipped,
+    /// Discovery is `Env` or `Config`; not yet implemented this step.
+    Deferred {
+        /// Free-form reason. Surfaced verbatim in the event log.
+        reason: String,
+    },
+}
+
+/// Install a symlink at `canonical` pointing to `target`, after first
+/// renaming `canonical` aside to `canonical.migrated-<unix_seconds>`.
+///
+/// Used by the Symlink-discovery rewrite branch. The "move aside, then
+/// symlink in" sequence preserves the design doc's "never auto-delete"
+/// guarantee: the original directory is still on disk at the
+/// `.migrated-…` path until the operator runs `sessionguard
+/// migrate-cleanup` (a later command).
+fn rewrite_via_symlink(canonical: &Path, target: &Path) -> Result<RewriteOutcome, MigrateError> {
+    // We expect `canonical` to be a real directory (the original src)
+    // and `target` to be the already-copied destination.
+    if !canonical.exists() {
+        return Err(MigrateError::StageFailed(
+            Stage::Rewrite,
+            format!(
+                "canonical path `{}` doesn't exist; nothing to rewrite",
+                canonical.display()
+            ),
+        ));
+    }
+    if !target.exists() {
+        return Err(MigrateError::StageFailed(
+            Stage::Rewrite,
+            format!(
+                "target `{}` doesn't exist; copy stage must have run first",
+                target.display()
+            ),
+        ));
+    }
+
+    // Move the original aside with a timestamped sidecar name. This is
+    // the design-doc-prescribed retention pattern.
+    let moved_aside = canonical.with_file_name(format!(
+        "{}.migrated-{}",
+        canonical
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("data"),
+        now_unix()
+    ));
+    if moved_aside.exists() {
+        return Err(MigrateError::StageFailed(
+            Stage::Rewrite,
+            format!(
+                "preserved name `{}` already exists; refusing to overwrite. \
+                 Move it aside manually and retry.",
+                moved_aside.display()
+            ),
+        ));
+    }
+    std::fs::rename(canonical, &moved_aside)?;
+
+    // Install symlink. If this fails, undo the rename to leave the
+    // operator with their original setup intact.
+    #[cfg(unix)]
+    let symlink_result = std::os::unix::fs::symlink(target, canonical);
+    #[cfg(not(unix))]
+    let symlink_result: std::io::Result<()> = Err(std::io::Error::other(
+        "symlinks not supported on this platform",
+    ));
+
+    match symlink_result {
+        Ok(()) => Ok(RewriteOutcome::SymlinkInstalled {
+            canonical: canonical.to_path_buf(),
+            target: target.to_path_buf(),
+            moved_aside: Some(moved_aside),
+        }),
+        Err(e) => {
+            // Symlink failed — restore the original. Best-effort.
+            let _ = std::fs::rename(&moved_aside, canonical);
+            Err(MigrateError::StageFailed(
+                Stage::Rewrite,
+                format!("symlink install failed (original restored): {e}"),
+            ))
+        }
+    }
+}
+
+/// Undo a [`RewriteOutcome`]. Used when a later stage fails and we
+/// need to roll back the symlink dance.
+fn undo_rewrite(outcome: &RewriteOutcome) -> Result<(), MigrateError> {
+    match outcome {
+        RewriteOutcome::SymlinkInstalled {
+            canonical,
+            moved_aside: Some(aside),
+            ..
+        } => {
+            // Remove the symlink at `canonical`, then rename the
+            // preserved directory back.
+            if canonical.exists() || canonical.is_symlink() {
+                std::fs::remove_file(canonical).or_else(|e| {
+                    // `remove_file` doesn't always work on dirs; in our
+                    // case `canonical` should always be a symlink, but
+                    // be defensive.
+                    if canonical.is_dir() {
+                        std::fs::remove_dir_all(canonical)
+                    } else {
+                        Err(e)
+                    }
+                })?;
+            }
+            std::fs::rename(aside, canonical)?;
+            Ok(())
+        }
+        RewriteOutcome::SymlinkInstalled {
+            moved_aside: None, ..
+        }
+        | RewriteOutcome::DryRunSkipped
+        | RewriteOutcome::Deferred { .. } => Ok(()),
+    }
+}
+
 fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
     let output = std::process::Command::new("systemctl")
         .args(args)
@@ -573,25 +714,104 @@ pub fn migrate_with(
         }
     }
 
-    // Stage 5+ gate — Rewrite / Resume / Validate / Retain are not
-    // wired yet. Under dry-run we return clean now; under real run
-    // we refuse to proceed (after cleaning up the dst we just copied)
-    // so the operator isn't left with orphan data the tool can't yet
-    // be told to read from.
+    // Stage 5: rewrite — install the symlink / env override / config
+    // edit per the layout's discovery branch. This is the first
+    // *user-visible* change: after this step, the tool will start
+    // reading from `dst`. Resume / Validate / Retain still come next,
+    // and the `NotYetMutating` gate now sits BEFORE Stage::Resume —
+    // a successful Rewrite isn't enough on its own to call the
+    // migration done, but it's safe to land because we can undo it.
+    let rewrite_outcome = if dry_run {
+        RewriteOutcome::DryRunSkipped
+    } else {
+        match layout.discovery {
+            HomeDirDiscovery::Symlink => match rewrite_via_symlink(src, dst) {
+                Ok(o) => o,
+                Err(e) => {
+                    cleanup_partial_copy(dst);
+                    return Err(e);
+                }
+            },
+            HomeDirDiscovery::Env | HomeDirDiscovery::Config => {
+                // Env discovery (systemd drop-in or shell rc edit) and
+                // Config discovery (write through reconciler adapters)
+                // both land in step 6b. Until then, dry-run-only.
+                cleanup_partial_copy(dst);
+                return Err(MigrateError::StageFailed(
+                    Stage::Rewrite,
+                    format!(
+                        "discovery = {:?} is not yet implemented in this release; \
+                         only `Symlink` discovery has a working Rewrite. Use \
+                         --dry-run to walk the read-only half of the state machine.",
+                        layout.discovery
+                    ),
+                ));
+            }
+            HomeDirDiscovery::Compile => {
+                // Already rejected in preflight, but be defensive.
+                cleanup_partial_copy(dst);
+                return Err(MigrateError::CompileBaked);
+            }
+        }
+    };
+    let rewrite_detail = match &rewrite_outcome {
+        RewriteOutcome::SymlinkInstalled {
+            canonical,
+            target,
+            moved_aside: Some(aside),
+        } => format!(
+            "installed symlink {} -> {}; preserved original at {}",
+            canonical.display(),
+            target.display(),
+            aside.display()
+        ),
+        RewriteOutcome::SymlinkInstalled {
+            moved_aside: None, ..
+        } => "symlink installed (no preserved original recorded)".into(),
+        RewriteOutcome::DryRunSkipped => {
+            format!(
+                "dry-run: would install symlink for {:?} discovery",
+                layout.discovery
+            )
+        }
+        RewriteOutcome::Deferred { reason } => format!("rewrite deferred: {reason}"),
+    };
+    record(Stage::Rewrite, &rewrite_detail, &mut events);
+
+    // Stages 6-8 (Resume / Validate / Retain) are still gated. Once
+    // Rewrite has run on a real migration, we need to undo it before
+    // returning the gate error — otherwise the operator is left with
+    // a symlink pointing at data the tool isn't yet wired up against.
     if !dry_run {
+        if let Err(undo_err) = undo_rewrite(&rewrite_outcome) {
+            // Best-effort undo: if it fails we record the failure in
+            // the event log but still return NotYetMutating; the
+            // operator will see both events and know what to fix.
+            record(
+                Stage::Rewrite,
+                &format!("rollback of Rewrite FAILED: {undo_err}"),
+                &mut events,
+            );
+        } else {
+            record(
+                Stage::Rewrite,
+                "rollback ok (Rewrite undone before gate)",
+                &mut events,
+            );
+        }
         cleanup_partial_copy(dst);
         return Err(MigrateError::NotYetMutating);
     }
 
-    // Stages 5–8 are not wired yet. Dry-run returns success at this
-    // point so the operator can validate the read-only half of the
-    // state machine against real data.
+    // Stages 6–8 are not wired yet. Dry-run returns success at this
+    // point with Stage::Rewrite as the terminal so the operator can
+    // see the rewrite intent recorded in the event log.
     let result = MigrationResult {
         tool_name: tool.name.clone(),
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         dry_run,
-        final_stage: Stage::Verify,
+        final_stage: Stage::Rewrite,
         success: true,
         events,
         error: None,
@@ -833,7 +1053,9 @@ mod tests {
 
         let result = migrate(&t, src.path(), &dst, true).unwrap();
         assert!(result.success);
-        assert_eq!(result.final_stage, Stage::Verify);
+        // With Rewrite landed (step 6), the dry-run terminal stage
+        // advances from Verify → Rewrite.
+        assert_eq!(result.final_stage, Stage::Rewrite);
         assert!(result.dry_run);
 
         let stages: Vec<Stage> = result.events.iter().map(|e| e.stage).collect();
@@ -855,6 +1077,7 @@ mod tests {
                 Stage::Quiesce,
                 Stage::Copy,
                 Stage::Verify,
+                Stage::Rewrite,
             ]
         );
     }
@@ -1172,8 +1395,148 @@ mod tests {
         assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
         // Rollback removed the dst the Copy stage created:
         assert!(!dst.exists(), "real-run rollback must remove orphan dst");
-        // Source still intact:
+        // Source still intact (Rewrite would have moved it aside;
+        // rollback then renames it back):
         assert!(src.path().join("a.txt").exists());
         assert!(src.path().join("nested/b.bin").exists());
+        // The `.migrated-*` sidecar that Rewrite created should have
+        // been undone by the rollback path:
+        let leftovers: Vec<_> = std::fs::read_dir(src.path().parent().unwrap())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".migrated-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "rollback must remove the .migrated-* sidecar; found: {:?}",
+            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    // ── New in step 6: Rewrite stage (symlink branch)
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_via_symlink_swaps_dir_for_symlink_and_preserves_original() {
+        let parent = TempDir::new().unwrap();
+        let canonical = parent.path().join("data");
+        let target = parent.path().join("new-home");
+        // Set up: canonical is a real dir with one file; target is
+        // a separate dir (simulating Copy already ran).
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("a"), b"original").unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a"), b"original").unwrap();
+
+        let outcome = rewrite_via_symlink(&canonical, &target).unwrap();
+        match outcome {
+            RewriteOutcome::SymlinkInstalled {
+                canonical: c,
+                target: t,
+                moved_aside: Some(aside),
+            } => {
+                assert_eq!(c, canonical);
+                assert_eq!(t, target);
+                assert!(aside.exists(), "preserved aside should still exist");
+                assert!(aside.is_dir(), "preserved aside should be a directory");
+                // canonical is now a symlink
+                let meta = std::fs::symlink_metadata(&canonical).unwrap();
+                assert!(meta.file_type().is_symlink());
+                // Following the symlink reads target/a:
+                let read = std::fs::read_to_string(canonical.join("a")).unwrap();
+                assert_eq!(read, "original");
+            }
+            other => panic!("expected SymlinkInstalled, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rewrite_via_symlink_refuses_when_preserved_name_already_taken() {
+        // If someone already migrated and left a .migrated-<ts>
+        // sidecar, we refuse to clobber it on a second attempt.
+        let parent = TempDir::new().unwrap();
+        let canonical = parent.path().join("data");
+        let target = parent.path().join("new-home");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+
+        // Pre-create a collision at the timestamped path. The test
+        // can't easily predict the exact timestamp `now_unix()`
+        // returns, so we manually create a .migrated-<exact-now>
+        // sidecar by calling the same time fn and seeding the
+        // collision before rewrite runs. Edge case but worth covering.
+        let collision = canonical.with_file_name(format!("data.migrated-{}", now_unix()));
+        std::fs::create_dir_all(&collision).unwrap();
+
+        let err = rewrite_via_symlink(&canonical, &target).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Rewrite, msg) => {
+                assert!(msg.contains("preserved name") && msg.contains("already exists"));
+            }
+            other => panic!("expected StageFailed(Rewrite, ...), got {other:?}"),
+        }
+        // Original canonical must be untouched:
+        assert!(
+            canonical.is_dir(),
+            "canonical must not be modified on refusal"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_rewrite_restores_original_directory() {
+        let parent = TempDir::new().unwrap();
+        let canonical = parent.path().join("data");
+        let target = parent.path().join("new-home");
+        std::fs::create_dir_all(&canonical).unwrap();
+        std::fs::write(canonical.join("a"), b"v1").unwrap();
+        std::fs::create_dir_all(&target).unwrap();
+        std::fs::write(target.join("a"), b"v1").unwrap();
+
+        let outcome = rewrite_via_symlink(&canonical, &target).unwrap();
+        // Sanity: canonical is a symlink now
+        assert!(std::fs::symlink_metadata(&canonical)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        undo_rewrite(&outcome).unwrap();
+
+        // canonical is a real directory again, with its original file
+        let meta = std::fs::symlink_metadata(&canonical).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(canonical.join("a")).unwrap(), "v1");
+    }
+
+    #[test]
+    fn migrate_refuses_env_discovery_until_step_6b() {
+        // Env-var rewrite branch isn't wired yet (systemd drop-in /
+        // shell rc edits land in step 6b). A real-run attempt against
+        // a tool with discovery = Env should refuse with a clear
+        // message and roll back the copy.
+        let t = tool(HomeDirDiscovery::Env, Some("TEST_HOME"), None);
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("a.txt", b"hello")]);
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("new");
+
+        let err = migrate_with(&t, src.path(), &dst, false, &FakeQuiescer::default()).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Rewrite, msg) => {
+                assert!(
+                    msg.contains("not yet implemented"),
+                    "expected discovery=Env refusal, got: {msg}"
+                );
+            }
+            other => panic!("expected StageFailed(Rewrite, ...), got {other:?}"),
+        }
+        // Rollback removed the copied dst:
+        assert!(!dst.exists(), "rollback must remove dst on Env refusal");
     }
 }
