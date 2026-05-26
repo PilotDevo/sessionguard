@@ -138,6 +138,15 @@ pub enum Command {
         action: Option<ToolsAction>,
     },
 
+    /// Enumerate every tool with a declared home-dir layout: where its
+    /// data lives, how big it is, when it was last touched. Read-only;
+    /// the lead-in to `sessionguard migrate`.
+    Inventory {
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+
     /// Undo previous reconciliation actions from the event log.
     Undo {
         /// Undo the last N actions. Default: 1.

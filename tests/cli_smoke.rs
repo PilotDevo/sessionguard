@@ -143,6 +143,48 @@ fn cli_status_format_json_has_expected_keys() {
 }
 
 #[test]
+fn cli_inventory_text_lists_codex_and_opencode() {
+    // Both codex and opencode declare home_dir_layout as of v0.4 prep
+    // — they should appear in inventory output. Other built-ins
+    // (claude_code, cursor, etc.) don't yet and shouldn't.
+    Command::cargo_bin("sessionguard")
+        .unwrap()
+        .arg("inventory")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("opencode"));
+}
+
+#[test]
+fn cli_inventory_format_json_is_valid_array() {
+    let out = Command::cargo_bin("sessionguard")
+        .unwrap()
+        .args(["inventory", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value =
+        serde_json::from_slice(&out).expect("inventory --format json should be valid JSON");
+    let arr = parsed
+        .as_array()
+        .expect("inventory JSON should be an array");
+    // codex + opencode at minimum
+    assert!(
+        arr.len() >= 2,
+        "expected >=2 inventory entries, got {}",
+        arr.len()
+    );
+    for entry in arr {
+        assert!(entry.get("tool_name").is_some());
+        assert!(entry.get("path").is_some());
+        assert!(entry.get("size_bytes").is_some());
+    }
+}
+
+#[test]
 fn cli_undo_no_events_prints_message() {
     // Fresh in-process data dir so we know the log is empty
     let tmp = tempfile::TempDir::new().unwrap();

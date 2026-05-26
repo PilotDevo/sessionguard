@@ -14,6 +14,7 @@ pub mod detector;
 pub mod error;
 pub mod event_log;
 pub mod health;
+pub mod inventory;
 pub mod reconciler;
 pub mod registry;
 pub mod tools;

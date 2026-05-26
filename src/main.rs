@@ -459,6 +459,58 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Inventory { format } => {
+            use sessionguard::inventory::inventory_tools_impl;
+
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let mut tools: Vec<_> = tool_registry.all().collect();
+            tools.sort_by(|a, b| a.name.cmp(&b.name));
+            let entries = inventory_tools_impl(tools.iter().copied());
+
+            match format {
+                sessionguard::cli::Format::Json => {
+                    println!("{}", serde_json::to_string_pretty(&entries)?);
+                }
+                sessionguard::cli::Format::Text => {
+                    if entries.is_empty() {
+                        println!(
+                            "no tools declare a home_dir_layout — nothing to migrate.\n\
+                             (only tools with a [tool.home_dir_layout] block in their TOML\n\
+                             can be migrated by `sessionguard migrate`; see\n\
+                             docs/design/migrate.md.)"
+                        );
+                    } else {
+                        println!(
+                            "{:<14} {:<48} {:>12} {:>10} {:>14}",
+                            "TOOL", "LOCATION", "SIZE", "FILES", "LAST MODIFIED"
+                        );
+                        for e in &entries {
+                            let size = fmt_size(e.size_bytes);
+                            let when = e.last_modified.map(fmt_ago).unwrap_or_else(|| "-".into());
+                            let loc = if e.exists {
+                                e.path.display().to_string()
+                            } else {
+                                format!("(absent) {}", e.path.display())
+                            };
+                            let trunc = if e.truncated { "+" } else { "" };
+                            println!(
+                                "{:<14} {:<48} {:>12} {:>9}{} {:>14}",
+                                e.tool_name, loc, size, e.file_count, trunc, when
+                            );
+                            for note in &e.notes {
+                                println!("  ! {note}");
+                            }
+                        }
+                        if entries.iter().any(|e| e.truncated) {
+                            println!(
+                                "\n(+) walk truncated at the file cap; actual size/count is a floor"
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
         Command::Undo { last, id, dry_run } => {
             let event_log = EventLog::open_default()?;
 
@@ -533,4 +585,70 @@ async fn main() -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Render a byte count in a compact human-friendly form for the
+/// `inventory` text table. Stops at TB; everything beyond would be
+/// surprising on a single tool's data dir.
+fn fmt_size(bytes: u64) -> String {
+    const UNITS: &[(&str, u64)] = &[
+        ("TB", 1u64 << 40),
+        ("GB", 1u64 << 30),
+        ("MB", 1u64 << 20),
+        ("KB", 1u64 << 10),
+    ];
+    for (suffix, threshold) in UNITS {
+        if bytes >= *threshold {
+            let value = bytes as f64 / *threshold as f64;
+            return format!("{value:.1} {suffix}");
+        }
+    }
+    format!("{bytes} B")
+}
+
+/// Render a unix-epoch-seconds timestamp as "X ago". Approximate; the
+/// inventory's purpose is "is this stale or recent?", not precision.
+fn fmt_ago(unix_seconds: u64) -> String {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(unix_seconds);
+    let age = now.saturating_sub(unix_seconds);
+    if age < 60 {
+        format!("{age}s ago")
+    } else if age < 3600 {
+        format!("{}m ago", age / 60)
+    } else if age < 86_400 {
+        format!("{}h ago", age / 3600)
+    } else {
+        format!("{}d ago", age / 86_400)
+    }
+}
+
+#[cfg(test)]
+mod main_tests {
+    use super::*;
+
+    #[test]
+    fn fmt_size_picks_largest_appropriate_unit() {
+        assert_eq!(fmt_size(0), "0 B");
+        assert_eq!(fmt_size(1023), "1023 B");
+        assert_eq!(fmt_size(1024), "1.0 KB");
+        assert_eq!(fmt_size(1024 * 1024), "1.0 MB");
+        assert_eq!(fmt_size(1024 * 1024 * 1024), "1.0 GB");
+        // 20 GB the user's OpenCode store should render reasonably.
+        assert_eq!(fmt_size(20_u64 * (1u64 << 30)), "20.0 GB");
+    }
+
+    #[test]
+    fn fmt_ago_buckets_correctly() {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        assert!(fmt_ago(now.saturating_sub(30)).contains("s ago"));
+        assert!(fmt_ago(now.saturating_sub(300)).contains("m ago"));
+        assert!(fmt_ago(now.saturating_sub(7200)).contains("h ago"));
+        assert!(fmt_ago(now.saturating_sub(2 * 86_400)).contains("d ago"));
+    }
 }
