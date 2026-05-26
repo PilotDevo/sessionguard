@@ -2,6 +2,44 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.7] - 2026-05-26
+
+### Features
+
+- **Quiesce stage wired to real systemd** — v0.4 implementation
+  step 4 (see `docs/design/migrate.md`). Migration now actually
+  stops the service holding the data before the copy stage; future
+  Resume stage will start it back up post-rewrite.
+
+### Internal
+
+- New `Quiescer` trait abstracts "stop / start the thing holding
+  the data" so unit tests can verify the dispatch logic without
+  spawning real `systemctl` processes.
+- `SystemdQuiescer` is the production implementation: shells out
+  to `systemctl --user stop <unit>` (preferred, no sudo needed)
+  or `systemctl stop <unit>` based on the layout's quiesce hook.
+- `QuiesceOutcome` enum (`UnitStopped { scope, unit }` /
+  `NoUnitWarning` / `DryRunSkipped`) records what actually
+  happened in the per-stage event.
+- `ResumeAction` enum (`StartUnit { scope, unit }` / `None`)
+  records the inverse of Quiesce. Carried in `MigrationResult`
+  so the upcoming Resume stage (and `sessionguard undo` for stale
+  half-migrates) knows what to bring back up.
+- New `migrate_with(tool, src, dst, dry_run, &dyn Quiescer)`
+  entry point for tests; `migrate()` stays the production API.
+- Six new unit tests cover the wiring: dry-run records DryRunSkipped,
+  user-unit picked up correctly, user-vs-system preference order,
+  system-only fallback, no-unit warning path, ResumeAction JSON
+  tagged-repr shape. 101 tests total (was 95).
+
+### Still gated
+
+Real (non-dry-run) migrations remain blocked by `NotYetMutating`
+until Copy + Verify + Rewrite + Resume + Validate land
+(steps 5-7 of the implementation order). Dry-run end-to-end works
+including the Quiesce simulation.
+
 ## [0.3.6] - 2026-05-26
 
 ### Features
