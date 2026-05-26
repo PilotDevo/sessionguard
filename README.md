@@ -260,6 +260,8 @@ See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
 - CI dogfood matrix on Ubuntu + macOS (the regression gate for the
   classes of bugs unit tests historically missed)
 - Homebrew tap + crates.io publishing, both automated on release
+  (see [`docs/ops/homebrew-tap-token.md`](docs/ops/homebrew-tap-token.md)
+  for the one-time `HOMEBREW_TAP_TOKEN` setup that activates the tap update)
 
 **Next — v0.4 "Migrate"**
 The thesis shift: from *"watches for moves"* to *"the tool that moves

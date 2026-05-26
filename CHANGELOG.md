@@ -68,7 +68,9 @@ All notable changes to SessionGuard will be documented in this file.
   SHA256s, renders a fresh `Formula/sessionguard.rb`, and pushes to
   `PilotDevo/homebrew-tap`. Requires repository secret
   `HOMEBREW_TAP_TOKEN` (fine-grained PAT, `Contents: write` on the tap).
-  Fails fast with a clear message if the secret isn't configured.
+  Fails fast with a clear message if the secret isn't configured. See
+  [`docs/ops/homebrew-tap-token.md`](docs/ops/homebrew-tap-token.md) for
+  the one-time PAT creation walkthrough.
 
 ### Changes
 
