@@ -49,6 +49,108 @@ fn default_format() -> String {
     "text".to_string()
 }
 
+/// How a tool discovers its data directory at startup.
+///
+/// Drives the rewrite stage of `sessionguard migrate`: depending on
+/// how the tool finds its data, we either edit a config file, set an
+/// env var (typically via systemd unit override), or just leave a
+/// symlink in place. See `docs/design/migrate.md` §"Per-tool
+/// `home_dir_layout` schema".
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum HomeDirDiscovery {
+    /// Path is set via an environment variable named in `env_var`.
+    Env,
+    /// Path is embedded in one or more files declared in `config_files`.
+    Config,
+    /// Migration replaces `default_path` with a symlink to the new
+    /// location; the tool follows the symlink transparently. Works
+    /// for tools that don't resolve symlinks; verify per-tool.
+    #[default]
+    Symlink,
+    /// Path is baked into the binary; migration impossible without
+    /// reinstalling. SessionGuard refuses to migrate such tools.
+    Compile,
+}
+
+/// Reference to a config file that names the tool's data dir. Reuses
+/// the same JSON/TOML/text adapter dispatch as in-project `path_fields`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeDirConfigFile {
+    /// Path to the config file, with `~` expanded to the user's home.
+    pub file: String,
+    /// Dot-separated field within the file (e.g. `data_dir`, `storage.path`).
+    pub field: String,
+    /// File format: `json`, `toml`, or anything else (text fallback).
+    #[serde(default = "default_format")]
+    pub format: String,
+}
+
+/// systemd integration for quiescing a tool before migrating its data.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HomeDirQuiesce {
+    /// Stop this user-scope unit (`systemctl --user stop <name>`)
+    /// before the copy stage; restart it after rewrite.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd_user_unit: Option<String>,
+    /// System-scope unit equivalent. Mutually exclusive with
+    /// `systemd_user_unit` per-invocation; declaring both means
+    /// "try user first, fall back to system" at migrate time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub systemd_system_unit: Option<String>,
+}
+
+/// Optional post-rewrite validation step run during migrate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct HomeDirValidate {
+    /// Argv to invoke after restart. Migrate considers the migration
+    /// successful only if this exits zero within `timeout_seconds`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub command: Vec<String>,
+    /// Validation timeout. Defaults to 10s if unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout_seconds: Option<u64>,
+}
+
+/// Per-tool layout description used by `sessionguard migrate` (v0.4+).
+///
+/// Tools without this block are *in-project only* — they reconcile on
+/// project moves (existing v0.3 behaviour) but cannot be migrated by
+/// `sessionguard migrate`. The schema is intentionally permissive on
+/// load (any combination of optional fields parses) so future tool
+/// definitions can mix and match without bumping the schema version.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HomeDirLayout {
+    /// Canonical default location the tool reads/writes from.
+    /// May contain `~` for the user's home; expanded at runtime, not
+    /// at parse time, so the same TOML works for any user.
+    pub default_path: String,
+    /// How the tool finds the data dir at startup.
+    #[serde(default)]
+    pub discovery: HomeDirDiscovery,
+    /// For `discovery = "env"`: the environment variable name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env_var: Option<String>,
+    /// For `discovery = "config"`: one or more config files that
+    /// name the data dir.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub config_files: Vec<HomeDirConfigFile>,
+    /// Optional service-quiesce instructions (stop before, start after).
+    #[serde(default, skip_serializing_if = "is_default_quiesce")]
+    pub quiesce: HomeDirQuiesce,
+    /// Optional post-migrate validation.
+    #[serde(default, skip_serializing_if = "is_default_validate")]
+    pub validate: HomeDirValidate,
+}
+
+fn is_default_quiesce(q: &HomeDirQuiesce) -> bool {
+    q.systemd_user_unit.is_none() && q.systemd_system_unit.is_none()
+}
+
+fn is_default_validate(v: &HomeDirValidate) -> bool {
+    v.command.is_empty() && v.timeout_seconds.is_none()
+}
+
 /// A tool definition describing one AI coding tool's session artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -75,6 +177,13 @@ pub struct ToolDefinition {
     /// after a Node/Python runtime upgrade).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub binary: Option<String>,
+    /// How the tool stores user-scoped data and how to rewrite its self-
+    /// references during `sessionguard migrate` (v0.4+). Tools without this
+    /// block are skipped by migrate with a clear "no home-dir layout
+    /// declared" message — they still reconcile on project moves as in
+    /// v0.3.x. See `docs/design/migrate.md` for the full schema rationale.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub home_dir_layout: Option<HomeDirLayout>,
 }
 
 /// TOML wrapper for a file containing a single tool definition.
@@ -212,6 +321,123 @@ mod tests {
     }
 
     #[test]
+    fn home_dir_layout_parses_full_block() {
+        // Exercise every optional sub-field of the v0.4 home_dir_layout
+        // schema and confirm round-tripping doesn't lose information.
+        let toml_str = r#"
+[tool]
+name = "example"
+display_name = "Example"
+version = "1.0"
+on_move = "rewrite_paths"
+binary = "example"
+session_patterns = []
+
+[tool.home_dir_layout]
+default_path = "~/.local/share/example"
+discovery = "config"
+
+[[tool.home_dir_layout.config_files]]
+file = "~/.config/example/config.json"
+field = "data_dir"
+format = "json"
+
+[tool.home_dir_layout.quiesce]
+systemd_user_unit = "example.service"
+
+[tool.home_dir_layout.validate]
+command = ["example", "--health"]
+timeout_seconds = 5
+"#;
+        let parsed: ToolFile = toml::from_str(toml_str).unwrap();
+        let h = parsed
+            .tool
+            .home_dir_layout
+            .as_ref()
+            .expect("layout present");
+        assert_eq!(h.default_path, "~/.local/share/example");
+        assert_eq!(h.discovery, HomeDirDiscovery::Config);
+        assert_eq!(h.config_files.len(), 1);
+        assert_eq!(h.config_files[0].field, "data_dir");
+        assert_eq!(h.config_files[0].format, "json");
+        assert_eq!(
+            h.quiesce.systemd_user_unit.as_deref(),
+            Some("example.service")
+        );
+        assert_eq!(h.validate.command, vec!["example", "--health"]);
+        assert_eq!(h.validate.timeout_seconds, Some(5));
+    }
+
+    #[test]
+    fn home_dir_layout_minimal_block_parses() {
+        // The schema is intentionally permissive — only `default_path`
+        // is required. Everything else falls back to defaults.
+        let toml_str = r#"
+[tool]
+name = "minimal"
+display_name = "Minimal"
+session_patterns = []
+
+[tool.home_dir_layout]
+default_path = "~/.minimal"
+"#;
+        let parsed: ToolFile = toml::from_str(toml_str).unwrap();
+        let h = parsed
+            .tool
+            .home_dir_layout
+            .as_ref()
+            .expect("layout present");
+        assert_eq!(h.default_path, "~/.minimal");
+        assert_eq!(h.discovery, HomeDirDiscovery::Symlink); // default
+        assert!(h.config_files.is_empty());
+        assert!(h.quiesce.systemd_user_unit.is_none());
+        assert!(h.validate.command.is_empty());
+    }
+
+    #[test]
+    fn builtin_codex_declares_env_discovery() {
+        // The Codex builtin should declare CODEX_HOME as its env discovery
+        // mechanism. This test will fail loudly if anyone removes or
+        // mis-spells the field, which would silently break v0.4 migrate
+        // for Codex.
+        let registry = ToolRegistry::new().unwrap();
+        let codex = registry.get("codex").unwrap();
+        let h = codex
+            .home_dir_layout
+            .as_ref()
+            .expect("codex must declare home_dir_layout for v0.4 migrate");
+        assert_eq!(h.default_path, "~/.codex");
+        assert_eq!(h.discovery, HomeDirDiscovery::Env);
+        assert_eq!(h.env_var.as_deref(), Some("CODEX_HOME"));
+    }
+
+    #[test]
+    fn builtin_opencode_declares_symlink_discovery() {
+        let registry = ToolRegistry::new().unwrap();
+        let opencode = registry.get("opencode").unwrap();
+        let h = opencode
+            .home_dir_layout
+            .as_ref()
+            .expect("opencode must declare home_dir_layout for v0.4 migrate");
+        assert_eq!(h.default_path, "~/.local/share/opencode");
+        assert_eq!(h.discovery, HomeDirDiscovery::Symlink);
+    }
+
+    #[test]
+    fn home_dir_layout_omitted_means_in_project_only() {
+        // Tools that don't declare home_dir_layout (the existing v0.3.x
+        // shape) parse exactly as before. v0.4 migrate will skip them.
+        let toml_str = r#"
+[tool]
+name = "in_project_only"
+display_name = "In-Project Only"
+session_patterns = [".foo/"]
+"#;
+        let parsed: ToolFile = toml::from_str(toml_str).unwrap();
+        assert!(parsed.tool.home_dir_layout.is_none());
+    }
+
+    #[test]
     fn tool_registry_override() {
         let mut registry = ToolRegistry::new().unwrap();
         let custom = ToolDefinition {
@@ -222,6 +448,7 @@ mod tests {
             on_move: ReconcileStrategy::Notify,
             version: Some("99.0".to_string()),
             binary: None,
+            home_dir_layout: None,
         };
         registry.register(custom);
         assert_eq!(
@@ -307,6 +534,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 on_move: ReconcileStrategy::Notify,
                 version: Some("1.0".to_string()),
                 binary: None,
+                home_dir_layout: None,
             }],
             ..Default::default()
         };
@@ -332,6 +560,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 on_move: ReconcileStrategy::RewritePaths,
                 version: Some("99.0".to_string()),
                 binary: None,
+                home_dir_layout: None,
             }],
             ..Default::default()
         };

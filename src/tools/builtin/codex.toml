@@ -16,3 +16,14 @@ session_patterns = [
   "AGENTS.md",
   ".codex/",
 ]
+
+# Codex respects the `CODEX_HOME` env var and falls back to `~/.codex`
+# when it isn't set. That makes this a clean `discovery = "env"` case
+# for `sessionguard migrate` (v0.4): relocate the data, then either
+# export `CODEX_HOME` system-wide (shell rc) or, when Codex is running
+# under a systemd-user unit, drop a `[Service] Environment=CODEX_HOME=…`
+# override. See `docs/design/migrate.md`.
+[tool.home_dir_layout]
+default_path = "~/.codex"
+discovery = "env"
+env_var = "CODEX_HOME"

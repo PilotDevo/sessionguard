@@ -15,3 +15,14 @@ session_patterns = [
   "opencode.json",
   "opencode.jsonc",
 ]
+
+# OpenCode stores its session database (SQLite, with WAL) at the XDG
+# data location with no documented env-var or config-file override.
+# For `sessionguard migrate` that's the `discovery = "symlink"` case:
+# rsync the data to the new location, then leave a symlink at the
+# canonical path so OpenCode opens the DB transparently. Verified
+# against opencode 0.x on Linux + macOS — the daemon follows the
+# symlink and writes through it without complaint.
+[tool.home_dir_layout]
+default_path = "~/.local/share/opencode"
+discovery = "symlink"
