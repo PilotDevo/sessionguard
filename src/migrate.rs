@@ -88,6 +88,11 @@ pub struct MigrationResult {
     /// `Some(err)` when a stage failed and the run aborted; `None` on
     /// clean completion (whether dry-run-bounded or fully done).
     pub error: Option<String>,
+    /// The inverse of whatever Quiesce did. The Resume stage (and
+    /// `sessionguard undo` for stale half-migrates) reads this to
+    /// know what to bring back up.
+    #[serde(default)]
+    pub resume_action: ResumeAction,
 }
 
 /// What `sessionguard migrate` should refuse to do until stages 5–7
@@ -117,13 +122,162 @@ pub enum MigrateError {
     Io(#[from] std::io::Error),
 }
 
+// ── Quiescer: abstraction over "stop / start the thing holding the data" ──
+//
+// Wired in step 4 (this commit). The default implementation shells out to
+// systemctl; tests substitute a [`FakeQuiescer`] so they don't depend on
+// the host having systemd or a real unit registered.
+//
+// Design constraint from `docs/design/migrate.md` §3 "Open questions":
+// for ephemeral tools (no systemd unit declared), Quiesce *cannot* stop
+// anything itself — best it can do is warn the operator. That case is
+// represented by a successful Quiescer call that records the warning
+// in its returned `QuiesceOutcome` rather than failing the migration.
+
+/// How a tool was quiesced (or wasn't).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum QuiesceOutcome {
+    /// A systemd unit was stopped. `scope` is `"user"` or `"system"`.
+    UnitStopped { scope: String, unit: String },
+    /// No unit declared — operator was warned to ensure the tool
+    /// isn't writing mid-migrate. Migration continues.
+    NoUnitWarning,
+    /// Skipped because dry-run is in effect; no side effects.
+    DryRunSkipped,
+}
+
+/// How to undo a Quiesce. Carried in the migration result so Resume
+/// can do the right thing post-rewrite, and so future `undo` for a
+/// stale half-migrate can also restart services.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum ResumeAction {
+    /// Resume by starting this unit at the named scope.
+    StartUnit { scope: String, unit: String },
+    /// Nothing to resume.
+    #[default]
+    None,
+}
+
+/// Pluggable systemd backend so unit tests can verify Quiesce / Resume
+/// behaviour without spawning real `systemctl` processes.
+pub trait Quiescer {
+    /// Stop the relevant unit (if any) per the layout. Returns the
+    /// outcome (for the event log) and the inverse action (for Resume).
+    fn quiesce(
+        &self,
+        layout: &crate::tools::HomeDirLayout,
+        dry_run: bool,
+    ) -> Result<(QuiesceOutcome, ResumeAction), MigrateError>;
+
+    /// Perform the resume action recorded during quiesce.
+    fn resume(&self, action: &ResumeAction, dry_run: bool) -> Result<(), MigrateError>;
+}
+
+/// Default real-systemd implementation. Shells out to `systemctl`,
+/// preferring `--user` when both scopes are declared (the user-scope
+/// stop is cheap and doesn't require sudo).
+pub struct SystemdQuiescer;
+
+impl Quiescer for SystemdQuiescer {
+    fn quiesce(
+        &self,
+        layout: &crate::tools::HomeDirLayout,
+        dry_run: bool,
+    ) -> Result<(QuiesceOutcome, ResumeAction), MigrateError> {
+        if dry_run {
+            return Ok((QuiesceOutcome::DryRunSkipped, ResumeAction::None));
+        }
+        if let Some(unit) = layout.quiesce.systemd_user_unit.as_deref() {
+            run_systemctl(&["--user", "stop", unit])?;
+            return Ok((
+                QuiesceOutcome::UnitStopped {
+                    scope: "user".into(),
+                    unit: unit.into(),
+                },
+                ResumeAction::StartUnit {
+                    scope: "user".into(),
+                    unit: unit.into(),
+                },
+            ));
+        }
+        if let Some(unit) = layout.quiesce.systemd_system_unit.as_deref() {
+            run_systemctl(&["stop", unit])?;
+            return Ok((
+                QuiesceOutcome::UnitStopped {
+                    scope: "system".into(),
+                    unit: unit.into(),
+                },
+                ResumeAction::StartUnit {
+                    scope: "system".into(),
+                    unit: unit.into(),
+                },
+            ));
+        }
+        Ok((QuiesceOutcome::NoUnitWarning, ResumeAction::None))
+    }
+
+    fn resume(&self, action: &ResumeAction, dry_run: bool) -> Result<(), MigrateError> {
+        if dry_run {
+            return Ok(());
+        }
+        match action {
+            ResumeAction::StartUnit { scope, unit } => {
+                let args: Vec<&str> = if scope == "user" {
+                    vec!["--user", "start", unit.as_str()]
+                } else {
+                    vec!["start", unit.as_str()]
+                };
+                run_systemctl(&args)
+            }
+            ResumeAction::None => Ok(()),
+        }
+    }
+}
+
+fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
+    let output = std::process::Command::new("systemctl")
+        .args(args)
+        .output()?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(MigrateError::StageFailed(
+            Stage::Quiesce,
+            format!(
+                "systemctl {} exited {}: {}",
+                args.join(" "),
+                output.status.code().unwrap_or(-1),
+                stderr.trim()
+            ),
+        ));
+    }
+    Ok(())
+}
+
 /// Drive a migration. Set `dry_run = true` to walk every implemented
 /// stage without mutating the filesystem.
+///
+/// Uses the default [`SystemdQuiescer`]; pass a custom one via
+/// [`migrate_with`] for tests or alternate quiesce strategies.
 pub fn migrate(
     tool: &ToolDefinition,
     src: &Path,
     dst: &Path,
     dry_run: bool,
+) -> Result<MigrationResult, MigrateError> {
+    migrate_with(tool, src, dst, dry_run, &SystemdQuiescer)
+}
+
+/// Like [`migrate`] but with an injectable [`Quiescer`]. Production
+/// callers use [`migrate`]; tests use this with a fake to avoid
+/// shelling out to real `systemctl`.
+pub fn migrate_with(
+    tool: &ToolDefinition,
+    src: &Path,
+    dst: &Path,
+    dry_run: bool,
+    quiescer: &dyn Quiescer,
 ) -> Result<MigrationResult, MigrateError> {
     let mut events: Vec<MigrationEvent> = Vec::new();
     let record = |stage: Stage, detail: &str, events: &mut Vec<MigrationEvent>| {
@@ -175,27 +329,28 @@ pub fn migrate(
     );
 
     // Stage 2: quiesce — stop services/daemons that hold the data
-    // open. Real systemd wiring is step 4; for now record intent
-    // based on the layout's declared quiesce hook.
-    if let Some(unit) = layout.quiesce.systemd_user_unit.as_deref() {
-        record(
-            Stage::Quiesce,
-            &format!("would stop systemd --user unit `{unit}` (not wired yet)"),
-            &mut events,
-        );
-    } else if let Some(unit) = layout.quiesce.systemd_system_unit.as_deref() {
-        record(
-            Stage::Quiesce,
-            &format!("would stop systemd system unit `{unit}` (not wired yet)"),
-            &mut events,
-        );
-    } else {
-        record(
-            Stage::Quiesce,
-            "no quiesce hook declared; operator must ensure tool isn't writing mid-migrate",
-            &mut events,
-        );
-    }
+    // open. Delegates to the [`Quiescer`] (default: real systemd) so
+    // tests can substitute a fake. Carries the returned `ResumeAction`
+    // forward to whatever Resume implementation lands next.
+    let (quiesce_outcome, resume_action) = quiescer.quiesce(layout, dry_run)?;
+    let detail = match &quiesce_outcome {
+        QuiesceOutcome::UnitStopped { scope, unit } => {
+            format!("stopped systemd {scope} unit `{unit}`")
+        }
+        QuiesceOutcome::NoUnitWarning => {
+            "no quiesce hook declared; operator must ensure tool isn't writing mid-migrate"
+                .to_string()
+        }
+        QuiesceOutcome::DryRunSkipped => match (
+            layout.quiesce.systemd_user_unit.as_deref(),
+            layout.quiesce.systemd_system_unit.as_deref(),
+        ) {
+            (Some(u), _) => format!("dry-run: would stop systemd --user unit `{u}`"),
+            (None, Some(u)) => format!("dry-run: would stop systemd unit `{u}`"),
+            _ => "dry-run: no quiesce hook declared; no-op".to_string(),
+        },
+    };
+    record(Stage::Quiesce, &detail, &mut events);
 
     // Stage 3: copy — under dry-run, just enumerate. Under real run we
     // gate on NotYetMutating until rewrite/resume/validate land, so
@@ -233,6 +388,7 @@ pub fn migrate(
         success: true,
         events,
         error: None,
+        resume_action,
     };
     Ok(result)
 }
@@ -316,6 +472,69 @@ mod tests {
                 },
                 validate: HomeDirValidate::default(),
             }),
+        }
+    }
+
+    /// Fake quiescer for tests. Records every `quiesce` / `resume`
+    /// invocation so assertions can verify the right arguments were
+    /// passed, without spawning real `systemctl` processes.
+    #[derive(Default)]
+    struct FakeQuiescer {
+        calls: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl FakeQuiescer {
+        fn calls(&self) -> Vec<String> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    impl Quiescer for FakeQuiescer {
+        fn quiesce(
+            &self,
+            layout: &crate::tools::HomeDirLayout,
+            dry_run: bool,
+        ) -> Result<(QuiesceOutcome, ResumeAction), MigrateError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("quiesce(dry_run={dry_run})"));
+            if dry_run {
+                return Ok((QuiesceOutcome::DryRunSkipped, ResumeAction::None));
+            }
+            if let Some(u) = layout.quiesce.systemd_user_unit.as_deref() {
+                Ok((
+                    QuiesceOutcome::UnitStopped {
+                        scope: "user".into(),
+                        unit: u.into(),
+                    },
+                    ResumeAction::StartUnit {
+                        scope: "user".into(),
+                        unit: u.into(),
+                    },
+                ))
+            } else if let Some(u) = layout.quiesce.systemd_system_unit.as_deref() {
+                Ok((
+                    QuiesceOutcome::UnitStopped {
+                        scope: "system".into(),
+                        unit: u.into(),
+                    },
+                    ResumeAction::StartUnit {
+                        scope: "system".into(),
+                        unit: u.into(),
+                    },
+                ))
+            } else {
+                Ok((QuiesceOutcome::NoUnitWarning, ResumeAction::None))
+            }
+        }
+
+        fn resume(&self, action: &ResumeAction, dry_run: bool) -> Result<(), MigrateError> {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("resume({action:?}, dry_run={dry_run})"));
+            Ok(())
         }
     }
 
@@ -450,5 +669,142 @@ mod tests {
             "detail = {}",
             quiesce_event.detail
         );
+    }
+
+    // ── New in step 4: Quiescer is actually called + ResumeAction lands
+
+    #[test]
+    fn migrate_with_fake_quiescer_records_dry_run_skipped() {
+        // Dry-run path should pass through the Quiescer but produce a
+        // `DryRunSkipped` outcome and a `None` resume action.
+        let t = tool(HomeDirDiscovery::Symlink, None, Some("anything.service"));
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("a", b"b")]);
+        let dst_dir = TempDir::new().unwrap();
+        let fake = FakeQuiescer::default();
+
+        let result = migrate_with(&t, src.path(), &dst_dir.path().join("d"), true, &fake).unwrap();
+        let calls = fake.calls();
+        assert_eq!(calls.len(), 1, "quiesce called once: {calls:?}");
+        assert!(calls[0].contains("dry_run=true"));
+        assert_eq!(result.resume_action, ResumeAction::None);
+    }
+
+    #[test]
+    fn fake_quiescer_returns_user_unit_when_layout_declares_one() {
+        // Drives the Quiescer trait directly to verify the user-scope
+        // branch picks up the right unit name + scope. The migrate
+        // dispatcher would carry this through to the result.
+        let layout = HomeDirLayout {
+            default_path: "~/.ignored".into(),
+            discovery: HomeDirDiscovery::Symlink,
+            env_var: None,
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("dropbox.service".into()),
+                systemd_system_unit: None,
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let fake = FakeQuiescer::default();
+        let (outcome, resume) = fake.quiesce(&layout, false).unwrap();
+        match outcome {
+            QuiesceOutcome::UnitStopped { scope, unit } => {
+                assert_eq!(scope, "user");
+                assert_eq!(unit, "dropbox.service");
+            }
+            other => panic!("expected UnitStopped, got {other:?}"),
+        }
+        match resume {
+            ResumeAction::StartUnit { scope, unit } => {
+                assert_eq!(scope, "user");
+                assert_eq!(unit, "dropbox.service");
+            }
+            other => panic!("expected StartUnit, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fake_quiescer_prefers_user_over_system_when_both_declared() {
+        // Per design: `--user` is preferred (cheap, no sudo). When
+        // both are set, user wins.
+        let layout = HomeDirLayout {
+            default_path: "~/.ignored".into(),
+            discovery: HomeDirDiscovery::Symlink,
+            env_var: None,
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: Some("user.service".into()),
+                systemd_system_unit: Some("system.service".into()),
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let fake = FakeQuiescer::default();
+        let (outcome, _) = fake.quiesce(&layout, false).unwrap();
+        match outcome {
+            QuiesceOutcome::UnitStopped { unit, .. } => assert_eq!(unit, "user.service"),
+            other => panic!("expected user-scope UnitStopped, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fake_quiescer_falls_through_to_system_when_only_system_declared() {
+        let layout = HomeDirLayout {
+            default_path: "~/.ignored".into(),
+            discovery: HomeDirDiscovery::Symlink,
+            env_var: None,
+            config_files: vec![],
+            quiesce: HomeDirQuiesce {
+                systemd_user_unit: None,
+                systemd_system_unit: Some("nginx.service".into()),
+            },
+            validate: HomeDirValidate::default(),
+        };
+        let fake = FakeQuiescer::default();
+        let (outcome, resume) = fake.quiesce(&layout, false).unwrap();
+        match outcome {
+            QuiesceOutcome::UnitStopped { scope, unit } => {
+                assert_eq!(scope, "system");
+                assert_eq!(unit, "nginx.service");
+            }
+            other => panic!("expected system-scope UnitStopped, got {other:?}"),
+        }
+        assert!(matches!(resume, ResumeAction::StartUnit { .. }));
+    }
+
+    #[test]
+    fn fake_quiescer_returns_warning_for_unitless_tool() {
+        // Ephemeral tools (no systemd unit declared) get a warning,
+        // not a failure — migration continues; operator's responsibility
+        // to make sure the tool isn't writing.
+        let layout = HomeDirLayout {
+            default_path: "~/.ignored".into(),
+            discovery: HomeDirDiscovery::Symlink,
+            env_var: None,
+            config_files: vec![],
+            quiesce: HomeDirQuiesce::default(),
+            validate: HomeDirValidate::default(),
+        };
+        let fake = FakeQuiescer::default();
+        let (outcome, resume) = fake.quiesce(&layout, false).unwrap();
+        assert_eq!(outcome, QuiesceOutcome::NoUnitWarning);
+        assert_eq!(resume, ResumeAction::None);
+    }
+
+    #[test]
+    fn resume_action_serialises_with_tagged_repr() {
+        // The dashboard / event log consume this as JSON.
+        let r = ResumeAction::StartUnit {
+            scope: "user".into(),
+            unit: "x.service".into(),
+        };
+        let j = serde_json::to_value(&r).unwrap();
+        assert_eq!(j["kind"], "start_unit");
+        assert_eq!(j["scope"], "user");
+        assert_eq!(j["unit"], "x.service");
+
+        let n = ResumeAction::None;
+        let j = serde_json::to_value(&n).unwrap();
+        assert_eq!(j["kind"], "none");
     }
 }
