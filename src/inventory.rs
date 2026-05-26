@@ -105,7 +105,7 @@ where
 /// Replace a leading `~` with the user's home directory. Other `~`
 /// occurrences inside the string are left as-is. Returns the input
 /// unchanged on unusual platforms with no resolvable home.
-fn expand_home(s: &str) -> PathBuf {
+pub fn expand_home(s: &str) -> PathBuf {
     if let Some(rest) = s.strip_prefix("~/") {
         if let Some(home) = home_dir() {
             return home.join(rest);

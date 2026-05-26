@@ -459,6 +459,59 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Migrate {
+            tool,
+            to,
+            dry_run,
+            format,
+        } => {
+            use sessionguard::migrate;
+
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let tool_def = tool_registry
+                .get(&tool)
+                .ok_or_else(|| anyhow::anyhow!("no tool named `{tool}` registered"))?;
+
+            // The tool's home_dir_layout (if any) tells us the source
+            // path; for now we derive it directly from the layout's
+            // default_path. Future polish: --from override.
+            let layout = tool_def.home_dir_layout.as_ref().ok_or_else(|| {
+                anyhow::anyhow!(
+                    "tool `{tool}` has no home_dir_layout — nothing to migrate. \
+                     See docs/design/migrate.md for what's needed."
+                )
+            })?;
+            let src = sessionguard::inventory::expand_home(&layout.default_path);
+
+            match migrate::migrate(tool_def, &src, &to, dry_run) {
+                Ok(result) => match format {
+                    sessionguard::cli::Format::Json => {
+                        println!("{}", serde_json::to_string_pretty(&result)?);
+                    }
+                    sessionguard::cli::Format::Text => {
+                        let mode = if dry_run { "DRY-RUN" } else { "LIVE" };
+                        println!("{} migrate: {} -> {}", mode, src.display(), to.display());
+                        for e in &result.events {
+                            println!("  [{:?}] {}", e.stage, e.detail);
+                        }
+                        println!(
+                            "\nfinal stage: {:?}  success: {}",
+                            result.final_stage, result.success
+                        );
+                        if result.dry_run {
+                            println!(
+                                "\n(dry-run only. Real migration is gated until v0.4 \
+                                 implementation lands stages 5-7.)"
+                            );
+                        }
+                    }
+                },
+                Err(e) => {
+                    return Err(anyhow::anyhow!("migrate failed: {e}"));
+                }
+            }
+        }
+
         Command::Inventory { format } => {
             use sessionguard::inventory::inventory_tools_impl;
 

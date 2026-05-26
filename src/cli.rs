@@ -147,6 +147,27 @@ pub enum Command {
         format: Format,
     },
 
+    /// **EXPERIMENTAL (v0.4 in flight).** Migrate a tool's home-dir data
+    /// to a new location. Only `--dry-run` works today — real
+    /// migrations are gated until the rewrite / resume / validate
+    /// stages land. See `docs/design/migrate.md` for the design.
+    Migrate {
+        /// Tool name to migrate (e.g. `codex`, `opencode`).
+        tool: String,
+        /// Destination directory. Must not exist; sessionguard refuses
+        /// to overwrite an existing path.
+        #[arg(long)]
+        to: PathBuf,
+        /// Walk every implemented stage of the state machine without
+        /// touching the filesystem. Today this is the only supported
+        /// mode; a real migration without `--dry-run` errors out.
+        #[arg(long)]
+        dry_run: bool,
+        /// Output format for the per-stage event log.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+
     /// Undo previous reconciliation actions from the event log.
     Undo {
         /// Undo the last N actions. Default: 1.
