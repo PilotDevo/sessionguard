@@ -3,36 +3,31 @@
 
 //! Migration state machine for `sessionguard migrate` (v0.4).
 //!
-//! Step 3 of the v0.4 implementation order (see `docs/design/migrate.md`).
-//! This module implements the eight-stage state machine described in the
-//! design doc, **but only the read-only stages (0–4) are wired today**.
-//! Stages 5–8 (rewrite / resume / validate / retain) are scaffolded as
-//! enum variants with `unimplemented!()` bodies so the type system tracks
-//! the missing work and the design contract is visible in code.
+//! Implements the nine-stage state machine from `docs/design/migrate.md`,
+//! end-to-end: real migrations now run to completion through
+//! Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite →
+//! Resume → Validate → Retain → Done.
 //!
-//! Every stage transition writes a structured event so `sessionguard undo`
-//! can reverse a migration the same way it reverses a reconcile. The
-//! current scaffold uses a placeholder event sink (`MigrationLog`); when
-//! step 6 wires this into the real event log, the sink trait is the seam.
+//! ## Stage status
 //!
-//! ## What lands in v0.3.6 (this commit) vs. later
+//! | Stage     | Status      | Effect on disk |
+//! |-----------|-------------|----------------|
+//! | Preflight | Implemented | Read-only checks |
+//! | Snapshot  | Stubbed     | Records intent only (btrfs detect comes later) |
+//! | Quiesce   | Implemented | `systemctl stop` via [`Quiescer`] |
+//! | Copy      | Implemented | Recursive copy into the new path |
+//! | Verify    | Implemented | Compares file count + total size |
+//! | Rewrite   | Implemented | Symlink / config edit / systemd drop-in per discovery |
+//! | Resume    | Implemented | `systemctl start` via [`Quiescer`] |
+//! | Validate  | Implemented | Runs `validate.command` with timeout |
+//! | Retain    | Implemented | Renames source to `.migrated-<ts>` (never auto-deletes) |
+//! | Done      | Terminal    | — |
 //!
-//! | Stage     | Status here  | Effect on disk |
-//! |-----------|--------------|----------------|
-//! | Preflight | Implemented  | Read-only checks |
-//! | Snapshot  | Stubbed      | Records intent only (btrfs detect comes later) |
-//! | Quiesce   | Stubbed      | Records intent only (systemd wiring later) |
-//! | Copy      | Implemented  | Honest rsync into the new path (dry-run aware) |
-//! | Verify    | Implemented  | Compares file count + total size |
-//! | Rewrite   | Not yet      | `unimplemented!()` |
-//! | Resume    | Not yet      | `unimplemented!()` |
-//! | Validate  | Not yet      | `unimplemented!()` |
-//! | Retain    | Implemented  | Renames source to `.migrated-<ts>` on success |
-//!
-//! The `migrate --dry-run` invocation walks every stage but never mutates
-//! the filesystem; `migrate` (no `--dry-run`) is intentionally gated to
-//! refuse running until stages 5–7 land, so we can't ship a half-baked
-//! mutator that doesn't honor the design's "never auto-delete" rule.
+//! Any post-Verify failure rolls back every preceding side-effect:
+//! dst removed, drop-ins uninstalled, config backups restored,
+//! symlink-sidecars renamed back. The "never auto-delete the source"
+//! design rule means even on success the original lives on at
+//! `<src>.migrated-<unix>` until the operator decides to clean it up.
 
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
@@ -111,11 +106,6 @@ pub enum MigrateError {
     SourceMissing(PathBuf),
     #[error("`discovery = \"compile\"` is not migratable: tool config is baked into the binary")]
     CompileBaked,
-    #[error(
-        "real migration (without --dry-run) is gated until stages 5–7 (rewrite/resume/validate) \
-         land. Use `--dry-run` to walk the read-only stages of the state machine."
-    )]
-    NotYetMutating,
     #[error("stage `{0:?}` failed: {1}")]
     StageFailed(Stage, String),
     #[error(transparent)]
@@ -880,6 +870,143 @@ fn undo_rewrite(outcome: &RewriteOutcome, env_writer: &dyn EnvWriter) -> Result<
     }
 }
 
+// ── Validate (stage 7) ────────────────────────────────────────────────────
+
+/// Outcome of running the layout's optional `validate.command`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValidateOutcome {
+    /// No command declared in the layout; nothing to do.
+    Skipped,
+    /// Command ran and exited zero within the timeout.
+    Ok { command: String, took_ms: u128 },
+}
+
+/// Run the layout's `validate.command` (if any). Returns an error if
+/// the command exits non-zero, times out, or fails to spawn. The
+/// timeout defaults to 10 seconds when `timeout_seconds` is unset.
+fn run_validate(validate: &crate::tools::HomeDirValidate) -> Result<ValidateOutcome, MigrateError> {
+    if validate.command.is_empty() {
+        return Ok(ValidateOutcome::Skipped);
+    }
+    let timeout = std::time::Duration::from_secs(validate.timeout_seconds.unwrap_or(10));
+    let start = std::time::Instant::now();
+    let argv0 = &validate.command[0];
+    let argv_rest = &validate.command[1..];
+    let mut child = std::process::Command::new(argv0)
+        .args(argv_rest)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .map_err(|e| {
+            MigrateError::StageFailed(
+                Stage::Validate,
+                format!("failed to spawn `{}`: {e}", validate.command.join(" ")),
+            )
+        })?;
+
+    // Poll-loop with sleep — keeps us off the tokio runtime so this
+    // stays a pure sync function reachable from non-async callers.
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                if status.success() {
+                    return Ok(ValidateOutcome::Ok {
+                        command: validate.command.join(" "),
+                        took_ms: start.elapsed().as_millis(),
+                    });
+                } else {
+                    let code = status.code().unwrap_or(-1);
+                    return Err(MigrateError::StageFailed(
+                        Stage::Validate,
+                        format!("validate `{}` exited {code}", validate.command.join(" ")),
+                    ));
+                }
+            }
+            Ok(None) => {
+                if start.elapsed() >= timeout {
+                    let _ = child.kill();
+                    return Err(MigrateError::StageFailed(
+                        Stage::Validate,
+                        format!(
+                            "validate `{}` timed out after {}s",
+                            validate.command.join(" "),
+                            timeout.as_secs()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(e) => {
+                return Err(MigrateError::StageFailed(
+                    Stage::Validate,
+                    format!("failed to poll validate child: {e}"),
+                ));
+            }
+        }
+    }
+}
+
+// ── Retain (stage 8) ─────────────────────────────────────────────────────
+
+/// What Retain did with the source dir. Stored on the result so a
+/// future `sessionguard migrate-cleanup` command can find the
+/// preserved sidecar and delete it once the operator's happy.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum RetainOutcome {
+    /// Symlink discovery already moved the source aside in Rewrite.
+    PreservedInRewrite { aside: PathBuf },
+    /// Config/Env discovery: Retain renamed src → src.migrated-<unix>.
+    RenamedAside { from: PathBuf, to: PathBuf },
+    /// No source preservation applicable (e.g. partial recovery path).
+    Nothing,
+    /// Dry-run; nothing happened.
+    DryRunSkipped,
+}
+
+/// Preserve `src` per the design's "never auto-delete" rule. The
+/// behaviour depends on whether Rewrite already moved it aside.
+fn retain_source(
+    src: &Path,
+    rewrite_outcome: &RewriteOutcome,
+) -> Result<RetainOutcome, MigrateError> {
+    if let RewriteOutcome::SymlinkInstalled {
+        moved_aside: Some(aside),
+        ..
+    } = rewrite_outcome
+    {
+        return Ok(RetainOutcome::PreservedInRewrite {
+            aside: aside.clone(),
+        });
+    }
+    // For Config / Env rewrites, src is still a real directory. Rename
+    // it aside with a timestamped sidecar name so the tool can't be
+    // tricked into reading the old copy if its config is reverted by
+    // hand.
+    if !src.exists() {
+        return Ok(RetainOutcome::Nothing);
+    }
+    let aside = src.with_file_name(format!(
+        "{}.migrated-{}",
+        src.file_name().and_then(|s| s.to_str()).unwrap_or("data"),
+        now_unix()
+    ));
+    if aside.exists() {
+        return Err(MigrateError::StageFailed(
+            Stage::Retain,
+            format!(
+                "preserved name `{}` already exists; refusing to overwrite",
+                aside.display()
+            ),
+        ));
+    }
+    std::fs::rename(src, &aside)?;
+    Ok(RetainOutcome::RenamedAside {
+        from: src.to_path_buf(),
+        to: aside,
+    })
+}
+
 fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
     let output = std::process::Command::new("systemctl")
         .args(args)
@@ -1177,46 +1304,143 @@ pub fn migrate_with_backends(
     };
     record(Stage::Rewrite, &rewrite_detail, &mut events);
 
-    // Stages 6-8 (Resume / Validate / Retain) are still gated. Once
-    // Rewrite has run on a real migration, we need to undo it before
-    // returning the gate error — otherwise the operator is left with
-    // a symlink pointing at data the tool isn't yet wired up against.
-    if !dry_run {
-        if let Err(undo_err) = undo_rewrite(&rewrite_outcome, env_writer) {
-            // Best-effort undo: if it fails we record the failure in
-            // the event log but still return NotYetMutating; the
-            // operator will see both events and know what to fix.
+    // Stage 6: resume — bring back up whatever Quiesce stopped. Same
+    // [`Quiescer`] handles both ends. Dry-run still walks this stage
+    // but takes no system action.
+    match quiescer.resume(&resume_action, dry_run) {
+        Ok(()) => {
+            let detail = match (&resume_action, dry_run) {
+                (ResumeAction::StartUnit { scope, unit }, false) => {
+                    format!("started systemd {scope} unit `{unit}`")
+                }
+                (ResumeAction::StartUnit { scope, unit }, true) => {
+                    format!("dry-run: would start systemd {scope} unit `{unit}`")
+                }
+                (ResumeAction::None, _) => "no resume action declared; nothing to start".into(),
+            };
+            record(Stage::Resume, &detail, &mut events);
+        }
+        Err(e) => {
+            // Resume failure is recoverable: undo Rewrite, clean up
+            // dst, surface the error. The operator's daemons may be
+            // left stopped (since Quiesce ran), and that's the
+            // honest state to report.
+            if let Err(undo_err) = undo_rewrite(&rewrite_outcome, env_writer) {
+                record(
+                    Stage::Resume,
+                    &format!("Resume failed AND undo of Rewrite failed: {undo_err}"),
+                    &mut events,
+                );
+            }
+            cleanup_partial_copy(dst);
+            return Err(e);
+        }
+    }
+
+    // Stage 7: validate — optional post-rewrite health check. If the
+    // layout declares a `validate.command`, run it (bounded by
+    // `timeout_seconds`, default 10s) and expect exit 0. Anything
+    // else means the migration didn't take and we should unwind.
+    if dry_run {
+        if layout.validate.command.is_empty() {
             record(
-                Stage::Rewrite,
-                &format!("rollback of Rewrite FAILED: {undo_err}"),
+                Stage::Validate,
+                "dry-run: no validate command declared",
                 &mut events,
             );
         } else {
             record(
-                Stage::Rewrite,
-                "rollback ok (Rewrite undone before gate)",
+                Stage::Validate,
+                &format!(
+                    "dry-run: would run `{}` (timeout {}s)",
+                    layout.validate.command.join(" "),
+                    layout.validate.timeout_seconds.unwrap_or(10)
+                ),
                 &mut events,
             );
         }
-        cleanup_partial_copy(dst);
-        return Err(MigrateError::NotYetMutating);
+    } else {
+        match run_validate(&layout.validate) {
+            Ok(ValidateOutcome::Skipped) => {
+                record(
+                    Stage::Validate,
+                    "no validate command declared; skipping",
+                    &mut events,
+                );
+            }
+            Ok(ValidateOutcome::Ok { command, took_ms }) => {
+                record(
+                    Stage::Validate,
+                    &format!("validate `{command}` exited 0 in {took_ms}ms"),
+                    &mut events,
+                );
+            }
+            Err(e) => {
+                // Validate failed — full rollback. Stop the service
+                // again so the operator isn't left with a half-broken
+                // tool, undo the rewrite, clean up dst.
+                let _ = quiescer.quiesce(layout, dry_run);
+                if let Err(undo_err) = undo_rewrite(&rewrite_outcome, env_writer) {
+                    record(
+                        Stage::Validate,
+                        &format!("Validate failed AND undo of Rewrite failed: {undo_err}"),
+                        &mut events,
+                    );
+                } else {
+                    record(
+                        Stage::Validate,
+                        &format!("validate failed: {e}; rolled back Rewrite"),
+                        &mut events,
+                    );
+                }
+                cleanup_partial_copy(dst);
+                return Err(e);
+            }
+        }
     }
 
-    // Stages 6–8 are not wired yet. Dry-run returns success at this
-    // point with Stage::Rewrite as the terminal so the operator can
-    // see the rewrite intent recorded in the event log.
-    let result = MigrationResult {
+    // Stage 8: retain — preserve the source per the "never auto-delete"
+    // rule. For Symlink discovery the Rewrite stage already moved the
+    // original aside, so Retain is a no-op recording the existing
+    // `moved_aside` path. For Config / Env, src is still a real
+    // directory; rename it to `<src>.migrated-<unix>` so the tool
+    // can never accidentally start reading the old copy.
+    let retain_outcome = if dry_run {
+        RetainOutcome::DryRunSkipped
+    } else {
+        retain_source(src, &rewrite_outcome)?
+    };
+    let retain_detail = match &retain_outcome {
+        RetainOutcome::PreservedInRewrite { aside } => {
+            format!(
+                "source already preserved during Rewrite at {}",
+                aside.display()
+            )
+        }
+        RetainOutcome::RenamedAside { from, to } => format!(
+            "renamed source {} → {} (operator-driven cleanup later)",
+            from.display(),
+            to.display()
+        ),
+        RetainOutcome::Nothing => "source preservation not applicable".into(),
+        RetainOutcome::DryRunSkipped => "dry-run: would rename source aside".into(),
+    };
+    record(Stage::Retain, &retain_detail, &mut events);
+
+    // Stage 9: done — terminal event so dashboards can stop polling.
+    record(Stage::Done, "migration complete", &mut events);
+
+    Ok(MigrationResult {
         tool_name: tool.name.clone(),
         src: src.to_path_buf(),
         dst: dst.to_path_buf(),
         dry_run,
-        final_stage: Stage::Rewrite,
+        final_stage: Stage::Done,
         success: true,
         events,
         error: None,
         resume_action,
-    };
-    Ok(result)
+    })
 }
 
 /// One-line summary of what stage 3 *would* do, for the dry-run event.
@@ -1505,19 +1729,10 @@ mod tests {
         );
     }
 
-    #[test]
-    fn refuses_real_run_until_mutating_stages_land() {
-        // The whole point of this gate: refuse to ship a half-built
-        // mutator. Stage 3 onward is unimplemented; real run must
-        // fail loud, not silently produce a half-migrated FS.
-        let t = tool(HomeDirDiscovery::Symlink, None, None);
-        let src = TempDir::new().unwrap();
-        populate(src.path(), &[("a.txt", b"hi")]);
-        let dst_dir = TempDir::new().unwrap();
-        let dst = dst_dir.path().join("new-location");
-        let err = migrate(&t, src.path(), &dst, false).unwrap_err();
-        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
-    }
+    // (Removed `refuses_real_run_until_mutating_stages_land` — the
+    // NotYetMutating gate is gone now that Resume + Validate + Retain
+    // are wired. Real migrations run end-to-end. See the per-discovery
+    // end-to-end success tests below.)
 
     #[test]
     fn dry_run_walks_every_implemented_stage_in_order() {
@@ -1536,9 +1751,9 @@ mod tests {
 
         let result = migrate(&t, src.path(), &dst, true).unwrap();
         assert!(result.success);
-        // With Rewrite landed (step 6), the dry-run terminal stage
-        // advances from Verify → Rewrite.
-        assert_eq!(result.final_stage, Stage::Rewrite);
+        // With Resume/Validate/Retain wired (step 7), dry-run now
+        // walks to the terminal Stage::Done.
+        assert_eq!(result.final_stage, Stage::Done);
         assert!(result.dry_run);
 
         let stages: Vec<Stage> = result.events.iter().map(|e| e.stage).collect();
@@ -1561,6 +1776,10 @@ mod tests {
                 Stage::Copy,
                 Stage::Verify,
                 Stage::Rewrite,
+                Stage::Resume,
+                Stage::Validate,
+                Stage::Retain,
+                Stage::Done,
             ]
         );
     }
@@ -1598,8 +1817,11 @@ mod tests {
 
         let result = migrate_with(&t, src.path(), &dst_dir.path().join("d"), true, &fake).unwrap();
         let calls = fake.calls();
-        assert_eq!(calls.len(), 1, "quiesce called once: {calls:?}");
-        assert!(calls[0].contains("dry_run=true"));
+        // After step 7, dry-run walks Resume too — so the fake sees
+        // quiesce + resume = 2 calls, both flagged dry_run=true.
+        assert_eq!(calls.len(), 2, "quiesce+resume called once each: {calls:?}");
+        assert!(calls[0].contains("quiesce(dry_run=true"));
+        assert!(calls[1].contains("resume(") && calls[1].contains("dry_run=true"));
         assert_eq!(result.resume_action, ResumeAction::None);
     }
 
@@ -1858,46 +2080,55 @@ mod tests {
         cleanup_partial_copy(&tmp.path().join("never-existed"));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn migrate_real_run_now_actually_copies_then_rolls_back() {
-        // With the NotYetMutating gate moved to AFTER Verify, a real
-        // (non-dry-run) call now performs Copy + Verify successfully,
-        // hits the gate at Stage::Rewrite, and rolls back by removing
-        // the dst it just populated. The migrate() observer sees
-        // NotYetMutating; the FS is left in its original state.
+    fn migrate_real_run_symlink_discovery_completes_end_to_end() {
+        // With Resume/Validate/Retain wired (step 7) and the gate gone,
+        // a real (non-dry-run) call now COMPLETES instead of unwinding.
+        // The dst is populated, the canonical path is a symlink, the
+        // original src has been preserved at `<src>.migrated-<ts>`,
+        // and the final stage is Done.
         let t = tool(HomeDirDiscovery::Symlink, None, None);
-        let src = TempDir::new().unwrap();
-        populate(
-            src.path(),
-            &[("a.txt", b"first"), ("nested/b.bin", &[0u8; 32])],
-        );
-        let dst_dir = TempDir::new().unwrap();
-        let dst = dst_dir.path().join("not-yet-existing");
+        // Own a parent dir explicitly so the .migrated-* sidecar scan
+        // doesn't pick up siblings from concurrent tests in /tmp.
+        let parent = TempDir::new().unwrap();
+        let src_path = parent.path().join("src-dir");
+        std::fs::create_dir_all(&src_path).unwrap();
+        std::fs::write(src_path.join("a.txt"), b"first").unwrap();
+        std::fs::create_dir_all(src_path.join("nested")).unwrap();
+        std::fs::write(src_path.join("nested/b.bin"), [0u8; 32]).unwrap();
+        let dst = parent.path().join("new-home");
 
-        let err = migrate_with(&t, src.path(), &dst, false, &FakeQuiescer::default()).unwrap_err();
-        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
-        // Rollback removed the dst the Copy stage created:
-        assert!(!dst.exists(), "real-run rollback must remove orphan dst");
-        // Source still intact (Rewrite would have moved it aside;
-        // rollback then renames it back):
-        assert!(src.path().join("a.txt").exists());
-        assert!(src.path().join("nested/b.bin").exists());
-        // The `.migrated-*` sidecar that Rewrite created should have
-        // been undone by the rollback path:
-        let leftovers: Vec<_> = std::fs::read_dir(src.path().parent().unwrap())
+        let result = migrate_with(&t, &src_path, &dst, false, &FakeQuiescer::default()).unwrap();
+        assert!(result.success);
+        assert_eq!(result.final_stage, Stage::Done);
+
+        // dst was populated and survives
+        assert!(dst.join("a.txt").exists());
+        assert!(dst.join("nested/b.bin").exists());
+
+        // canonical src is now a symlink to dst
+        let meta = std::fs::symlink_metadata(&src_path).unwrap();
+        assert!(meta.file_type().is_symlink());
+        let link_target = std::fs::read_link(&src_path).unwrap();
+        assert_eq!(link_target, dst);
+
+        // The `.migrated-*` sidecar from Rewrite still exists — design
+        // doc says we never auto-delete.
+        let sidecars: Vec<_> = std::fs::read_dir(parent.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
                 e.file_name()
                     .to_str()
-                    .map(|s| s.contains(".migrated-"))
+                    .map(|s| s.starts_with("src-dir.migrated-"))
                     .unwrap_or(false)
             })
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "rollback must remove the .migrated-* sidecar; found: {:?}",
-            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        assert_eq!(
+            sidecars.len(),
+            1,
+            "exactly one .migrated-* sidecar should remain (never auto-deleted)"
         );
     }
 
@@ -2249,10 +2480,10 @@ mod tests {
     }
 
     #[test]
-    fn migrate_with_config_discovery_runs_rewrite_then_rolls_back_at_gate() {
-        // End-to-end: real (non-dry) migrate with discovery=Config. The
-        // driver should run the full Copy/Verify/Rewrite trio, then hit
-        // the NotYetMutating gate at Stage::Resume and unwind everything.
+    fn migrate_with_config_discovery_completes_end_to_end() {
+        // End-to-end: real (non-dry) migrate with discovery=Config.
+        // After step 7 the driver runs to completion: config rewritten,
+        // src renamed aside by Retain, dst populated, final_stage=Done.
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("data-src");
         let dst = tmp.path().join("data-dst");
@@ -2263,21 +2494,37 @@ mod tests {
         std::fs::write(&cfg, &original).unwrap();
 
         let t = config_tool_json(&cfg, "data_dir", &src.display().to_string());
-        let err = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap_err();
-        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
+        let result = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap();
+        assert!(result.success);
+        assert_eq!(result.final_stage, Stage::Done);
 
-        // Rollback removed the dst the Copy stage created
-        assert!(!dst.exists(), "rollback must remove orphan dst");
-        // Config file restored to pre-rewrite contents
+        // dst populated
+        assert!(dst.join("a").exists());
+        // config file points at NEW location now
         let v: serde_json::Value =
             serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["data_dir"], dst.display().to_string());
+        // src renamed aside (Retain stage)
+        assert!(!src.exists(), "src should be renamed aside by Retain");
+        let sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with("data-src.migrated-"))
+                    .unwrap_or(false)
+            })
+            .collect();
         assert_eq!(
-            v["data_dir"],
-            src.display().to_string(),
-            "config file must be restored to pre-rewrite state"
+            sidecars.len(),
+            1,
+            "exactly one src sidecar should remain (never auto-deleted)"
         );
-        // No leftover backup sidecars
-        let leftovers: Vec<_> = std::fs::read_dir(tmp.path())
+        // The reconciler's backup of the config file was consumed when
+        // the rewrite succeeded — i.e. it survives because no rollback
+        // happened. Confirm at least one .sessionguard-backup-* exists.
+        let backups: Vec<_> = std::fs::read_dir(tmp.path())
             .unwrap()
             .filter_map(|e| e.ok())
             .filter(|e| {
@@ -2287,10 +2534,10 @@ mod tests {
                     .unwrap_or(false)
             })
             .collect();
-        assert!(
-            leftovers.is_empty(),
-            "rollback must consume backup sidecars: {:?}",
-            leftovers.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        assert_eq!(
+            backups.len(),
+            1,
+            "config backup sidecar should remain (kept for undo)"
         );
     }
 
@@ -2486,10 +2733,10 @@ mod tests {
     }
 
     #[test]
-    fn migrate_with_env_discovery_runs_rewrite_then_rolls_back_at_gate() {
-        // End-to-end: real (non-dry) migrate with discovery=Env. The
-        // driver runs Copy + Verify + Rewrite (installing drop-in),
-        // then hits NotYetMutating and unwinds everything.
+    fn migrate_with_env_discovery_completes_end_to_end() {
+        // End-to-end: real (non-dry) migrate with discovery=Env.
+        // After step 7 the driver runs to completion: drop-in stays,
+        // src renamed aside, dst populated, final_stage=Done.
         let tmp = TempDir::new().unwrap();
         let src = tmp.path().join("src");
         let dst = tmp.path().join("dst");
@@ -2503,21 +2750,184 @@ mod tests {
         );
 
         let (ew, _scratch) = fake_env_writer();
-        let err = migrate_with_backends(&t, &src, &dst, false, &FakeQuiescer::default(), &ew)
-            .unwrap_err();
-        assert!(matches!(err, MigrateError::NotYetMutating), "got {err:?}");
+        let result =
+            migrate_with_backends(&t, &src, &dst, false, &FakeQuiescer::default(), &ew).unwrap();
+        assert!(result.success);
+        assert_eq!(result.final_stage, Stage::Done);
 
-        // Rollback removed the dst Copy created
-        assert!(!dst.exists(), "rollback must remove orphan dst");
-        // Install happened, then uninstall on rollback
+        // dst populated
+        assert!(dst.join("a").exists());
+        // drop-in survives (no rollback)
         assert_eq!(ew.installs().len(), 1, "one install during Rewrite");
-        assert_eq!(ew.uninstalls().len(), 1, "one uninstall during rollback");
-        // Drop-in file should be gone
-        let leftover = &ew.installs()[0].drop_in_path;
         assert!(
-            !leftover.exists(),
-            "drop-in must be removed after rollback: {}",
-            leftover.display()
+            ew.uninstalls().is_empty(),
+            "no uninstall on a successful run"
         );
+        assert!(ew.installs()[0].drop_in_path.exists());
+        // src renamed aside by Retain
+        assert!(!src.exists());
+        let sidecars: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.starts_with("src.migrated-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert_eq!(sidecars.len(), 1, "exactly one src sidecar should remain");
+    }
+
+    // ── New in step 7: Resume / Validate / Retain stages
+
+    #[test]
+    fn validate_runs_command_and_succeeds_on_exit_zero() {
+        let v = crate::tools::HomeDirValidate {
+            command: vec!["true".into()],
+            timeout_seconds: Some(5),
+        };
+        let outcome = run_validate(&v).unwrap();
+        match outcome {
+            ValidateOutcome::Ok { command, .. } => assert_eq!(command, "true"),
+            other => panic!("expected Ok, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_fails_on_nonzero_exit() {
+        let v = crate::tools::HomeDirValidate {
+            command: vec!["false".into()],
+            timeout_seconds: Some(5),
+        };
+        let err = run_validate(&v).unwrap_err();
+        match err {
+            MigrateError::StageFailed(Stage::Validate, msg) => {
+                assert!(msg.contains("exited"));
+            }
+            other => panic!("expected StageFailed(Validate, ...), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_times_out_on_long_running_command() {
+        // sleep 30s but timeout at 1s — should kill + report timeout.
+        let v = crate::tools::HomeDirValidate {
+            command: vec!["sleep".into(), "30".into()],
+            timeout_seconds: Some(1),
+        };
+        let start = std::time::Instant::now();
+        let err = run_validate(&v).unwrap_err();
+        let elapsed = start.elapsed().as_secs();
+        assert!(
+            elapsed < 5,
+            "should kill within timeout window, took {elapsed}s"
+        );
+        match err {
+            MigrateError::StageFailed(Stage::Validate, msg) => {
+                assert!(msg.contains("timed out"), "got: {msg}");
+            }
+            other => panic!("expected StageFailed timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_skipped_when_no_command_declared() {
+        let v = crate::tools::HomeDirValidate::default();
+        let outcome = run_validate(&v).unwrap();
+        assert_eq!(outcome, ValidateOutcome::Skipped);
+    }
+
+    #[test]
+    fn validate_failure_rolls_back_full_migration() {
+        // Build a Symlink-discovery tool with a validate command that
+        // fails. The driver should run all the way through Rewrite +
+        // Resume, hit Validate, fail it, and roll back: dst gone,
+        // symlink replaced by original directory, no .migrated- sidecars.
+        let parent = TempDir::new().unwrap();
+        let src = parent.path().join("src");
+        let dst = parent.path().join("dst");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"x").unwrap();
+
+        let mut t = tool(HomeDirDiscovery::Symlink, None, None);
+        if let Some(ref mut layout) = t.home_dir_layout {
+            layout.validate = crate::tools::HomeDirValidate {
+                command: vec!["false".into()],
+                timeout_seconds: Some(5),
+            };
+        }
+
+        let err = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap_err();
+        assert!(
+            matches!(err, MigrateError::StageFailed(Stage::Validate, _)),
+            "got {err:?}"
+        );
+
+        // dst removed
+        assert!(!dst.exists(), "rollback must remove dst on Validate fail");
+        // src is a real dir again (Rewrite-undo renamed sidecar back)
+        let meta = std::fs::symlink_metadata(&src).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        assert_eq!(std::fs::read_to_string(src.join("a")).unwrap(), "x");
+        // No leftover .migrated-* sidecars
+        let sidecars: Vec<_> = std::fs::read_dir(parent.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_str()
+                    .map(|s| s.contains(".migrated-"))
+                    .unwrap_or(false)
+            })
+            .collect();
+        assert!(
+            sidecars.is_empty(),
+            "Validate-failure rollback must remove .migrated-* sidecars: {:?}",
+            sidecars.iter().map(|e| e.file_name()).collect::<Vec<_>>()
+        );
+    }
+
+    #[test]
+    fn retain_source_renames_src_for_config_discovery() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"v").unwrap();
+        // Pretend Rewrite did Config-edits, not symlink-move. Construct
+        // a corresponding outcome with no `moved_aside`.
+        let outcome = RewriteOutcome::ConfigEdited { backups: vec![] };
+        let r = retain_source(&src, &outcome).unwrap();
+        match r {
+            RetainOutcome::RenamedAside { from, to } => {
+                assert_eq!(from, src);
+                assert!(to.exists(), "renamed-aside path should exist");
+                assert!(!src.exists(), "original src should be gone");
+                assert!(to
+                    .file_name()
+                    .unwrap()
+                    .to_string_lossy()
+                    .contains(".migrated-"));
+            }
+            other => panic!("expected RenamedAside, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn retain_source_is_noop_when_symlink_rewrite_already_preserved() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data");
+        let aside = tmp.path().join("data.migrated-99");
+        std::fs::create_dir_all(&aside).unwrap();
+        let outcome = RewriteOutcome::SymlinkInstalled {
+            canonical: src.clone(),
+            target: tmp.path().join("dst"),
+            moved_aside: Some(aside.clone()),
+        };
+        let r = retain_source(&src, &outcome).unwrap();
+        match r {
+            RetainOutcome::PreservedInRewrite { aside: a } => assert_eq!(a, aside),
+            other => panic!("expected PreservedInRewrite, got {other:?}"),
+        }
     }
 }

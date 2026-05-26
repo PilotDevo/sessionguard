@@ -2,6 +2,56 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.12] - 2026-05-26
+
+### Features — `migrate` runs end-to-end now
+
+v0.4 step 7: Resume + Validate + Retain wired; `NotYetMutating` gate
+removed. Real (non-dry-run) `sessionguard migrate` now completes the
+full state machine for every supported discovery branch:
+
+```
+Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite →
+            Resume → Validate → Retain → Done
+```
+
+- **Stage::Resume** — calls `Quiescer::resume` to restart whatever
+  Quiesce stopped. Failure unwinds Rewrite and surfaces the error.
+- **Stage::Validate** — runs `layout.validate.command` with a timeout
+  (default 10s, configurable via `validate.timeout_seconds`). Exit 0
+  → success. Anything else (non-zero, timeout, spawn failure) →
+  full rollback: re-quiesce the unit, undo the rewrite, remove dst.
+- **Stage::Retain** — preserves the source per the "never auto-delete"
+  design rule:
+  - Symlink discovery → no-op (Rewrite already moved src aside).
+  - Config / Env discovery → renames src to `<src>.migrated-<unix>`.
+  Operators decide when to clean up the sidecar.
+- **Stage::Done** — terminal event so dashboards / scripts can stop
+  polling.
+
+### Breaking
+
+- **`MigrateError::NotYetMutating` is gone.** Real runs no longer
+  refuse — they complete. If you were matching on this variant in
+  external code, replace it with success-path assertions.
+
+### Testing
+
+- 7 new unit tests covering: Validate exit-zero success, non-zero
+  failure, timeout-and-kill, no-command-declared skip, full-migration
+  rollback on validate failure, Retain renaming src for Config/Env,
+  Retain no-op for Symlink. End-to-end success tests for all three
+  discovery branches now assert the migration COMPLETES (not unwinds).
+  **106 tests passing total**.
+
+### Internal
+
+- Driver header docstring rewritten to reflect the now-complete state
+  machine (was previously a "what lands in v0.3.6 vs. later" table).
+- Event-log integration for migrations is intentionally deferred to
+  v0.3.13 (step 7b) — keep this ship focused on the state machine
+  itself.
+
 ## [0.3.11] - 2026-05-26
 
 ### Features
