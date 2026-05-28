@@ -221,6 +221,8 @@ async fn main() -> Result<()> {
                         for m in &migrations {
                             let undone = if m.undone_at.is_some() {
                                 " (undone)"
+                            } else if m.cleaned_at.is_some() {
+                                " (cleaned — not undoable)"
                             } else {
                                 ""
                             };
@@ -552,6 +554,85 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::MigrateCleanup { migration, execute } => {
+            let event_log = EventLog::open_default()?;
+
+            let candidates = match migration {
+                Some(mid) => {
+                    let entry = event_log
+                        .get_migration(mid)?
+                        .ok_or_else(|| anyhow::anyhow!("no migration with id {mid}"))?;
+                    if entry.undone_at.is_some() {
+                        return Err(anyhow::anyhow!(
+                            "migration {mid} was undone; nothing to clean up"
+                        ));
+                    }
+                    if entry.cleaned_at.is_some() {
+                        println!("migration {mid} was already cleaned up");
+                        return Ok(());
+                    }
+                    vec![entry]
+                }
+                None => event_log.cleanable_migrations(100)?,
+            };
+
+            if candidates.is_empty() {
+                println!("no migrations with preserved originals to clean up");
+                return Ok(());
+            }
+
+            let mut total: u64 = 0;
+            let mut cleaned = 0usize;
+            for entry in &candidates {
+                let plan: sessionguard::migrate::MigrationUndo =
+                    serde_json::from_str(&entry.undo_plan).map_err(|e| {
+                        anyhow::anyhow!("migration {} has a corrupt undo plan: {e}", entry.id)
+                    })?;
+                let report = sessionguard::migrate::cleanup_migration(&plan, !execute)
+                    .map_err(|e| anyhow::anyhow!("cleanup failed: {e}"))?;
+                total += report.total_bytes();
+
+                let verb = if execute { "removing" } else { "would remove" };
+                println!(
+                    "migration #{} ({}: {} -> {})",
+                    entry.id,
+                    plan.tool_name,
+                    plan.src.display(),
+                    plan.dst.display()
+                );
+                for item in &report.items {
+                    if item.existed {
+                        println!(
+                            "  {} {} ({})",
+                            verb,
+                            item.path.display(),
+                            fmt_size(item.bytes)
+                        );
+                    } else {
+                        println!("  (already gone) {}", item.path.display());
+                    }
+                }
+                if execute {
+                    event_log.mark_migration_cleaned(entry.id)?;
+                    cleaned += 1;
+                }
+            }
+
+            if execute {
+                println!(
+                    "\ncleaned {cleaned} migration(s), reclaimed {}",
+                    fmt_size(total)
+                );
+            } else {
+                println!(
+                    "\n{} reclaimable across {} migration(s). \
+                     Re-run with --execute to delete.",
+                    fmt_size(total),
+                    candidates.len()
+                );
+            }
+        }
+
         Command::Inventory { format } => {
             use sessionguard::inventory::inventory_tools_impl;
 
@@ -631,6 +712,14 @@ async fn main() -> Result<()> {
             if let Some(entry) = target_migration {
                 if entry.undone_at.is_some() {
                     println!("migration {} was already undone", entry.id);
+                } else if entry.cleaned_at.is_some() {
+                    return Err(anyhow::anyhow!(
+                        "migration {} was cleaned up ({}); its preserved original \
+                         is gone, so undo is no longer available. The migrated data \
+                         at the destination is unaffected.",
+                        entry.id,
+                        entry.cleaned_at.as_deref().unwrap_or("")
+                    ));
                 } else {
                     let plan: sessionguard::migrate::MigrationUndo =
                         serde_json::from_str(&entry.undo_plan).map_err(|e| {
