@@ -168,14 +168,20 @@ pub enum Command {
         format: Format,
     },
 
-    /// Undo previous reconciliation actions from the event log.
+    /// Undo previous reconciliation actions or a completed migration.
+    ///
+    /// With no flags, undoes the most recent pending migration if one
+    /// exists, otherwise the last reconciliation action.
     Undo {
-        /// Undo the last N actions. Default: 1.
+        /// Undo the last N reconciliation actions. Default: 1.
         #[arg(long, default_value = "1")]
         last: usize,
-        /// Undo a specific event by id (mutually exclusive with --last).
+        /// Undo a specific reconciliation event by id.
         #[arg(long)]
         id: Option<i64>,
+        /// Undo a specific migration by id (from the migration log).
+        #[arg(long)]
+        migration: Option<i64>,
         /// Show what would be undone without modifying anything.
         #[arg(long)]
         dry_run: bool,
