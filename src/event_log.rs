@@ -61,6 +61,9 @@ pub struct MigrationLogEntry {
     pub undo_plan: String,
     /// `Some(timestamp)` once reversed via `sessionguard undo`.
     pub undone_at: Option<String>,
+    /// `Some(timestamp)` once the preserved original was deleted via
+    /// `sessionguard migrate-cleanup`. After this, undo is unavailable.
+    pub cleaned_at: Option<String>,
 }
 
 /// Structured event log backed by SQLite.
@@ -143,6 +146,12 @@ impl EventLog {
             CREATE INDEX IF NOT EXISTS idx_migrations_undone ON migrations(undone_at);
             ",
         )?;
+
+        // Step 5: `cleaned_at` records when `sessionguard migrate-cleanup`
+        // deleted the preserved original. Idempotent add-column for DBs
+        // created by v0.4.0 before this column existed (the events-table
+        // pattern; see `add_column_if_missing`).
+        self.add_column_if_missing("migrations", "cleaned_at", "TEXT")?;
         Ok(())
     }
 
@@ -283,7 +292,7 @@ impl EventLog {
     /// ordered by insertion order (`id DESC`).
     pub fn recent_migrations(&self, limit: usize) -> Result<Vec<MigrationLogEntry>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
+            "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at, cleaned_at
              FROM migrations ORDER BY id DESC LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], row_to_migration)?;
@@ -300,8 +309,8 @@ impl EventLog {
         let row = self
             .conn
             .query_row(
-                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
-                 FROM migrations WHERE undone_at IS NULL
+                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at, cleaned_at
+                 FROM migrations WHERE undone_at IS NULL AND cleaned_at IS NULL
                  ORDER BY id DESC LIMIT 1",
                 [],
                 row_to_migration,
@@ -315,7 +324,7 @@ impl EventLog {
         let row = self
             .conn
             .query_row(
-                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
+                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at, cleaned_at
                  FROM migrations WHERE id = ?1",
                 params![id],
                 row_to_migration,
@@ -333,6 +342,35 @@ impl EventLog {
         )?;
         Ok(())
     }
+
+    /// Migrations whose preserved original is still on disk and thus
+    /// cleanable: not undone (undo already consumed the sidecar) and not
+    /// already cleaned. Ordered `id DESC`.
+    pub fn cleanable_migrations(&self, limit: usize) -> Result<Vec<MigrationLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at, cleaned_at
+             FROM migrations
+             WHERE undone_at IS NULL AND cleaned_at IS NULL
+             ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_migration)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    /// Mark a migration's preserved original as cleaned up. Idempotent.
+    /// After this, `undo` for the migration is no longer possible.
+    pub fn mark_migration_cleaned(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE migrations SET cleaned_at = datetime('now')
+             WHERE id = ?1 AND cleaned_at IS NULL",
+            params![id],
+        )?;
+        Ok(())
+    }
 }
 
 fn row_to_migration(row: &rusqlite::Row<'_>) -> rusqlite::Result<MigrationLogEntry> {
@@ -344,6 +382,7 @@ fn row_to_migration(row: &rusqlite::Row<'_>) -> rusqlite::Result<MigrationLogEnt
         dst: PathBuf::from(row.get::<_, String>(4)?),
         undo_plan: row.get(5)?,
         undone_at: row.get(6)?,
+        cleaned_at: row.get(7)?,
     })
 }
 
@@ -470,6 +509,56 @@ mod tests {
         // Undo the last one → none pending.
         log.mark_migration_undone(first).unwrap();
         assert!(log.latest_pending_migration().unwrap().is_none());
+    }
+
+    #[test]
+    fn cleanable_excludes_undone_and_cleaned() {
+        let log = EventLog::open_in_memory().unwrap();
+        let a = log
+            .record_migration("t", Path::new("/a"), Path::new("/A"), "{}")
+            .unwrap();
+        let b = log
+            .record_migration("t", Path::new("/b"), Path::new("/B"), "{}")
+            .unwrap();
+        let c = log
+            .record_migration("t", Path::new("/c"), Path::new("/C"), "{}")
+            .unwrap();
+
+        // All three start cleanable (newest first).
+        let ids: Vec<i64> = log
+            .cleanable_migrations(10)
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![c, b, a]);
+
+        // Undone migrations drop out (their sidecar is already gone).
+        log.mark_migration_undone(b).unwrap();
+        // Cleaned migrations drop out too.
+        log.mark_migration_cleaned(c).unwrap();
+        assert!(log.get_migration(c).unwrap().unwrap().cleaned_at.is_some());
+
+        let ids: Vec<i64> = log
+            .cleanable_migrations(10)
+            .unwrap()
+            .iter()
+            .map(|m| m.id)
+            .collect();
+        assert_eq!(ids, vec![a]);
+    }
+
+    #[test]
+    fn mark_migration_cleaned_is_idempotent() {
+        let log = EventLog::open_in_memory().unwrap();
+        let id = log
+            .record_migration("t", Path::new("/a"), Path::new("/b"), "{}")
+            .unwrap();
+        log.mark_migration_cleaned(id).unwrap();
+        let first = log.get_migration(id).unwrap().unwrap().cleaned_at;
+        log.mark_migration_cleaned(id).unwrap();
+        let second = log.get_migration(id).unwrap().unwrap().cleaned_at;
+        assert_eq!(first, second);
     }
 
     #[test]
