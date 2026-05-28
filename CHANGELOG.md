@@ -2,6 +2,51 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.4.0] - 2026-05-28
+
+### Features — migrations are reversible
+
+The last deferred piece of v0.4 lands: `sessionguard migrate` is now
+fully undoable, completing the migrate feature end-to-end (real
+migrations across all three discovery branches + a one-command undo).
+
+- **Migration log.** Every successful real migration is recorded to a
+  new `migrations` table in the event log, alongside a self-contained
+  JSON undo plan. The table is intentionally decoupled from the migrate
+  engine — it stores the plan as an opaque blob so the log has no
+  dependency on the state machine's types.
+- **`sessionguard undo` reverses a migration.** Inverts the forward
+  pipeline in dependency order: quiesce → reverse rewrite (remove
+  symlink / restore config backups / uninstall systemd drop-in) →
+  restore the source from its `.migrated-<unix>` sidecar → remove the
+  orphaned copy at the destination → resume. With no flags, `undo`
+  reverses the most recent pending migration if one exists, otherwise
+  falls back to reconcile-event undo. `--migration <id>` targets a
+  specific migration; `--id` still targets reconcile events.
+  `--dry-run` prints every step without touching the system. Because
+  the source is never deleted, even a failed undo leaves recoverable
+  data.
+- **`sessionguard log` lists migrations** with their ids and undone
+  state, so operators can find the id to pass to `undo --migration`.
+
+### Changed
+
+- `migrate` now prints `run \`sessionguard undo\` to reverse it` after a
+  successful real migration. The stale dry-run notice claiming real
+  migration is "gated until stages 5-7" is gone — it shipped two
+  releases ago.
+
+### Testing
+
+- New round-trip tests prove a symlink-discovery and a config-discovery
+  migration each undo cleanly: the source is restored byte-for-byte and
+  the destination copy is removed. Plus dry-run-undo-is-a-no-op,
+  `undo_plan()` is `None` for dry-runs, and migration-log CRUD +
+  idempotent mark-undone. **117 tests passing total.**
+- Verified end-to-end through the real CLI on macOS: live migrate →
+  `log` → `undo --dry-run` → `undo` (source + nested files restored,
+  dst removed, record marked undone) → re-undo is a clean no-op.
+
 ## [0.3.13] - 2026-05-28
 
 ### Fixed
