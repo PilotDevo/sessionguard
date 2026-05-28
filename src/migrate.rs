@@ -1294,12 +1294,48 @@ pub fn migrate_with_backends(
             var = record.env_var,
             value = record.value
         ),
-        RewriteOutcome::DryRunSkipped => {
-            format!(
-                "dry-run: would install symlink for {:?} discovery",
-                layout.discovery
-            )
-        }
+        RewriteOutcome::DryRunSkipped => match layout.discovery {
+            HomeDirDiscovery::Symlink => format!(
+                "dry-run: would install symlink {} -> {} and preserve original",
+                src.display(),
+                dst.display()
+            ),
+            HomeDirDiscovery::Config => {
+                let n = layout.config_files.len();
+                let files: Vec<String> = layout
+                    .config_files
+                    .iter()
+                    .map(|cf| format!("{} (field `{}`, {})", cf.file, cf.field, cf.format))
+                    .collect();
+                format!(
+                    "dry-run: would rewrite {n} config file(s) [{}]",
+                    files.join(", ")
+                )
+            }
+            HomeDirDiscovery::Env => {
+                let var = layout.env_var.as_deref().unwrap_or("<unset>");
+                let unit = layout
+                    .quiesce
+                    .systemd_user_unit
+                    .as_deref()
+                    .map(|u| format!("--user {u}"))
+                    .or_else(|| {
+                        layout
+                            .quiesce
+                            .systemd_system_unit
+                            .as_deref()
+                            .map(|u| format!("--system {u}"))
+                    })
+                    .unwrap_or_else(|| "<no unit declared — real run would refuse>".into());
+                format!(
+                    "dry-run: would install systemd drop-in for {unit} setting {var}={}",
+                    dst.display()
+                )
+            }
+            HomeDirDiscovery::Compile => {
+                "dry-run: discovery=compile is not migratable (rejected at preflight)".into()
+            }
+        },
         RewriteOutcome::Deferred { reason } => format!("rewrite deferred: {reason}"),
     };
     record(Stage::Rewrite, &rewrite_detail, &mut events);
@@ -2929,5 +2965,73 @@ mod tests {
             RetainOutcome::PreservedInRewrite { aside: a } => assert_eq!(a, aside),
             other => panic!("expected PreservedInRewrite, got {other:?}"),
         }
+    }
+
+    // ── Dry-run rewrite-detail strings are discovery-aware ──────────────
+
+    fn dry_run_rewrite_detail(t: &ToolDefinition) -> String {
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("a", b"x")]);
+        let dst_parent = TempDir::new().unwrap();
+        let dst = dst_parent.path().join("dst");
+        let (ew, _scratch) = fake_env_writer();
+        let result =
+            migrate_with_backends(t, src.path(), &dst, true, &FakeQuiescer::default(), &ew)
+                .unwrap();
+        result
+            .events
+            .iter()
+            .find(|e| e.stage == Stage::Rewrite)
+            .expect("rewrite event present")
+            .detail
+            .clone()
+    }
+
+    #[test]
+    fn dry_run_detail_for_symlink_discovery_mentions_symlink() {
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let d = dry_run_rewrite_detail(&t);
+        assert!(
+            d.contains("would install symlink") && d.contains(" -> "),
+            "got: {d}"
+        );
+    }
+
+    #[test]
+    fn dry_run_detail_for_config_discovery_mentions_config_files() {
+        let tmp = TempDir::new().unwrap();
+        let cfg = tmp.path().join("c.json");
+        std::fs::write(&cfg, "{}").unwrap();
+        let t = config_tool_json(&cfg, "data_dir", "/old");
+        let d = dry_run_rewrite_detail(&t);
+        assert!(
+            d.contains("would rewrite") && d.contains("config file"),
+            "got: {d}"
+        );
+        assert!(d.contains("data_dir"), "should name the field: {d}");
+    }
+
+    #[test]
+    fn dry_run_detail_for_env_discovery_mentions_systemd_drop_in() {
+        let t = tool(
+            HomeDirDiscovery::Env,
+            Some("MYTOOL_HOME"),
+            Some("mytool.service"),
+        );
+        let d = dry_run_rewrite_detail(&t);
+        assert!(d.contains("systemd drop-in"), "got: {d}");
+        assert!(d.contains("--user mytool.service"), "got: {d}");
+        assert!(d.contains("MYTOOL_HOME="), "got: {d}");
+    }
+
+    #[test]
+    fn dry_run_detail_for_env_discovery_without_unit_warns_real_run_would_refuse() {
+        // Tool with discovery=Env but no systemd unit declared — dry-run
+        // should call out that a real run would refuse, so the operator
+        // doesn't think this is ready to ship.
+        let t = tool(HomeDirDiscovery::Env, Some("X_HOME"), None);
+        let d = dry_run_rewrite_detail(&t);
+        assert!(d.contains("no unit declared"), "got: {d}");
+        assert!(d.contains("would refuse"), "got: {d}");
     }
 }
