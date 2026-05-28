@@ -2,6 +2,37 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.3.13] - 2026-05-28
+
+### Fixed
+
+- **Dry-run rewrite detail is now discovery-aware.** Previously every
+  `migrate --dry-run` invocation reported "would install symlink for
+  X discovery" regardless of the actual branch — a small but real lie
+  caught during fedora dogfood smoke. Now each branch reports what
+  *would* actually happen:
+  - **Symlink**: `would install symlink <src> -> <dst> and preserve original`
+  - **Config**: `would rewrite N config file(s) [<file> (field …, json), …]`
+  - **Env**: `would install systemd drop-in for --user <unit> setting <VAR>=<dst>`
+  - **Env without unit**: surfaces `<no unit declared — real run would refuse>`
+    so operators see the preflight refusal before they hit it.
+
+### Dogfood
+
+- v0.3.12 was used to migrate devo's real **21.2 GB / 144,385-file
+  OpenCode store** from `/home/devo/.local/share/opencode` to
+  `/mnt/fastpool/devo/opencode` on fedora — across filesystems, in
+  **94 seconds** (~225 MB/s). All 9 stages walked cleanly; verify
+  matched byte-for-byte; symlink installed and OpenCode 1.1.53 reads
+  through it transparently; original preserved at
+  `opencode.migrated-<unix>` per the never-auto-delete rule.
+  v0.4's state machine is production-real.
+
+### Testing
+
+- 4 new unit tests verifying each discovery's dry-run detail string,
+  including the env-without-unit warning. **110 tests passing total**.
+
 ## [0.3.12] - 2026-05-26
 
 ### Features — `migrate` runs end-to-end now
