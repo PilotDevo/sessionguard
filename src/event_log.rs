@@ -44,6 +44,25 @@ pub struct LogEntry {
     pub undone_at: Option<String>,
 }
 
+/// A logged migration, recoverable via `sessionguard undo`.
+///
+/// `undo_plan` is an opaque JSON string — the caller (the `migrate`
+/// module via `main.rs`) is responsible for serializing/deserializing
+/// it into the concrete undo type. Keeping it opaque here avoids a
+/// circular dependency between the event log and the migrate engine.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub tool_name: String,
+    pub src: PathBuf,
+    pub dst: PathBuf,
+    /// Serialized undo plan (a `migrate::MigrationUndo` as JSON).
+    pub undo_plan: String,
+    /// `Some(timestamp)` once reversed via `sessionguard undo`.
+    pub undone_at: Option<String>,
+}
+
 /// Structured event log backed by SQLite.
 pub struct EventLog {
     conn: Connection,
@@ -103,6 +122,27 @@ impl EventLog {
         // Step 3: now safe to create indexes on the new columns.
         self.conn
             .execute_batch("CREATE INDEX IF NOT EXISTS idx_events_undone ON events(undone_at);")?;
+
+        // Step 4: migration log — one row per completed `sessionguard
+        // migrate`. Decoupled from the `events` table because a migration
+        // is a coarse, multi-stage operation, not a single field rewrite.
+        // `undo_plan` holds an opaque JSON blob (a serialized
+        // `migrate::MigrationUndo`) so this module stays free of any
+        // dependency on the migrate state machine's types.
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS migrations (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
+                tool_name   TEXT NOT NULL,
+                src         TEXT NOT NULL,
+                dst         TEXT NOT NULL,
+                undo_plan   TEXT NOT NULL,
+                undone_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_migrations_undone ON migrations(undone_at);
+            ",
+        )?;
         Ok(())
     }
 
@@ -213,6 +253,98 @@ impl EventLog {
             .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))?;
         Ok(count as usize)
     }
+
+    // ── Migration log ────────────────────────────────────────────────
+
+    /// Record a completed migration. `undo_plan` is an opaque JSON blob
+    /// (a serialized `migrate::MigrationUndo`) used later by undo.
+    /// Returns the new row id.
+    pub fn record_migration(
+        &self,
+        tool_name: &str,
+        src: &Path,
+        dst: &Path,
+        undo_plan: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO migrations (tool_name, src, dst, undo_plan)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![
+                tool_name,
+                src.to_string_lossy().as_ref(),
+                dst.to_string_lossy().as_ref(),
+                undo_plan,
+            ],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Most recent N migration records (regardless of undone state),
+    /// ordered by insertion order (`id DESC`).
+    pub fn recent_migrations(&self, limit: usize) -> Result<Vec<MigrationLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
+             FROM migrations ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map(params![limit as i64], row_to_migration)?;
+        let mut entries = Vec::new();
+        for row in rows {
+            entries.push(row?);
+        }
+        Ok(entries)
+    }
+
+    /// The most recent migration that has NOT yet been undone, if any.
+    /// Used by `sessionguard undo` to find the reversal candidate.
+    pub fn latest_pending_migration(&self) -> Result<Option<MigrationLogEntry>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
+                 FROM migrations WHERE undone_at IS NULL
+                 ORDER BY id DESC LIMIT 1",
+                [],
+                row_to_migration,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Fetch a specific migration by id. `Ok(None)` if no row matches.
+    pub fn get_migration(&self, id: i64) -> Result<Option<MigrationLogEntry>> {
+        let row = self
+            .conn
+            .query_row(
+                "SELECT id, timestamp, tool_name, src, dst, undo_plan, undone_at
+                 FROM migrations WHERE id = ?1",
+                params![id],
+                row_to_migration,
+            )
+            .optional()?;
+        Ok(row)
+    }
+
+    /// Mark a migration as undone. Idempotent — a second call is a no-op.
+    pub fn mark_migration_undone(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE migrations SET undone_at = datetime('now')
+             WHERE id = ?1 AND undone_at IS NULL",
+            params![id],
+        )?;
+        Ok(())
+    }
+}
+
+fn row_to_migration(row: &rusqlite::Row<'_>) -> rusqlite::Result<MigrationLogEntry> {
+    Ok(MigrationLogEntry {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        tool_name: row.get(2)?,
+        src: PathBuf::from(row.get::<_, String>(3)?),
+        dst: PathBuf::from(row.get::<_, String>(4)?),
+        undo_plan: row.get(5)?,
+        undone_at: row.get(6)?,
+    })
 }
 
 fn row_to_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<LogEntry> {
@@ -292,5 +424,64 @@ mod tests {
     fn get_returns_none_for_missing_id() {
         let log = EventLog::open_in_memory().unwrap();
         assert!(log.get(999).unwrap().is_none());
+    }
+
+    #[test]
+    fn migration_round_trip() {
+        let log = EventLog::open_in_memory().unwrap();
+        let id = log
+            .record_migration(
+                "opencode",
+                Path::new("/home/u/.local/share/opencode"),
+                Path::new("/pool/opencode"),
+                "{\"tool_name\":\"opencode\"}",
+            )
+            .unwrap();
+        assert!(id > 0);
+
+        let got = log.get_migration(id).unwrap().unwrap();
+        assert_eq!(got.tool_name, "opencode");
+        assert_eq!(got.dst, PathBuf::from("/pool/opencode"));
+        assert_eq!(got.undo_plan, "{\"tool_name\":\"opencode\"}");
+        assert!(got.undone_at.is_none());
+
+        let recent = log.recent_migrations(10).unwrap();
+        assert_eq!(recent.len(), 1);
+        assert_eq!(recent[0].id, id);
+    }
+
+    #[test]
+    fn latest_pending_migration_skips_undone() {
+        let log = EventLog::open_in_memory().unwrap();
+        let first = log
+            .record_migration("codex", Path::new("/a"), Path::new("/b"), "{}")
+            .unwrap();
+        let second = log
+            .record_migration("opencode", Path::new("/c"), Path::new("/d"), "{}")
+            .unwrap();
+
+        // Newest pending is `second`.
+        assert_eq!(log.latest_pending_migration().unwrap().unwrap().id, second);
+
+        // Undo it → falls back to `first`.
+        log.mark_migration_undone(second).unwrap();
+        assert_eq!(log.latest_pending_migration().unwrap().unwrap().id, first);
+
+        // Undo the last one → none pending.
+        log.mark_migration_undone(first).unwrap();
+        assert!(log.latest_pending_migration().unwrap().is_none());
+    }
+
+    #[test]
+    fn mark_migration_undone_is_idempotent() {
+        let log = EventLog::open_in_memory().unwrap();
+        let id = log
+            .record_migration("codex", Path::new("/a"), Path::new("/b"), "{}")
+            .unwrap();
+        log.mark_migration_undone(id).unwrap();
+        let first_ts = log.get_migration(id).unwrap().unwrap().undone_at;
+        log.mark_migration_undone(id).unwrap();
+        let second_ts = log.get_migration(id).unwrap().unwrap().undone_at;
+        assert_eq!(first_ts, second_ts, "undone_at must not change on repeat");
     }
 }
