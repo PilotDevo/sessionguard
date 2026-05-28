@@ -147,10 +147,9 @@ pub enum Command {
         format: Format,
     },
 
-    /// **EXPERIMENTAL (v0.4 in flight).** Migrate a tool's home-dir data
-    /// to a new location. Only `--dry-run` works today — real
-    /// migrations are gated until the rewrite / resume / validate
-    /// stages land. See `docs/design/migrate.md` for the design.
+    /// Migrate a tool's home-dir data to a new location, preserving the
+    /// original. Runs the full state machine and records a reversible
+    /// migration (`sessionguard undo`). See `docs/design/migrate.md`.
     Migrate {
         /// Tool name to migrate (e.g. `codex`, `opencode`).
         tool: String,
@@ -158,14 +157,29 @@ pub enum Command {
         /// to overwrite an existing path.
         #[arg(long)]
         to: PathBuf,
-        /// Walk every implemented stage of the state machine without
-        /// touching the filesystem. Today this is the only supported
-        /// mode; a real migration without `--dry-run` errors out.
+        /// Walk every stage of the state machine without touching the
+        /// filesystem — a preview of exactly what a real run would do.
         #[arg(long)]
         dry_run: bool,
         /// Output format for the per-stage event log.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+    },
+
+    /// Reclaim space from completed migrations by deleting the preserved
+    /// originals (the `.migrated-<unix>` sidecars and config backups).
+    ///
+    /// Reports what's reclaimable by default. Pass `--execute` to delete.
+    /// Cleaning a migration makes it un-undoable, but never touches the
+    /// live data at the destination.
+    MigrateCleanup {
+        /// Clean only this migration id (from `sessionguard log`).
+        /// Without it, all cleanable migrations are considered.
+        #[arg(long)]
+        migration: Option<i64>,
+        /// Actually delete. Without this flag, cleanup only reports.
+        #[arg(long)]
+        execute: bool,
     },
 
     /// Undo previous reconciliation actions or a completed migration.

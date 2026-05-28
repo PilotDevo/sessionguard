@@ -1039,6 +1039,101 @@ pub fn undo_migration(
     Ok(MigrationUndoReport { dry_run, steps })
 }
 
+impl MigrationUndo {
+    /// Filesystem paths this migration preserved that `migrate-cleanup`
+    /// can reclaim once the operator trusts the new location: the
+    /// moved-aside original directory plus any config-file backups.
+    ///
+    /// Deleting these makes the migration un-undoable — but the *live*
+    /// data at `dst` is untouched, so it's never destructive to the
+    /// working copy.
+    pub fn preserved_paths(&self) -> Vec<PathBuf> {
+        let mut paths = Vec::new();
+        // Config/Env discovery: src was renamed aside in Retain.
+        if let Some(sidecar) = &self.retained_at {
+            paths.push(sidecar.clone());
+        }
+        match &self.rewrite_outcome {
+            // Symlink discovery: the original lives at moved_aside.
+            RewriteOutcome::SymlinkInstalled {
+                moved_aside: Some(p),
+                ..
+            } => paths.push(p.clone()),
+            // Config discovery also kept timestamped config backups.
+            RewriteOutcome::ConfigEdited { backups } => {
+                for b in backups {
+                    paths.push(b.backup.clone());
+                }
+            }
+            _ => {}
+        }
+        paths
+    }
+}
+
+/// One reclaimable artifact from `migrate-cleanup`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupItem {
+    pub path: PathBuf,
+    /// Size on disk (recursive for directories). `0` if already gone.
+    pub bytes: u64,
+    /// Whether the path was present when cleanup ran.
+    pub existed: bool,
+    /// Whether cleanup actually removed it (`false` for dry-run / absent).
+    pub removed: bool,
+}
+
+/// What [`cleanup_migration`] did (or would do under `--dry-run`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CleanupReport {
+    pub dry_run: bool,
+    pub items: Vec<CleanupItem>,
+}
+
+impl CleanupReport {
+    /// Total bytes reclaimed (or reclaimable, in dry-run).
+    pub fn total_bytes(&self) -> u64 {
+        self.items.iter().map(|i| i.bytes).sum()
+    }
+}
+
+/// Delete the artifacts a completed migration preserved (the moved-aside
+/// original + config backups). Never touches the live data at `dst`.
+/// `dry_run` reports what would be removed without deleting anything.
+pub fn cleanup_migration(
+    plan: &MigrationUndo,
+    dry_run: bool,
+) -> Result<CleanupReport, MigrateError> {
+    let mut items = Vec::new();
+    for p in plan.preserved_paths() {
+        let is_symlink = p.is_symlink();
+        let existed = p.exists() || is_symlink;
+        let bytes = if !existed {
+            0
+        } else if p.is_dir() && !is_symlink {
+            walk_size(&p).1
+        } else {
+            std::fs::symlink_metadata(&p).map(|m| m.len()).unwrap_or(0)
+        };
+        let mut removed = false;
+        if existed && !dry_run {
+            if p.is_dir() && !is_symlink {
+                std::fs::remove_dir_all(&p)?;
+            } else {
+                std::fs::remove_file(&p)?;
+            }
+            removed = true;
+        }
+        items.push(CleanupItem {
+            path: p,
+            bytes,
+            existed,
+            removed,
+        });
+    }
+    Ok(CleanupReport { dry_run, items })
+}
+
 /// One-liner describing a rewrite outcome for undo reporting.
 fn describe_rewrite_for_undo(outcome: &RewriteOutcome) -> String {
     match outcome {
@@ -3350,5 +3445,98 @@ mod tests {
             .file_type()
             .is_symlink());
         assert!(dst.exists(), "dry-run undo must not remove dst");
+    }
+
+    // ── migrate-cleanup ──────────────────────────────────────────────
+
+    #[cfg(unix)]
+    #[test]
+    fn cleanup_symlink_removes_sidecar_but_keeps_live_data() {
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let parent = TempDir::new().unwrap();
+        let src = parent.path().join("src-dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"payload-1234").unwrap();
+        let dst = parent.path().join("new-home");
+
+        let q = FakeQuiescer::default();
+        let (ew, _s) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        let plan = result.undo_plan().unwrap();
+
+        // The preserved path is the moved-aside original.
+        let preserved = plan.preserved_paths();
+        assert_eq!(preserved.len(), 1);
+        assert!(preserved[0].exists());
+
+        // Dry-run reports a non-zero reclaim and removes nothing.
+        let dry = cleanup_migration(&plan, true).unwrap();
+        assert!(dry.dry_run);
+        assert!(dry.total_bytes() > 0);
+        assert!(preserved[0].exists(), "dry-run must not delete");
+
+        // Live run deletes the sidecar; the symlink + dst stay intact.
+        let report = cleanup_migration(&plan, false).unwrap();
+        assert!(report.items.iter().all(|i| i.removed));
+        assert!(!preserved[0].exists(), "sidecar should be gone");
+        assert!(std::fs::symlink_metadata(&src)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(dst.join("a.txt").exists(), "live data must survive cleanup");
+    }
+
+    #[test]
+    fn cleanup_config_removes_sidecar_and_backups() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data-src");
+        let dst = tmp.path().join("data-dst");
+        let cfg = tmp.path().join("tool.json");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hi").unwrap();
+        std::fs::write(&cfg, format!(r#"{{"data_dir": "{}"}}"#, src.display())).unwrap();
+
+        let t = config_tool_json(&cfg, "data_dir", &src.display().to_string());
+        let q = FakeQuiescer::default();
+        let (ew, _s) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        let plan = result.undo_plan().unwrap();
+
+        // Preserved: the renamed-aside src sidecar + the config backup.
+        let preserved = plan.preserved_paths();
+        assert_eq!(preserved.len(), 2, "src sidecar + one config backup");
+        assert!(preserved.iter().all(|p| p.exists()));
+
+        cleanup_migration(&plan, false).unwrap();
+        assert!(
+            preserved.iter().all(|p| !p.exists()),
+            "all preserved artifacts removed"
+        );
+        // The config file itself (live) is untouched and still points at dst.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["data_dir"], dst.display().to_string());
+    }
+
+    #[test]
+    fn cleanup_is_idempotent_when_already_gone() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data-src");
+        let dst = tmp.path().join("data-dst");
+        let cfg = tmp.path().join("tool.json");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hi").unwrap();
+        std::fs::write(&cfg, format!(r#"{{"data_dir": "{}"}}"#, src.display())).unwrap();
+        let t = config_tool_json(&cfg, "data_dir", &src.display().to_string());
+        let q = FakeQuiescer::default();
+        let (ew, _s) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        let plan = result.undo_plan().unwrap();
+
+        cleanup_migration(&plan, false).unwrap();
+        // Second pass: everything already gone, reports existed=false, no error.
+        let again = cleanup_migration(&plan, false).unwrap();
+        assert!(again.items.iter().all(|i| !i.existed && !i.removed));
+        assert_eq!(again.total_bytes(), 0);
     }
 }

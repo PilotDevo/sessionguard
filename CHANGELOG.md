@@ -2,6 +2,24 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.4.1] - 2026-05-28
+
+### Features — reclaim space from completed migrations
+
+`sessionguard migrate` never auto-deletes the original: it preserves it
+at a `.migrated-<unix>` sidecar (plus any config backups) so a migration
+stays reversible. This release adds the operator-driven companion to that
+rule — a way to reclaim that space once you're confident the move stuck.
+
+- **`sessionguard migrate-cleanup`.** Reports the reclaimable preserved
+  originals (sidecars + consumed config backups) with per-item sizes by
+  default; pass `--execute` to delete them. `--migration <id>` scopes the
+  cleanup to one migration; without it, all cleanable migrations are
+  considered. The live migrated data at the destination is never touched.
+- **Cleaning makes a migration un-undoable, by design.** Once cleaned,
+  `undo --migration <id>` refuses with a clear message, bare `undo` skips
+  the migration, and `log` labels it `(cleaned — not undoable)`.
+
 ## [0.4.0] - 2026-05-28
 
 ### Features — migrations are reversible
