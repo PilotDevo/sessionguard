@@ -88,6 +88,57 @@ pub struct MigrationResult {
     /// know what to bring back up.
     #[serde(default)]
     pub resume_action: ResumeAction,
+    /// What Rewrite did, retained so `sessionguard undo` can reverse it.
+    /// `None` on a dry-run or a run that aborted before Rewrite.
+    #[serde(default)]
+    pub rewrite_outcome: Option<RewriteOutcome>,
+    /// Where the source ended up after Retain (the `.migrated-<unix>`
+    /// sidecar). `undo` renames this back to `src`. `None` for dry-runs
+    /// and for runs where the source was never moved aside.
+    #[serde(default)]
+    pub retained_at: Option<PathBuf>,
+}
+
+/// The minimal, self-contained set of facts `sessionguard undo` needs
+/// to reverse a completed migration. Serialized to JSON and stored in
+/// the event log's `migrations` table; deserialized at undo time and
+/// fed to [`undo_migration`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MigrationUndo {
+    pub tool_name: String,
+    pub src: PathBuf,
+    pub dst: PathBuf,
+    /// How Rewrite mutated the system, so we can invert it.
+    pub rewrite_outcome: RewriteOutcome,
+    /// The `.migrated-<unix>` path the source was renamed to (Config/Env
+    /// discovery). `None` for Symlink discovery, where `rewrite_outcome`
+    /// already carries the moved-aside path.
+    pub retained_at: Option<PathBuf>,
+}
+
+impl MigrationResult {
+    /// Build the undo plan for a successful real migration, or `None`
+    /// if this result isn't reversible (dry-run, failure, or a rewrite
+    /// outcome that left nothing to undo).
+    pub fn undo_plan(&self) -> Option<MigrationUndo> {
+        if self.dry_run || !self.success {
+            return None;
+        }
+        let rewrite_outcome = self.rewrite_outcome.clone()?;
+        if matches!(
+            rewrite_outcome,
+            RewriteOutcome::DryRunSkipped | RewriteOutcome::Deferred { .. }
+        ) {
+            return None;
+        }
+        Some(MigrationUndo {
+            tool_name: self.tool_name.clone(),
+            src: self.src.clone(),
+            dst: self.dst.clone(),
+            rewrite_outcome,
+            retained_at: self.retained_at.clone(),
+        })
+    }
 }
 
 /// What `sessionguard migrate` should refuse to do until stages 5–7
@@ -870,6 +921,147 @@ fn undo_rewrite(outcome: &RewriteOutcome, env_writer: &dyn EnvWriter) -> Result<
     }
 }
 
+// ── Undo a completed migration ───────────────────────────────────────────
+
+/// What [`undo_migration`] did, for reporting to the operator.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MigrationUndoReport {
+    /// `true` when invoked with `--dry-run` — no side effects taken.
+    pub dry_run: bool,
+    /// Human-readable steps performed (or that would be performed).
+    pub steps: Vec<String>,
+}
+
+/// Reverse a completed migration recorded in the event log.
+///
+/// The inverse of the forward state machine, in dependency order:
+/// 1. **Quiesce** — stop whatever came up reading `dst`.
+/// 2. **Reverse Rewrite** — remove the symlink / restore config backups
+///    / uninstall the systemd drop-in (via [`undo_rewrite`]).
+/// 3. **Restore source** — for Config/Env discovery, rename the
+///    `.migrated-<unix>` sidecar back to `src` (Symlink discovery already
+///    restored `src` in step 2).
+/// 4. **Remove dst** — the now-orphaned copy at the new location.
+/// 5. **Resume** — start the unit back up.
+///
+/// `dry_run` walks every step without touching the system. Failures in
+/// the destructive middle are surfaced; the source is never deleted, so
+/// the worst case still leaves the operator with recoverable data.
+pub fn undo_migration(
+    plan: &MigrationUndo,
+    layout: &crate::tools::HomeDirLayout,
+    quiescer: &dyn Quiescer,
+    env_writer: &dyn EnvWriter,
+    dry_run: bool,
+) -> Result<MigrationUndoReport, MigrateError> {
+    let mut steps: Vec<String> = Vec::new();
+
+    // 1. Quiesce — stop the service so nothing is reading `dst` while we
+    //    pull it out from under it. Capture the resume action for step 5.
+    let (_q, resume_action) = quiescer.quiesce(layout, dry_run)?;
+    steps.push(match &resume_action {
+        ResumeAction::StartUnit { scope, unit } => {
+            format!("quiesced {scope} unit `{unit}` (will resume after)")
+        }
+        ResumeAction::None => "no unit to quiesce".into(),
+    });
+
+    // 2. Reverse the Rewrite.
+    if dry_run {
+        steps.push(format!(
+            "dry-run: would reverse rewrite ({})",
+            describe_rewrite_for_undo(&plan.rewrite_outcome)
+        ));
+    } else {
+        undo_rewrite(&plan.rewrite_outcome, env_writer)?;
+        steps.push(format!(
+            "reversed rewrite ({})",
+            describe_rewrite_for_undo(&plan.rewrite_outcome)
+        ));
+    }
+
+    // 3. Restore the source for Config/Env discovery. Only act when the
+    //    source slot is free (Symlink discovery already restored it in
+    //    step 2, leaving `src` present).
+    if let Some(sidecar) = &plan.retained_at {
+        if dry_run {
+            steps.push(format!(
+                "dry-run: would rename {} back to {}",
+                sidecar.display(),
+                plan.src.display()
+            ));
+        } else if !plan.src.exists() && sidecar.exists() {
+            std::fs::rename(sidecar, &plan.src)?;
+            steps.push(format!(
+                "restored source {} from {}",
+                plan.src.display(),
+                sidecar.display()
+            ));
+        } else {
+            steps.push(format!(
+                "source {} already present; left sidecar {} in place",
+                plan.src.display(),
+                sidecar.display()
+            ));
+        }
+    }
+
+    // 4. Remove the orphaned copy at `dst`.
+    if dry_run {
+        steps.push(format!(
+            "dry-run: would remove copy at {}",
+            plan.dst.display()
+        ));
+    } else if plan.dst.exists() {
+        std::fs::remove_dir_all(&plan.dst).map_err(|e| {
+            MigrateError::StageFailed(
+                Stage::Copy,
+                format!("undo: failed to remove dst `{}`: {e}", plan.dst.display()),
+            )
+        })?;
+        steps.push(format!("removed copy at {}", plan.dst.display()));
+    } else {
+        steps.push(format!("copy at {} already gone", plan.dst.display()));
+    }
+
+    // 5. Resume — bring the service back up against the restored source.
+    quiescer.resume(&resume_action, dry_run)?;
+    steps.push(match (&resume_action, dry_run) {
+        (ResumeAction::StartUnit { scope, unit }, false) => {
+            format!("resumed {scope} unit `{unit}`")
+        }
+        (ResumeAction::StartUnit { scope, unit }, true) => {
+            format!("dry-run: would resume {scope} unit `{unit}`")
+        }
+        (ResumeAction::None, _) => "nothing to resume".into(),
+    });
+
+    Ok(MigrationUndoReport { dry_run, steps })
+}
+
+/// One-liner describing a rewrite outcome for undo reporting.
+fn describe_rewrite_for_undo(outcome: &RewriteOutcome) -> String {
+    match outcome {
+        RewriteOutcome::SymlinkInstalled { canonical, .. } => {
+            format!(
+                "remove symlink {} and restore original",
+                canonical.display()
+            )
+        }
+        RewriteOutcome::ConfigEdited { backups } => {
+            format!("restore {} config backup(s)", backups.len())
+        }
+        RewriteOutcome::EnvOverridden { record } => {
+            format!(
+                "uninstall systemd drop-in {}",
+                record.drop_in_path.display()
+            )
+        }
+        RewriteOutcome::DryRunSkipped => "nothing (dry-run rewrite)".into(),
+        RewriteOutcome::Deferred { reason } => format!("nothing (deferred: {reason})"),
+    }
+}
+
 // ── Validate (stage 7) ────────────────────────────────────────────────────
 
 /// Outcome of running the layout's optional `validate.command`.
@@ -1466,6 +1658,15 @@ pub fn migrate_with_backends(
     // Stage 9: done — terminal event so dashboards can stop polling.
     record(Stage::Done, "migration complete", &mut events);
 
+    // For Config/Env discovery the source was renamed aside in Retain;
+    // capture that path so `undo` can move it back. Symlink discovery
+    // carries its moved-aside path inside `rewrite_outcome` instead, so
+    // we leave `retained_at` None there to avoid double-restoring.
+    let retained_at = match &retain_outcome {
+        RetainOutcome::RenamedAside { to, .. } => Some(to.clone()),
+        _ => None,
+    };
+
     Ok(MigrationResult {
         tool_name: tool.name.clone(),
         src: src.to_path_buf(),
@@ -1476,6 +1677,8 @@ pub fn migrate_with_backends(
         events,
         error: None,
         resume_action,
+        rewrite_outcome: Some(rewrite_outcome),
+        retained_at,
     })
 }
 
@@ -3033,5 +3236,119 @@ mod tests {
         let d = dry_run_rewrite_detail(&t);
         assert!(d.contains("no unit declared"), "got: {d}");
         assert!(d.contains("would refuse"), "got: {d}");
+    }
+
+    // ── Undo of a completed migration ────────────────────────────────
+
+    #[test]
+    fn undo_plan_is_none_for_dry_run() {
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let parent = TempDir::new().unwrap();
+        let src = parent.path().join("src-dir");
+        std::fs::create_dir_all(&src).unwrap();
+        let dst = parent.path().join("new-home");
+        let q = FakeQuiescer::default();
+        let (ew, _s) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, true, &q, &ew).unwrap();
+        assert!(
+            result.undo_plan().is_none(),
+            "a dry-run migration is not reversible"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_migration_symlink_round_trips() {
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let parent = TempDir::new().unwrap();
+        let src = parent.path().join("src-dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"payload").unwrap();
+        let dst = parent.path().join("new-home");
+
+        let q = FakeQuiescer::default();
+        let (ew, _scratch) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        assert!(result.success);
+        // Sanity: src is a symlink to dst after a successful migrate.
+        assert!(std::fs::symlink_metadata(&src)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+
+        let plan = result
+            .undo_plan()
+            .expect("a successful real migration should be reversible");
+        let layout = t.home_dir_layout.as_ref().unwrap();
+        let report = undo_migration(&plan, layout, &q, &ew, false).unwrap();
+        assert!(!report.dry_run);
+
+        // src is a real directory again with original content; the
+        // orphaned copy at dst is removed.
+        let meta = std::fs::symlink_metadata(&src).unwrap();
+        assert!(meta.is_dir() && !meta.file_type().is_symlink());
+        assert_eq!(
+            std::fs::read_to_string(src.join("a.txt")).unwrap(),
+            "payload"
+        );
+        assert!(!dst.exists(), "copy at dst should be removed by undo");
+    }
+
+    #[test]
+    fn undo_migration_config_round_trips() {
+        let tmp = TempDir::new().unwrap();
+        let src = tmp.path().join("data-src");
+        let dst = tmp.path().join("data-dst");
+        let cfg = tmp.path().join("tool.json");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a"), b"hello").unwrap();
+        std::fs::write(&cfg, format!(r#"{{"data_dir": "{}"}}"#, src.display())).unwrap();
+
+        let t = config_tool_json(&cfg, "data_dir", &src.display().to_string());
+        let q = FakeQuiescer::default();
+        let (ew, _scratch) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        assert!(result.success);
+        assert!(!src.exists(), "src renamed aside by Retain after migrate");
+
+        let plan = result.undo_plan().expect("config migration is reversible");
+        let layout = t.home_dir_layout.as_ref().unwrap();
+        undo_migration(&plan, layout, &q, &ew, false).unwrap();
+
+        // src restored from the .migrated sidecar with original content.
+        assert!(src.exists(), "src should be restored by undo");
+        assert_eq!(std::fs::read_to_string(src.join("a")).unwrap(), "hello");
+        // config points back to the original src.
+        let v: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&cfg).unwrap()).unwrap();
+        assert_eq!(v["data_dir"], src.display().to_string());
+        // the copy at dst is removed.
+        assert!(!dst.exists(), "copy at dst should be removed by undo");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn undo_migration_dry_run_takes_no_action() {
+        let t = tool(HomeDirDiscovery::Symlink, None, None);
+        let parent = TempDir::new().unwrap();
+        let src = parent.path().join("src-dir");
+        std::fs::create_dir_all(&src).unwrap();
+        std::fs::write(src.join("a.txt"), b"payload").unwrap();
+        let dst = parent.path().join("new-home");
+
+        let q = FakeQuiescer::default();
+        let (ew, _scratch) = fake_env_writer();
+        let result = migrate_with_backends(&t, &src, &dst, false, &q, &ew).unwrap();
+        let plan = result.undo_plan().unwrap();
+        let layout = t.home_dir_layout.as_ref().unwrap();
+
+        let report = undo_migration(&plan, layout, &q, &ew, true).unwrap();
+        assert!(report.dry_run);
+        // Nothing changed: src is still a symlink, dst still present.
+        assert!(std::fs::symlink_metadata(&src)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        assert!(dst.exists(), "dry-run undo must not remove dst");
     }
 }

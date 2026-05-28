@@ -214,6 +214,30 @@ async fn main() -> Result<()> {
                             );
                         }
                     }
+
+                    let migrations = event_log.recent_migrations(last)?;
+                    if !migrations.is_empty() {
+                        println!("\nmigrations:");
+                        for m in &migrations {
+                            let undone = if m.undone_at.is_some() {
+                                " (undone)"
+                            } else {
+                                ""
+                            };
+                            println!(
+                                "[{}] #{} migrate {} :: {} -> {}{}",
+                                m.timestamp,
+                                m.id,
+                                m.tool_name,
+                                m.src.display(),
+                                m.dst.display(),
+                                undone
+                            );
+                        }
+                        println!(
+                            "\n(reverse a migration with `sessionguard undo --migration <id>`)"
+                        );
+                    }
                 }
             }
         }
@@ -484,28 +508,44 @@ async fn main() -> Result<()> {
             let src = sessionguard::inventory::expand_home(&layout.default_path);
 
             match migrate::migrate(tool_def, &src, &to, dry_run) {
-                Ok(result) => match format {
-                    sessionguard::cli::Format::Json => {
-                        println!("{}", serde_json::to_string_pretty(&result)?);
+                Ok(result) => {
+                    // Persist a reversible record for a successful real
+                    // migration so `sessionguard undo` can reverse it.
+                    if let Some(plan) = result.undo_plan() {
+                        let event_log = EventLog::open_default()?;
+                        let undo_json = serde_json::to_string(&plan)?;
+                        event_log.record_migration(
+                            &plan.tool_name,
+                            &plan.src,
+                            &plan.dst,
+                            &undo_json,
+                        )?;
                     }
-                    sessionguard::cli::Format::Text => {
-                        let mode = if dry_run { "DRY-RUN" } else { "LIVE" };
-                        println!("{} migrate: {} -> {}", mode, src.display(), to.display());
-                        for e in &result.events {
-                            println!("  [{:?}] {}", e.stage, e.detail);
+                    match format {
+                        sessionguard::cli::Format::Json => {
+                            println!("{}", serde_json::to_string_pretty(&result)?);
                         }
-                        println!(
-                            "\nfinal stage: {:?}  success: {}",
-                            result.final_stage, result.success
-                        );
-                        if result.dry_run {
+                        sessionguard::cli::Format::Text => {
+                            let mode = if dry_run { "DRY-RUN" } else { "LIVE" };
+                            println!("{} migrate: {} -> {}", mode, src.display(), to.display());
+                            for e in &result.events {
+                                println!("  [{:?}] {}", e.stage, e.detail);
+                            }
                             println!(
-                                "\n(dry-run only. Real migration is gated until v0.4 \
-                                 implementation lands stages 5-7.)"
+                                "\nfinal stage: {:?}  success: {}",
+                                result.final_stage, result.success
                             );
+                            if result.dry_run {
+                                println!("\n(dry-run only — no changes were made.)");
+                            } else if result.success {
+                                println!(
+                                    "\nMigration complete. Original preserved; run \
+                                     `sessionguard undo` to reverse it."
+                                );
+                            }
                         }
                     }
-                },
+                }
                 Err(e) => {
                     return Err(anyhow::anyhow!("migrate failed: {e}"));
                 }
@@ -564,8 +604,77 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Undo { last, id, dry_run } => {
+        Command::Undo {
+            last,
+            id,
+            migration,
+            dry_run,
+        } => {
             let event_log = EventLog::open_default()?;
+
+            // Resolve which migration (if any) this invocation targets:
+            //  --migration <id>  → that specific migration
+            //  bare `undo`       → the latest pending migration, if one exists
+            //  --id / --last     → reconciliation events only (never a migration)
+            let target_migration = if let Some(mid) = migration {
+                Some(
+                    event_log
+                        .get_migration(mid)?
+                        .ok_or_else(|| anyhow::anyhow!("no migration with id {mid}"))?,
+                )
+            } else if id.is_none() {
+                event_log.latest_pending_migration()?
+            } else {
+                None
+            };
+
+            if let Some(entry) = target_migration {
+                if entry.undone_at.is_some() {
+                    println!("migration {} was already undone", entry.id);
+                } else {
+                    let plan: sessionguard::migrate::MigrationUndo =
+                        serde_json::from_str(&entry.undo_plan).map_err(|e| {
+                            anyhow::anyhow!("migration {} has a corrupt undo plan: {e}", entry.id)
+                        })?;
+                    let tool_registry = ToolRegistry::new_with_config(&config)?;
+                    let layout = tool_registry
+                        .get(&plan.tool_name)
+                        .and_then(|t| t.home_dir_layout.as_ref())
+                        .ok_or_else(|| {
+                            anyhow::anyhow!(
+                                "tool `{}` is no longer registered or lost its \
+                                 home_dir_layout; cannot undo migration {}",
+                                plan.tool_name,
+                                entry.id
+                            )
+                        })?;
+
+                    println!(
+                        "{} migration {} ({}: {} -> {}):",
+                        if dry_run { "would undo" } else { "undoing" },
+                        entry.id,
+                        plan.tool_name,
+                        plan.src.display(),
+                        plan.dst.display()
+                    );
+                    let report = sessionguard::migrate::undo_migration(
+                        &plan,
+                        layout,
+                        &sessionguard::migrate::SystemdQuiescer,
+                        &sessionguard::migrate::SystemdEnvWriter,
+                        dry_run,
+                    )
+                    .map_err(|e| anyhow::anyhow!("undo failed: {e}"))?;
+                    for step in &report.steps {
+                        println!("  - {step}");
+                    }
+                    if !dry_run {
+                        event_log.mark_migration_undone(entry.id)?;
+                        println!("\nmigration {} undone", entry.id);
+                    }
+                }
+                return Ok(());
+            }
 
             let entries = match id {
                 Some(event_id) => vec![event_log
