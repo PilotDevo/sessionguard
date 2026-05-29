@@ -27,3 +27,15 @@ session_patterns = [
 default_path = "~/.codex"
 discovery = "env"
 env_var = "CODEX_HOME"
+
+# Codex CLI is normally ephemeral (one process per shell), but when it's
+# run under a systemd user service — the typical setup on a server or
+# when migrating its data dir — `sessionguard migrate` writes the
+# `CODEX_HOME` override into that unit's drop-in and stops it for the
+# copy. Declaring the unit here is safe for interactive users too: a
+# not-loaded unit is treated as benign (warn and proceed), and the
+# drop-in is still written so the var takes effect next time Codex runs
+# under the unit. If you only ever run Codex from a plain shell, export
+# CODEX_HOME in your shell rc instead.
+[tool.home_dir_layout.quiesce]
+systemd_user_unit = "codex.service"
