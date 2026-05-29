@@ -26,3 +26,15 @@ session_patterns = [
 [tool.home_dir_layout]
 default_path = "~/.local/share/opencode"
 discovery = "symlink"
+
+# OpenCode keeps its session DB in SQLite with WAL enabled. Copying a
+# live WAL database mid-write risks a torn copy, so when OpenCode runs
+# under a systemd user service we stop it for the duration of the copy
+# and restart it once the symlink is in place. The unit name below is
+# the conventional one; declaring it is safe even if you *don't* run
+# OpenCode under systemd — `sessionguard migrate` treats a not-loaded
+# unit as benign (it warns and proceeds without quiescing). Override
+# the name (or move it to `systemd_system_unit`) via a user/project
+# tool config if your unit differs.
+[tool.home_dir_layout.quiesce]
+systemd_user_unit = "opencode.service"

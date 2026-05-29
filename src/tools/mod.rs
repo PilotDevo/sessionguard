@@ -409,6 +409,13 @@ default_path = "~/.minimal"
         assert_eq!(h.default_path, "~/.codex");
         assert_eq!(h.discovery, HomeDirDiscovery::Env);
         assert_eq!(h.env_var.as_deref(), Some("CODEX_HOME"));
+        // env discovery needs a unit to drop the CODEX_HOME override
+        // into; the builtin declares the conventional user unit.
+        assert_eq!(
+            h.quiesce.systemd_user_unit.as_deref(),
+            Some("codex.service"),
+            "codex builtin must declare a quiesce unit for the env-rewrite drop-in"
+        );
     }
 
     #[test]
@@ -421,6 +428,13 @@ default_path = "~/.minimal"
             .expect("opencode must declare home_dir_layout for v0.4 migrate");
         assert_eq!(h.default_path, "~/.local/share/opencode");
         assert_eq!(h.discovery, HomeDirDiscovery::Symlink);
+        // WAL-safe copy: the builtin declares the conventional user
+        // unit so migrate quiesces OpenCode when it runs under systemd.
+        assert_eq!(
+            h.quiesce.systemd_user_unit.as_deref(),
+            Some("opencode.service"),
+            "opencode builtin must declare a quiesce unit for WAL-safe copy"
+        );
     }
 
     #[test]

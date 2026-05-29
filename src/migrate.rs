@@ -184,6 +184,13 @@ pub enum QuiesceOutcome {
     /// No unit declared — operator was warned to ensure the tool
     /// isn't writing mid-migrate. Migration continues.
     NoUnitWarning,
+    /// A unit *was* declared, but it isn't loaded/known on this host —
+    /// i.e. the tool isn't running under that systemd unit here (the
+    /// common interactive/laptop case). Treated as benign: there is
+    /// nothing to stop, so the migration proceeds and Resume does
+    /// nothing. Distinct from `NoUnitWarning` so the event log can say
+    /// *which* declared unit was absent.
+    UnitAbsent { scope: String, unit: String },
     /// Skipped because dry-run is in effect; no side effects.
     DryRunSkipped,
 }
@@ -231,30 +238,10 @@ impl Quiescer for SystemdQuiescer {
             return Ok((QuiesceOutcome::DryRunSkipped, ResumeAction::None));
         }
         if let Some(unit) = layout.quiesce.systemd_user_unit.as_deref() {
-            run_systemctl(&["--user", "stop", unit])?;
-            return Ok((
-                QuiesceOutcome::UnitStopped {
-                    scope: "user".into(),
-                    unit: unit.into(),
-                },
-                ResumeAction::StartUnit {
-                    scope: "user".into(),
-                    unit: unit.into(),
-                },
-            ));
+            return stop_unit_classified("user", unit);
         }
         if let Some(unit) = layout.quiesce.systemd_system_unit.as_deref() {
-            run_systemctl(&["stop", unit])?;
-            return Ok((
-                QuiesceOutcome::UnitStopped {
-                    scope: "system".into(),
-                    unit: unit.into(),
-                },
-                ResumeAction::StartUnit {
-                    scope: "system".into(),
-                    unit: unit.into(),
-                },
-            ));
+            return stop_unit_classified("system", unit);
         }
         Ok((QuiesceOutcome::NoUnitWarning, ResumeAction::None))
     }
@@ -1294,23 +1281,107 @@ fn retain_source(
     })
 }
 
-fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
+/// A failed `systemctl` invocation, carrying enough detail to classify
+/// the failure (benign "unit absent" vs. a real problem).
+struct SystemctlFail {
+    code: Option<i32>,
+    stderr: String,
+}
+
+/// Raw `systemctl` runner. Returns the structured failure on non-zero
+/// exit (or spawn error) so callers can classify it.
+fn systemctl(args: &[&str]) -> Result<(), SystemctlFail> {
     let output = std::process::Command::new("systemctl")
         .args(args)
-        .output()?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        return Err(MigrateError::StageFailed(
+        .output()
+        .map_err(|e| SystemctlFail {
+            code: None,
+            stderr: e.to_string(),
+        })?;
+    if output.status.success() {
+        Ok(())
+    } else {
+        Err(SystemctlFail {
+            code: output.status.code(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_string(),
+        })
+    }
+}
+
+fn run_systemctl(args: &[&str]) -> Result<(), MigrateError> {
+    systemctl(args).map_err(|f| {
+        MigrateError::StageFailed(
             Stage::Quiesce,
             format!(
                 "systemctl {} exited {}: {}",
                 args.join(" "),
-                output.status.code().unwrap_or(-1),
-                stderr.trim()
+                f.code.unwrap_or(-1),
+                f.stderr
             ),
-        ));
+        )
+    })
+}
+
+/// Classify a failed `systemctl stop`: `true` when the failure merely
+/// means "that unit isn't loaded/known on this host" — i.e. the tool
+/// isn't running under that systemd unit here, so there is nothing to
+/// quiesce and the migration can safely proceed. Real failures
+/// (permission denied, no DBus, etc.) return `false` so they still
+/// abort the migration.
+///
+/// systemd uses LSB exit code 5 for "no such unit"; older/newer
+/// releases vary the wording, so we also match the stderr text.
+fn is_unit_absent_failure(code: Option<i32>, stderr: &str) -> bool {
+    if code == Some(5) {
+        return true;
     }
-    Ok(())
+    let s = stderr.to_ascii_lowercase();
+    s.contains("not loaded")
+        || s.contains("no such unit")
+        || s.contains("not found")
+        || s.contains("unit file") && s.contains("does not exist")
+}
+
+/// Stop a declared unit, classifying the three outcomes: stopped
+/// (record a Resume that restarts it), absent (benign — proceed with no
+/// Resume), or a hard failure (abort).
+fn stop_unit_classified(
+    scope: &str,
+    unit: &str,
+) -> Result<(QuiesceOutcome, ResumeAction), MigrateError> {
+    let args: Vec<&str> = if scope == "user" {
+        vec!["--user", "stop", unit]
+    } else {
+        vec!["stop", unit]
+    };
+    match systemctl(&args) {
+        Ok(()) => Ok((
+            QuiesceOutcome::UnitStopped {
+                scope: scope.into(),
+                unit: unit.into(),
+            },
+            ResumeAction::StartUnit {
+                scope: scope.into(),
+                unit: unit.into(),
+            },
+        )),
+        Err(f) if is_unit_absent_failure(f.code, &f.stderr) => Ok((
+            QuiesceOutcome::UnitAbsent {
+                scope: scope.into(),
+                unit: unit.into(),
+            },
+            ResumeAction::None,
+        )),
+        Err(f) => Err(MigrateError::StageFailed(
+            Stage::Quiesce,
+            format!(
+                "systemctl {} exited {}: {}",
+                args.join(" "),
+                f.code.unwrap_or(-1),
+                f.stderr
+            ),
+        )),
+    }
 }
 
 /// Drive a migration. Set `dry_run = true` to walk every implemented
@@ -1413,6 +1484,12 @@ pub fn migrate_with_backends(
         QuiesceOutcome::NoUnitWarning => {
             "no quiesce hook declared; operator must ensure tool isn't writing mid-migrate"
                 .to_string()
+        }
+        QuiesceOutcome::UnitAbsent { scope, unit } => {
+            format!(
+                "declared systemd {scope} unit `{unit}` is not loaded here; \
+                 nothing to stop — proceeding (ensure the tool isn't writing mid-migrate)"
+            )
         }
         QuiesceOutcome::DryRunSkipped => match (
             layout.quiesce.systemd_user_unit.as_deref(),
@@ -2275,6 +2352,55 @@ mod tests {
         let n = ResumeAction::None;
         let j = serde_json::to_value(&n).unwrap();
         assert_eq!(j["kind"], "none");
+    }
+
+    #[test]
+    fn unit_absent_failures_are_classified_benign() {
+        // The cases that mean "this host doesn't run the tool under that
+        // unit" — benign, migration proceeds.
+        assert!(is_unit_absent_failure(Some(5), ""));
+        assert!(is_unit_absent_failure(
+            Some(1),
+            "Failed to stop opencode.service: Unit opencode.service not loaded."
+        ));
+        assert!(is_unit_absent_failure(
+            Some(1),
+            "Unit codex.service not found."
+        ));
+        assert!(is_unit_absent_failure(
+            None,
+            "Unit file opencode.service does not exist."
+        ));
+        // case-insensitive
+        assert!(is_unit_absent_failure(Some(1), "NO SUCH UNIT"));
+    }
+
+    #[test]
+    fn real_failures_are_not_classified_benign() {
+        // These must still abort the migration — they are not "the unit
+        // simply isn't here".
+        assert!(!is_unit_absent_failure(
+            Some(1),
+            "Failed to stop opencode.service: Access denied"
+        ));
+        assert!(!is_unit_absent_failure(
+            Some(1),
+            "Failed to connect to bus: No such file or directory"
+        ));
+        assert!(!is_unit_absent_failure(None, "permission denied"));
+    }
+
+    #[test]
+    fn unit_absent_outcome_serialises_with_tagged_repr() {
+        // Event log / dashboard consume this as JSON.
+        let o = QuiesceOutcome::UnitAbsent {
+            scope: "user".into(),
+            unit: "opencode.service".into(),
+        };
+        let j = serde_json::to_value(&o).unwrap();
+        assert_eq!(j["kind"], "unit_absent");
+        assert_eq!(j["scope"], "user");
+        assert_eq!(j["unit"], "opencode.service");
     }
 
     // ── New in step 5: copy_tree + verify_copy

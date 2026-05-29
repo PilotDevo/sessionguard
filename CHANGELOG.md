@@ -2,6 +2,27 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.4.2] - 2026-05-28
+
+### Features — quiesce hooks on the OpenCode and Codex builtins
+
+`sessionguard migrate` can now stop a tool before copying its data and
+restart it afterward, baked into the built-in tool definitions instead
+of relying on the operator to wire it up.
+
+- **OpenCode and Codex builtins declare their systemd user units**
+  (`opencode.service`, `codex.service`). For OpenCode this means migrate
+  quiesces the daemon before copying its live WAL SQLite database,
+  avoiding a torn copy; for Codex it gives the `CODEX_HOME` env-rewrite a
+  unit to drop the override into.
+- **A declared-but-not-loaded unit is benign.** Because quiesce units are
+  environment-specific (you may run these tools interactively, not under
+  systemd), a not-loaded unit no longer aborts the migration — migrate
+  classifies it as a new `UnitAbsent` outcome, warns, and proceeds
+  without quiescing. Real failures (permission denied, no DBus) still
+  abort. Operators can override the unit name via user/project tool
+  config.
+
 ## [0.4.1] - 2026-05-28
 
 ### Features — reclaim space from completed migrations
