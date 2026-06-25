@@ -26,7 +26,7 @@ Examples of unacceptable behavior:
 
 Project maintainers are responsible for clarifying the standards of acceptable behavior and will take appropriate action in response to any instances of unacceptable behavior.
 
-Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by contacting the project team at **dev@droco.dev**.
+Instances of abusive, harassing, or otherwise unacceptable behavior may be reported by contacting the project team at **conduct@droco.io**.
 
 ## Attribution
 

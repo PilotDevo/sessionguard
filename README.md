@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.3.2** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. `sessionguard undo` wired to the event log. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for the v0.4 `migrate` arc.
+> **Status: v0.4.2** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. The v0.4 **Migrate** arc has shipped: `sessionguard inventory` / `migrate` / `migrate-cleanup` relocate a tool's home-dir data between disks, fully reversible via `sessionguard undo`. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -42,9 +42,10 @@ SessionGuard is a lightweight filesystem daemon that:
 
 Tool support is defined via runtime-loaded TOML patterns — add new tools without recompiling.
 
-Two support levels today:
+Three support levels today:
 - **Reconcile** — when a project moves, SessionGuard rewrites the tool's in-project session files (e.g. `.claude/settings.json`) to point at the new path, atomically and surgically.
-- **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite yet, because the tool stores its session data in the user's home directory keyed on absolute project paths. Home-dir reconciliation is coming in v0.4 `migrate`.
+- **Migrate** — the tool stores session data in the user's home directory; SessionGuard can relocate that home-dir store to a new disk/path and repoint the tool (symlink, config edit, or env override), reversibly. This is the v0.4 `migrate` capability — see [Migrate](#migrate-relocate-a-tools-home-dir-data) below.
+- **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite or migrate it yet.
 
 | Tool | Session Artifacts | Support |
 |------|------------------|---------|
@@ -53,8 +54,8 @@ Two support levels today:
 | **Windsurf** | `.windsurf/`, `.windsurfrules`, `.windsurfignore` | ✅ Reconcile |
 | **Gemini CLI** | `.gemini/`, `GEMINI.md`, `.geminiignore` | ✅ Reconcile |
 | **Aider** | `.aider.chat.history.md`, `.aider.conf.yml` | ✅ Reconcile *(text adapter)* |
-| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` | 🟡 Detect only |
-| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` | 🟡 Detect only |
+| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` (home: `~/.codex`, `CODEX_HOME`) | ✅ Reconcile + Migrate |
+| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` (home: `~/.local/share/opencode`) | ✅ Reconcile + Migrate |
 | **GitHub Copilot** | `.github/copilot-instructions.md` | 🔜 Planned |
 | **Continue.dev** | `.continue/`, `config.json` | 🔜 Planned |
 | **Custom / Other** | User-defined patterns via config TOML | ✅ Supported |
@@ -155,10 +156,11 @@ sessionguard simulate mv ~/projects/old-name ~/projects/new-name
 sessionguard log --last 20
 sessionguard log --format json
 
-# Reverse reconciliation actions (single-step undo)
-sessionguard undo                        # undo the last reconciliation
-sessionguard undo --last 5               # undo the five most recent
-sessionguard undo --id 42                # undo a specific event
+# Reverse reconciliation actions or a completed migration (undo)
+sessionguard undo                        # undo the most recent pending migration, else last reconciliation
+sessionguard undo --last 5               # undo the five most recent reconciliations
+sessionguard undo --id 42                # undo a specific reconciliation event
+sessionguard undo --migration 3          # reverse a specific migration (id from `log`)
 sessionguard undo --dry-run              # preview without writing
 
 # Diagnose common issues
@@ -167,6 +169,39 @@ sessionguard doctor
 # Generate shell completions
 sessionguard completions zsh > ~/.zfunc/_sessionguard
 ```
+
+### Migrate: relocate a tool's home-dir data
+
+Some tools (Codex, OpenCode) keep their session data in your home directory,
+not inside the project. `sessionguard migrate` moves that store to another
+disk or path and repoints the tool at it — preserving the original and
+recording a **reversible** migration.
+
+```bash
+# See what's migratable, where it lives, how big it is (read-only)
+sessionguard inventory
+sessionguard inventory --format json
+
+# Preview every stage of a migration without touching the filesystem
+sessionguard migrate opencode --to /mnt/fastpool/opencode --dry-run
+
+# Run it for real. The original is preserved at <src>.migrated-<unix>;
+# the tool is repointed (symlink / config edit / CODEX_HOME override).
+sessionguard migrate opencode --to /mnt/fastpool/opencode
+
+# Changed your mind? Reverse it (source restored, copy removed).
+sessionguard undo                        # the most recent migration
+sessionguard undo --migration 3          # a specific one (id from `sessionguard log`)
+
+# Confident it stuck? Reclaim the preserved originals' disk space.
+sessionguard migrate-cleanup                    # report what's reclaimable (safe)
+sessionguard migrate-cleanup --execute          # delete the preserved originals
+```
+
+SessionGuard never auto-deletes the source — `migrate-cleanup --execute` is the
+only command that removes a preserved original, and doing so makes that
+migration un-undoable (the live data at the destination is untouched). See
+[`docs/history/migrate.md`](docs/history/migrate.md) for the full design.
 
 ### Configure
 
@@ -248,14 +283,21 @@ AI tools evolve fast. New tools appear constantly. By defining tool patterns as 
 
 See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
 
-**Shipped** *(v0.1 – v0.3.2)*
+**Shipped** *(v0.1 – v0.4.2)*
 - Full watcher → detector → reconciler pipeline, verified end-to-end on
   macOS + Linux with real-data dogfooding (not just unit tests)
-- Seven built-in tool patterns (five reconciling, two detect-only)
+- Seven built-in tool patterns
 - `sessionguard undo` backed by an append-only event log
 - Adapter-based rewriting (JSON, TOML, text fallback) with prefix-safety
   guarantees — `/home/me/code` never rewrites inside `/home/me/code-backup`
-- `--format json` on `status`, `log`, and `tools` for tooling integration
+- `--format json` on `status`, `log`, `tools`, and `inventory` for tooling
+  integration
+- **v0.4 "Migrate"** — the thesis shift from *"watches for moves"* to *"moves
+  AI dev environments between disks without breaking them"*: `inventory`,
+  `migrate <tool> --to <path>` (a nine-stage state machine with quiesce →
+  copy → verify → rewrite → validate → retain), fully reversible via
+  `undo`, and `migrate-cleanup` to reclaim preserved originals. Dogfooded on a
+  multi-GB OpenCode store → fast pool. The source is never auto-deleted.
 - Read-only local dashboard (`tools/dashboard/`)
 - CI dogfood matrix on Ubuntu + macOS (the regression gate for the
   classes of bugs unit tests historically missed)
@@ -263,23 +305,18 @@ See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
   (see [`docs/ops/homebrew-tap-token.md`](docs/ops/homebrew-tap-token.md)
   for the one-time `HOMEBREW_TAP_TOKEN` setup that activates the tap update)
 
-**Next — v0.4 "Migrate"**
-The thesis shift: from *"watches for moves"* to *"the tool that moves
-AI dev environments between disks without breaking them"*. New verbs:
-`sessionguard migrate <tool> --to <path>`, `relocate <src> <dst>`,
-`inventory`. btrfs snapshot integration for atomic rollback. First
-dogfood target: a user's multi-GB Codex/OpenCode history → a fast
-pool, safely.
-
-**Later**
-Tool pattern library (community contributions), Tauri-based local UI,
-Windows support, broader launch. See [ROADMAP.md](ROADMAP.md).
+**Next**
+Cross-machine session **handoff** — resume the same session on another machine
+(design draft in [`docs/design/handoff.md`](docs/design/handoff.md)); btrfs
+snapshot integration for the migrate Snapshot stage; tool pattern library
+(community contributions); Tauri-based local UI; Windows support. See
+[ROADMAP.md](ROADMAP.md).
 
 ## Project Philosophy
 
 - **Vendor-neutral.** SessionGuard doesn't favor any AI tool. The tool pattern registry is community-maintained and extensible.
 - **Non-invasive.** It never modifies your code. It only touches AI tool session artifacts, and logs every change it makes.
-- **Undo-friendly.** Every reconciliation is append-only in the event log. `sessionguard undo` restores the previous state for the last action (`--last N` for several; `--id <n>` for a specific one; `--dry-run` to preview). Idempotent — already-undone events won't re-undo.
+- **Undo-friendly.** Every reconciliation *and every migration* is recorded in an append-only event log. `sessionguard undo` restores the previous state — for reconciliations (`--last N`, `--id <n>`) and for completed migrations (`--migration <id>`), with `--dry-run` to preview. Idempotent — already-undone events won't re-undo. A migration's source is never deleted, so even a failed undo leaves recoverable data.
 - **Privacy-first.** SessionGuard never reads your code or session *contents*. It only tracks file paths, timestamps, and structural metadata. Nothing leaves your machine.
 - **Unix philosophy.** It does one thing well. It watches for moves and fixes session paths. That's it.
 
@@ -344,7 +381,7 @@ SessionGuard treats each tool's session artifacts independently. It never merges
 Create a TOML file in `~/.config/sessionguard/tools/` following the pattern in `src/tools/builtin/claude_code.toml`. No recompilation needed. Or copy one of the built-ins into `sessionguard.toml` under a `[[tools]]` section in your project.
 
 **Q: What happens to session data my AI tool stores in `~/`, not inside the project?**
-Today: SessionGuard detects the project is using the tool but doesn't rewrite the home-dir store on move — that's why Codex and OpenCode are marked *Detect only* in the table above. v0.4's `migrate` command (in active design) will close this gap by safely relocating home-dir stores alongside their project references.
+That's what `sessionguard migrate` is for. As of v0.4 it safely relocates a tool's home-dir store (e.g. `~/.codex`, `~/.local/share/opencode`) to a new disk/path and repoints the tool — reversibly, never auto-deleting the original. See the [Migrate](#migrate-relocate-a-tools-home-dir-data) section above.
 
 **Q: Is there a GUI?**
 Yes — a minimal read-only one. `python3 tools/dashboard/app.py` serves a local web UI on port 8787 with five tabs:

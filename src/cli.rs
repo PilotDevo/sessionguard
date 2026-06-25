@@ -149,7 +149,7 @@ pub enum Command {
 
     /// Migrate a tool's home-dir data to a new location, preserving the
     /// original. Runs the full state machine and records a reversible
-    /// migration (`sessionguard undo`). See `docs/design/migrate.md`.
+    /// migration (`sessionguard undo`). See `docs/history/migrate.md`.
     Migrate {
         /// Tool name to migrate (e.g. `codex`, `opencode`).
         tool: String,

@@ -504,7 +504,7 @@ async fn main() -> Result<()> {
             let layout = tool_def.home_dir_layout.as_ref().ok_or_else(|| {
                 anyhow::anyhow!(
                     "tool `{tool}` has no home_dir_layout — nothing to migrate. \
-                     See docs/design/migrate.md for what's needed."
+                     See docs/history/migrate.md for what's needed."
                 )
             })?;
             let src = sessionguard::inventory::expand_home(&layout.default_path);
@@ -651,7 +651,7 @@ async fn main() -> Result<()> {
                             "no tools declare a home_dir_layout — nothing to migrate.\n\
                              (only tools with a [tool.home_dir_layout] block in their TOML\n\
                              can be migrated by `sessionguard migrate`; see\n\
-                             docs/design/migrate.md.)"
+                             docs/history/migrate.md.)"
                         );
                     } else {
                         println!(

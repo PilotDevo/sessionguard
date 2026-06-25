@@ -1,8 +1,11 @@
-# Design: `sessionguard migrate` (v0.4)
+# Design: `sessionguard migrate` (v0.4) — RETIRED
 
-> **Status**: Design draft. No code yet. Land this doc first, take
-> a beat, then implement. Reviewers: feedback as GitHub issues.
-> Last revised: 2026-05-26 (v0.3.4 baseline).
+> **Status**: SHIPPED in v0.4.0–v0.4.2 and retired to `docs/history/`. This is
+> the original design contract, kept for the record. Where the shipped code
+> diverged from this draft, the divergences are flagged inline as **SHIPPED
+> NOTE**. For current behavior see the `src/migrate.rs` module docs, the README
+> "Migrate" section, and `CHANGELOG.md`.
+> Originally drafted 2026-05-26 (v0.3.4 baseline).
 
 ## Thesis shift
 
@@ -55,6 +58,11 @@ sessionguard migrate codex    --to /mnt/fastpool/codex \
 sessionguard migrate claude_code --to /mnt/fastpool/claude --dry-run
 ```
 
+> **SHIPPED NOTE:** `--keep-old` was never built — the source is *always*
+> preserved (renamed to `.migrated-<unix>`); reclaiming it is the separate
+> `sessionguard migrate-cleanup` command. The shipped flags are `--to`,
+> `--dry-run`, `--format`.
+
 For each tool definition, a new optional `home_dir_layout` field
 describes where the tool stores user-scoped data and how to rewrite
 its self-references. Without this field, the tool is "in-project
@@ -62,6 +70,10 @@ only" (existing v0.3 behaviour); with it, `migrate` knows how to
 operate on the home-dir layer.
 
 ### `sessionguard relocate <src> <dst>`
+
+> **SHIPPED NOTE:** `relocate` was **not** built. The tool-centric `migrate`
+> covered the real need and the path-centric variant was dropped. This section
+> is design-only and describes a command that does not exist.
 
 Path-aware move. Scans **all** registered tool definitions for
 references to `<src>`, moves the data, rewrites every reference.
@@ -116,6 +128,9 @@ Each transition is logged to the event log so `undo` can reverse it.
                 ┌──────▼──────┐
                 │ 3. copy     │  rsync -aHAXS new path
                 └──────┬──────┘
+       ┌─ SHIPPED NOTE: implemented as a custom recursive `std::fs`
+       │  copy (no rsync dependency), not `rsync -aHAXS`.
+       │  (As of v0.4.3 it recreates symlinks; earlier 0.4.x skipped them.)
                        │
                 ┌──────▼──────┐
                 │ 4. verify   │  sizes match, no missing files, no errors
