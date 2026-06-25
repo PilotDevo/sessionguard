@@ -158,5 +158,5 @@ justfile                # Dev task runner
 - **Async runtime**: tokio (for concurrent fs event handling + signal trapping).
 - **SQLite bundled**: via `rusqlite` with `bundled` feature — no system SQLite dependency.
 - **`notify` v8**: Cross-platform fs watching (FSEvents on macOS, inotify on Linux).
-- **MSRV 1.75**: Set in `Cargo.toml` and `clippy.toml`.
+- **MSRV 1.85**: Set in `Cargo.toml` and `clippy.toml`.
 - **Copyright**: All source files carry `// Copyright 2026 Devin R O'Loughlin / Droco LLC` header.

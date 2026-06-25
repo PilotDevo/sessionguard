@@ -2,6 +2,49 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.4.3] - 2026-06-25
+
+A repo-health pass: the engine was already solid, but the docs had drifted
+~2 minor versions and the headline feature lacked black-box coverage. This
+release makes the docs tell the truth, covers migrate end-to-end, closes a
+latent symlink data-loss edge, and corrects a false MSRV claim.
+
+### Fixed
+
+- **Copy now preserves symlinks.** The migrate Copy stage previously skipped
+  symlinks silently — a symlinked directory or dangling link in a source tree
+  was dropped, and Verify couldn't always catch it. Copy now recreates symlinks
+  faithfully; an absolute target pointing into the source root is rebased onto
+  the destination so it resolves post-migrate. Relative and external targets are
+  recreated verbatim.
+- **MSRV corrected to 1.85.** The declared `rust-version = "1.75"` was already
+  false — a transitive dependency (`toml_datetime` via `toml`) requires the
+  `edition2024` Cargo feature (Rust 1.85+), so 1.75 could not build. Updated
+  `Cargo.toml`, `clippy.toml`, the README badge, and CLAUDE.md, and added a CI
+  job that pins 1.85 so the claim stays honest.
+
+### Added — test & CI coverage
+
+- Black-box end-to-end tests for `migrate` / `undo --migration` / `migrate-cleanup`
+  driving the real binary against a throwaway config-discovery tool, plus a new
+  `scripts/migrate-dogfood.sh` wired into CI on both OSes.
+- `SESSIONGUARD_CONFIG_DIR` env override (mirroring `SESSIONGUARD_DATA_DIR`) so
+  CLI smoke tests never read the operator's real `~/.config` / `$HOME`.
+- Unit tests for symlink recreation: relative, absolute-into-source (remapped),
+  symlinked-directory, and dangling — including a Verify-clean assertion.
+
+### Changed
+
+- **Docs realigned with v0.4.2 reality.** README status v0.3.2 → current with a
+  real "Migrate" usage section; removed the never-built `relocate` command from
+  all live docs; ROADMAP marks v0.4 + launcher-health shipped and adds a
+  cross-machine-handoff entry; CLAUDE.md module map / test count refreshed;
+  SECURITY supported-versions updated; `docs/design/migrate.md` retired to
+  `docs/history/` with inline SHIPPED NOTEs.
+- Release pipeline: the Homebrew-tap job is now non-fatal (`continue-on-error`)
+  and runs after `publish`, so a missing `HOMEBREW_TAP_TOKEN` no longer marks the
+  release run failed.
+
 ## [0.4.2] - 2026-05-28
 
 ### Features — quiesce hooks on the OpenCode and Codex builtins

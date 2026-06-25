@@ -1,8 +1,8 @@
 [package]
 name = "sessionguard"
-version = "0.4.2"
+version = "0.4.3"
 edition = "2021"
-rust-version = "1.75"
+rust-version = "1.85"
 authors = ["Droco LLC <dev@droco.io>"]
 description = "A system-level daemon that keeps AI coding sessions intact when your projects move"
 license = "MIT"

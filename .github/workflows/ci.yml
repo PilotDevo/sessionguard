@@ -37,6 +37,21 @@ jobs:
       - name: Test
         run: cargo test
 
+  msrv:
+    name: MSRV (1.85)
+    # Enforce the declared minimum supported Rust version (Cargo.toml
+    # rust-version / clippy.toml). Without this, an accidental use of a
+    # newer std API would silently break 1.85 builds.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@1.85
+      - uses: Swatinem/rust-cache@v2
+      - name: Build
+        run: cargo build
+      - name: Test
+        run: cargo test
+
   dogfood:
     name: Dogfood (${{ matrix.os }})
     # End-to-end smoke test that runs the real daemon against a synthetic

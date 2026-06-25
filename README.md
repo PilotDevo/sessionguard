@@ -4,7 +4,7 @@
 
 [![Crates.io](https://img.shields.io/crates/v/sessionguard.svg)](https://crates.io/crates/sessionguard)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Rust](https://img.shields.io/badge/Rust-1.75%2B-orange.svg?logo=rust)](https://www.rust-lang.org)
+[![Rust](https://img.shields.io/badge/Rust-1.85%2B-orange.svg?logo=rust)](https://www.rust-lang.org)
 [![CI](https://github.com/PilotDevo/sessionguard/actions/workflows/ci.yml/badge.svg)](https://github.com/PilotDevo/sessionguard/actions/workflows/ci.yml)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
 [![Built with Tokio](https://img.shields.io/badge/async-Tokio-blue.svg)](https://tokio.rs)
@@ -113,7 +113,7 @@ cargo install sessionguard
 ### Build from source
 
 ```bash
-# Requires Rust 1.75+
+# Requires Rust 1.85+
 git clone https://github.com/PilotDevo/sessionguard.git
 cd sessionguard
 cargo install --path .
