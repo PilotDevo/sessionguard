@@ -28,7 +28,7 @@ jobs:
             os: macos-latest
             binary: sessionguard
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -53,7 +53,7 @@ jobs:
     needs: build
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
         with:
           fetch-depth: 0
 
@@ -81,7 +81,7 @@ jobs:
     needs: release
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v6
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
 
@@ -121,7 +121,7 @@ jobs:
           fi
 
       - name: Checkout tap
-        uses: actions/checkout@v6
+        uses: actions/checkout@v7
         with:
           repository: PilotDevo/homebrew-tap
           token: ${{ secrets.HOMEBREW_TAP_TOKEN }}
