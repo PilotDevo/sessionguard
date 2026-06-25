@@ -103,7 +103,12 @@ jobs:
     # Security: all github.* values captured into env: before use in
     # run: scripts — never interpolated directly into command lines.
     name: Update Homebrew tap
-    needs: release
+    # Runs after publish so the tap never points at a release whose crate
+    # failed to publish. Non-fatal: a missing/expired HOMEBREW_TAP_TOKEN
+    # should not mark the whole release run failed — the binaries, GitHub
+    # release, and crates.io publish are already done by this point.
+    needs: publish
+    continue-on-error: true
     runs-on: ubuntu-latest
     steps:
       - name: Preflight — ensure tap token is configured
