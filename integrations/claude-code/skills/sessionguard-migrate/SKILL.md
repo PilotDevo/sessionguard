@@ -136,8 +136,9 @@ ran it as the Validate stage. If the user can, have them launch the tool once.
 
 ## Reading the stages
 
-A migration runs ten stages. In dry-run each prints what it *would* do; in a real
-run, what it *did*. The ones worth reading back to the user:
+A migration runs nine work stages (plus a terminal `Done`). In dry-run each
+prints what it *would* do; in a real run, what it *did*. The ones worth reading
+back to the user:
 
 - **Preflight** — validates source exists, destination doesn't, discovery type.
 - **Snapshot** — currently stubbed (no btrfs detection yet); safe to ignore.
@@ -145,7 +146,8 @@ run, what it *did*. The ones worth reading back to the user:
   mid-copy. If the unit isn't loaded on this host (the common interactive case),
   it says so and proceeds — that's *benign*, not an error. "No quiesce hook
   declared" is also fine.
-- **Copy** — rsync source → destination (shows file/byte counts).
+- **Copy** — recursive copy source → destination (shows file/byte counts). A
+  custom `std::fs` walk, not rsync — no delta detection.
 - **Verify** — compares size/count between source and destination.
 - **Rewrite** — repoints the tool: installs a symlink (OpenCode), edits a config
   file, or drops a systemd `Environment=` override (Codex / `CODEX_HOME`).

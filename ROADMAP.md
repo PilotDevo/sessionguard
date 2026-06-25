@@ -6,14 +6,15 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.3.4 (current)** — Daemon reliably detects moves on macOS and Linux
-(proven via `scripts/dogfood.sh` on real hardware) and reconciles seven
-built-in tools (five reconciling, two detect-only). `sessionguard undo`
-reverses any logged action from the event log. `--format json` available
-on `tools`, `log`, and `status` for tooling integration. **Launcher
-health** check (v0.3.3) tells you when a tool's binary is missing from
-PATH versus when the session data itself is gone. **`doctor --clean`**
-(v0.3.4) prunes stale registry entries without further mutation.
+**v0.4.2 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
+v0.1–v0.3 reconcile pipeline (move detection on macOS + Linux, seven built-in
+tools, `undo`, `--format json`, launcher health, `doctor --clean`),
+SessionGuard now relocates a tool's home-dir data between disks:
+`sessionguard inventory` enumerates what's migratable; `migrate <tool> --to
+<path>` runs a nine-stage state machine (quiesce → copy → verify → rewrite →
+validate → retain) that's fully reversible via `undo` / `undo --migration
+<id>`; `migrate-cleanup` reclaims the preserved originals. The source is never
+auto-deleted. Dogfooded on a multi-GB OpenCode store → fast pool.
 
 The local read-only **dashboard** (`tools/dashboard/`) ships with an
 **Activity** tab that gives a per-project, per-assistant view across
@@ -22,9 +23,10 @@ health in the Tools tab — answering "where am I working, which
 assistants have touched what, and can the tool actually run?" at a
 glance.
 
-The v0.4 *migrate* design is captured in
-[`docs/design/migrate.md`](docs/design/migrate.md) — code follows once
-the design is reviewed.
+The v0.4 *migrate* design is retired to
+[`docs/history/migrate.md`](docs/history/migrate.md). The next arc —
+cross-machine session **handoff** — is drafted in
+[`docs/design/handoff.md`](docs/design/handoff.md).
 
 ## v0.3 — Undo + More Patterns  *(shipping)*
 
@@ -41,33 +43,42 @@ Goal: build trust. Users won't run an auto-reconciler they can't reverse.
       *(deferred to v0.3.x)*
 - [ ] `scripts/dogfood.sh` as a required CI check *(deferred)*
 
-## v0.4 — Migrate
+## v0.4 — Migrate  *(shipped)*
 
-> **Design**: [`docs/design/migrate.md`](docs/design/migrate.md) — read
-> first; this section is the bullet-list summary, the design doc is the
-> contract.
+> **Design**: retired to [`docs/history/migrate.md`](docs/history/migrate.md).
 
-Goal: ship the feature conversation suggested by the fedora fastpool work.
-Turn SessionGuard from *"watches for moves"* into *"the tool that moves
-AI dev environments safely."*
+Turned SessionGuard from *"watches for moves"* into *"the tool that moves AI
+dev environments safely."*
 
-Concrete target — fedora hub box:
-`~/.codex/sessions/` (14 GB) + `~/.claude/projects/` (3.8 GB) +
-`~/droco-mem-data/` (18 GB) → `/mnt/fastpool/<target>` without losing
-session state.
+- [x] `sessionguard migrate <tool> --to <path>` — tool-aware relocation via a
+      nine-stage state machine (quiesce → copy → verify → rewrite → resume →
+      validate → retain)
+- [x] `sessionguard inventory` — enumerate tools, their data locations and
+      sizes; the read-only lead-in to `migrate`
+- [x] `migrate` is reversible — `undo` / `undo --migration <id>` reverses a
+      completed migration; the source is preserved at `.migrated-<unix>`
+- [x] `sessionguard migrate-cleanup` — reclaim preserved originals once a
+      migration is trusted (un-undoable after cleanup; live data untouched)
+- [x] `--dry-run` on every destructive command as a first-class pattern
+- [x] Quiesce graceful-skip — a declared-but-not-loaded systemd unit is benign
+- [ ] btrfs snapshot integration for the Snapshot stage (currently stubbed) —
+      *deferred*
+- ~~Docs site (MkDocs)~~ — dropped; README + design docs suffice for now
+- ~~`relocate <src> <dst>`~~ — dropped; `migrate` covers the real need
 
-- `sessionguard migrate <tool> --to <path>` — tool-aware relocation
-  (stop related services → rsync → rewrite config → restart → verify)
-- `sessionguard relocate <src> <dst>` — path-aware; scan all registered
-  tools for references to `<src>`, move data, rewrite references
-- `sessionguard inventory` — enumerate tracked tools, their data
-  locations, sizes; suggest migration candidates
-- btrfs snapshot integration — on btrfs roots, take a snapshot before
-  migrating for atomic rollback
-- `--dry-run` on every destructive command as a first-class pattern
-- Docs site (MkDocs Material, not Docusaurus — lighter)
+## v0.5 — Cross-machine handoff
 
-## v0.5 — Tool Pattern Library
+> **Design**: [`docs/design/handoff.md`](docs/design/handoff.md) (draft).
+
+Goal: the third "move" axis — resume the same session on a *different machine*.
+
+- `sessionguard handoff pack/apply/inspect` — a portable `.sgbundle` that
+  re-keys + path-remaps a tool's session for the target machine
+- Claude Code + Codex first (JSON-keyed); OpenCode (SQLite) deferred to a
+  follow-on
+- Secrets never travel in a bundle; one-directional by design; undoable
+
+## v0.6 — Tool Pattern Library
 
 Goal: let the community extend the pattern catalog safely.
 
@@ -78,13 +89,18 @@ Goal: let the community extend the pattern catalog safely.
 - `cargo-audit` integration in CI
 - Homebrew formula auto-publish workflow
 
-## Launcher health (v0.3.x or rolled into v0.4)
+## Launcher health  *(Path A shipped in v0.3.3 — `src/health.rs`)*
 
 Sessions can survive *the project* moving (the original thesis) and
 *the disk* changing (v0.4 `migrate`), but they don't survive *the
 runtime* changing — which is a separate failure mode that SessionGuard
 should be able to surface even if it can't fix it. The operator has
 hit this repeatedly across runtime upgrades (Node, Python, others).
+
+Path A (*Visibility* — notice and report missing launchers) shipped in v0.3.3
+via `src/health.rs`, wired into `doctor` and the dashboard Tools tab. Path B
+(*Availability* — restore launchers) remains deferred; the rest of this section
+is retained as the design record.
 
 **Motivating scenarios.** Same shape across runtimes:
 

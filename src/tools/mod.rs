@@ -54,7 +54,7 @@ fn default_format() -> String {
 /// Drives the rewrite stage of `sessionguard migrate`: depending on
 /// how the tool finds its data, we either edit a config file, set an
 /// env var (typically via systemd unit override), or just leave a
-/// symlink in place. See `docs/design/migrate.md` §"Per-tool
+/// symlink in place. See `docs/history/migrate.md` §"Per-tool
 /// `home_dir_layout` schema".
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
@@ -181,7 +181,7 @@ pub struct ToolDefinition {
     /// references during `sessionguard migrate` (v0.4+). Tools without this
     /// block are skipped by migrate with a clear "no home-dir layout
     /// declared" message — they still reconcile on project moves as in
-    /// v0.3.x. See `docs/design/migrate.md` for the full schema rationale.
+    /// v0.3.x. See `docs/history/migrate.md` for the full schema rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_dir_layout: Option<HomeDirLayout>,
 }

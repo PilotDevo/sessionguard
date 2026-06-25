@@ -77,11 +77,12 @@ systemctl --user enable --now sessionguard-dashboard.service
 This is a **read-only inspection tool**, not a full control surface. By
 design:
 
-- No undo / migrate / watch actions from the UI. Use the CLI for any
-  change. An interactive UI is planned for v0.5+ once the underlying
-  `migrate` CLI command lands (see `ROADMAP.md`).
-- The `Tools` tab shells out to `sessionguard tools list --verbose` and
-  parses text. A first-class JSON output on the CLI is on the polish list.
+- No undo / migrate / watch actions from the UI — it's read-only by design.
+  Use the CLI for any change (`migrate`, `undo`, `migrate-cleanup` all shipped
+  in v0.4). A write-capable interactive UI remains a later-version idea
+  (see `ROADMAP.md`).
+- The `Tools` tab reads `sessionguard tools list --format json` (as do the
+  other tabs that need the resolution chain).
 - `--host 0.0.0.0` exposes project paths and event history over the
   network. If you bind beyond localhost, make sure the network is
   trusted — there's no authentication layer.

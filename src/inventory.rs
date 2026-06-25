@@ -4,7 +4,7 @@
 //! Tool data-dir inventory.
 //!
 //! Step 2 of the v0.4 `migrate` implementation order (see
-//! `docs/design/migrate.md`). For every tool with a `home_dir_layout`
+//! `docs/history/migrate.md`). For every tool with a `home_dir_layout`
 //! declared, report:
 //!
 //! - the **resolved location** on the current machine (after

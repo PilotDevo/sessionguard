@@ -3,10 +3,10 @@
 
 //! Migration state machine for `sessionguard migrate` (v0.4).
 //!
-//! Implements the nine-stage state machine from `docs/design/migrate.md`,
-//! end-to-end: real migrations now run to completion through
-//! Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite →
-//! Resume → Validate → Retain → Done.
+//! Implements the nine-stage state machine from `docs/history/migrate.md`
+//! (nine work stages plus a terminal `Done`), end-to-end: real migrations
+//! now run to completion through Preflight → Snapshot → Quiesce → Copy →
+//! Verify → Rewrite → Resume → Validate → Retain → Done.
 //!
 //! ## Stage status
 //!
@@ -36,8 +36,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::{HomeDirConfigFile, HomeDirDiscovery, ToolDefinition};
 
-/// One node in the migration state machine. Variants match the eight
-/// stages in `docs/design/migrate.md` §"The migrate state machine".
+/// One node in the migration state machine. Variants match the nine work
+/// stages (plus the terminal `Done`) in `docs/history/migrate.md`
+/// §"The migrate state machine".
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum Stage {
@@ -169,7 +170,7 @@ pub enum MigrateError {
 // systemctl; tests substitute a [`FakeQuiescer`] so they don't depend on
 // the host having systemd or a real unit registered.
 //
-// Design constraint from `docs/design/migrate.md` §3 "Open questions":
+// Design constraint from `docs/history/migrate.md` §3 "Open questions":
 // for ephemeral tools (no systemd unit declared), Quiesce *cannot* stop
 // anything itself — best it can do is warn the operator. That case is
 // represented by a successful Quiescer call that records the warning
@@ -469,7 +470,7 @@ pub struct CopySummary {
 /// Recursively copy every regular file under `src` into `dst`,
 /// creating intermediate directories as needed.
 ///
-/// Design constraints from `docs/design/migrate.md`:
+/// Design constraints from `docs/history/migrate.md`:
 /// - Symlinks are **skipped** (cycles + off-tree pointers). Use rsync
 ///   externally if you need symlink semantics; the migrate target tools
 ///   (Codex, OpenCode) store regular files only.
