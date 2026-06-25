@@ -465,6 +465,11 @@ pub struct CopySummary {
     pub bytes_copied: u64,
     /// Number of directories created under the destination.
     pub dirs_created: usize,
+    /// Number of symlinks recreated in the destination. An absolute target
+    /// pointing into the source root is remapped to the destination root;
+    /// relative and external targets are recreated verbatim.
+    #[serde(default)]
+    pub symlinks_copied: usize,
 }
 
 /// Recursively copy every regular file under `src` into `dst`,
@@ -482,8 +487,9 @@ pub struct CopySummary {
 /// - On any error, `dst` may be left partially populated. The caller
 ///   is responsible for cleanup (see `cleanup_partial_copy`).
 ///
-/// Equivalent to `cp -r src dst` for the practical AI-tool-data case,
-/// minus symlinks. Not a full `rsync` — no delta detection, no
+/// Equivalent to `cp -RP src dst` for the practical AI-tool-data case:
+/// symlinks are recreated as symlinks (not followed), so the tree is
+/// reproduced faithfully. Not a full `rsync` — no delta detection, no
 /// resumability. For the v0.4 target (one-shot migration of stable
 /// data), this is sufficient.
 pub fn copy_tree(src: &Path, dst: &Path) -> Result<CopySummary, MigrateError> {
@@ -500,34 +506,49 @@ pub fn copy_tree(src: &Path, dst: &Path) -> Result<CopySummary, MigrateError> {
         files_copied: 0,
         bytes_copied: 0,
         dirs_created: 0,
+        symlinks_copied: 0,
     };
 
     std::fs::create_dir_all(dst)?;
     summary.dirs_created += 1;
 
-    copy_tree_inner(src, dst, &mut summary)?;
+    // Pass the top-level roots down so symlink targets that are absolute
+    // and point *into* the source can be remapped to the destination.
+    copy_tree_inner(src, dst, src, dst, &mut summary)?;
     Ok(summary)
 }
 
-fn copy_tree_inner(src: &Path, dst: &Path, summary: &mut CopySummary) -> Result<(), MigrateError> {
+fn copy_tree_inner(
+    src: &Path,
+    dst: &Path,
+    src_root: &Path,
+    dst_root: &Path,
+    summary: &mut CopySummary,
+) -> Result<(), MigrateError> {
     for entry in std::fs::read_dir(src)? {
         let entry = entry?;
-        // Use `symlink_metadata` so we don't follow symlinks at the
-        // type check; that lets us detect (and skip) them explicitly.
+        // `DirEntry::metadata()` does not traverse the final symlink, so this
+        // reports the entry's own type — letting us detect symlinks and
+        // recreate them rather than copying what they point at.
         let meta = entry.metadata()?;
         let src_path = entry.path();
         let dst_path = dst.join(entry.file_name());
 
         if meta.file_type().is_symlink() {
-            // Skip silently. Design doc says symlinks aren't followed;
-            // tools whose data dirs contain symlinks need a future
-            // `follow_symlinks` opt-in.
+            // Recreate the link faithfully rather than dropping it. A target
+            // that is absolute and lives under the migration source root is
+            // remapped to the destination root so it resolves post-migrate;
+            // relative or external targets are recreated verbatim.
+            let target = std::fs::read_link(&src_path)?;
+            let new_target = remap_symlink_target(&target, src_root, dst_root);
+            recreate_symlink(&new_target, &dst_path)?;
+            summary.symlinks_copied = summary.symlinks_copied.saturating_add(1);
             continue;
         }
         if meta.is_dir() {
             std::fs::create_dir_all(&dst_path)?;
             summary.dirs_created += 1;
-            copy_tree_inner(&src_path, &dst_path, summary)?;
+            copy_tree_inner(&src_path, &dst_path, src_root, dst_root, summary)?;
         } else if meta.is_file() {
             let bytes = std::fs::copy(&src_path, &dst_path)?;
             summary.bytes_copied = summary.bytes_copied.saturating_add(bytes);
@@ -555,6 +576,45 @@ fn copy_tree_inner(src: &Path, dst: &Path, summary: &mut CopySummary) -> Result<
         // unexpected in AI-tool data dirs — skip silently.
     }
     Ok(())
+}
+
+/// Remap a symlink target for the destination tree. An **absolute** target
+/// that lives under `src_root` is rebased onto `dst_root` so the copied link
+/// resolves to the migrated data; everything else (relative targets, or
+/// absolute targets pointing outside the migration) is returned unchanged.
+fn remap_symlink_target(target: &Path, src_root: &Path, dst_root: &Path) -> PathBuf {
+    if target.is_absolute() {
+        if let Ok(rel) = target.strip_prefix(src_root) {
+            return dst_root.join(rel);
+        }
+    }
+    target.to_path_buf()
+}
+
+/// Create a symlink at `link_path` pointing at `target`. Unix-only for now,
+/// matching the rest of migrate (the Copy stage's permission mirroring is also
+/// `#[cfg(unix)]`); on other platforms this is a clear, non-silent error.
+fn recreate_symlink(target: &Path, link_path: &Path) -> Result<(), MigrateError> {
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link_path).map_err(|e| {
+            MigrateError::StageFailed(
+                Stage::Copy,
+                format!("failed to recreate symlink {}: {e}", link_path.display()),
+            )
+        })
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = target;
+        Err(MigrateError::StageFailed(
+            Stage::Copy,
+            format!(
+                "cannot recreate symlink {} on this platform (Unix-only)",
+                link_path.display()
+            ),
+        ))
+    }
 }
 
 /// Remove a partially-populated `dst` after a failed copy. Best-effort:
@@ -1521,9 +1581,10 @@ pub fn migrate_with_backends(
                 record(
                     Stage::Copy,
                     &format!(
-                        "copied {} files ({} bytes) into {} directories at {}",
+                        "copied {} files ({} bytes), {} symlinks, into {} directories at {}",
                         s.files_copied,
                         s.bytes_copied,
+                        s.symlinks_copied,
                         s.dirs_created,
                         dst.display()
                     ),
@@ -1868,8 +1929,11 @@ fn describe_copy(src: &Path, dst: &Path) -> std::io::Result<String> {
 }
 
 /// Tiny non-capped variant of inventory's walker. Returns (file_count,
-/// total_bytes) under `path`. Skips symlinks; ignores errors silently
-/// so dry-run reporting stays best-effort.
+/// total_bytes of regular files) under `path`. Symlinks count toward neither
+/// (`DirEntry::metadata` reports them as neither file nor dir), so Verify
+/// compares regular-file payload on both sides — copy recreates symlinks
+/// faithfully, and the unit tests guard that they aren't dropped. Errors are
+/// ignored silently so dry-run reporting stays best-effort.
 fn walk_size(path: &Path) -> (usize, u64) {
     let mut stack = vec![path.to_path_buf()];
     let mut files = 0usize;
@@ -2446,24 +2510,89 @@ mod tests {
         assert!(matches!(err, MigrateError::DestinationExists(_)));
     }
 
+    #[cfg(unix)]
     #[test]
-    fn copy_tree_skips_symlinks() {
+    fn copy_tree_recreates_relative_symlink() {
         let src = TempDir::new().unwrap();
         populate(src.path(), &[("real.txt", b"data")]);
-        // Add a symlink alongside the regular file
-        #[cfg(unix)]
-        {
-            std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("link.txt"))
-                .unwrap();
-        }
+        // A relative symlink — recreated verbatim.
+        std::os::unix::fs::symlink("real.txt", src.path().join("link.txt")).unwrap();
+
         let dst_dir = TempDir::new().unwrap();
         let dst = dst_dir.path().join("out");
         let summary = copy_tree(src.path(), &dst).unwrap();
-        // Symlink should be skipped on Unix; on other platforms the
-        // create above is a no-op so the count is still 1.
-        assert_eq!(summary.files_copied, 1, "symlinks must not be followed");
-        assert!(dst.join("real.txt").exists());
-        assert!(!dst.join("link.txt").exists());
+
+        assert_eq!(summary.files_copied, 1, "only the regular file is a file");
+        assert_eq!(summary.symlinks_copied, 1, "the symlink is recreated");
+        let link = dst.join("link.txt");
+        let meta = std::fs::symlink_metadata(&link).unwrap();
+        assert!(meta.file_type().is_symlink(), "link must remain a symlink");
+        assert_eq!(std::fs::read_link(&link).unwrap(), Path::new("real.txt"));
+        // It resolves to the copied file, not the original.
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "data");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_remaps_absolute_symlink_into_source() {
+        let src = TempDir::new().unwrap();
+        populate(src.path(), &[("real.txt", b"payload")]);
+        // An ABSOLUTE symlink pointing into the source root — must be
+        // remapped to the destination so it resolves post-migrate.
+        std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("abs.txt"))
+            .unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        let summary = copy_tree(src.path(), &dst).unwrap();
+
+        assert_eq!(summary.symlinks_copied, 1);
+        let link = dst.join("abs.txt");
+        let target = std::fs::read_link(&link).unwrap();
+        assert_eq!(
+            target,
+            dst.join("real.txt"),
+            "absolute target into src must be rebased onto dst"
+        );
+        assert_eq!(std::fs::read_to_string(&link).unwrap(), "payload");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn copy_tree_recreates_symlinked_directory_and_dangling_link() {
+        // The two cases the audit flagged as silently droppable.
+        let src = TempDir::new().unwrap();
+        std::fs::create_dir_all(src.path().join("realdir")).unwrap();
+        std::fs::write(src.path().join("realdir/inner.txt"), b"x").unwrap();
+        // symlink TO a directory (not followed — recreated as a link)
+        std::os::unix::fs::symlink("realdir", src.path().join("dirlink")).unwrap();
+        // dangling symlink (target doesn't exist)
+        std::os::unix::fs::symlink("nowhere", src.path().join("dangling")).unwrap();
+
+        let dst_dir = TempDir::new().unwrap();
+        let dst = dst_dir.path().join("out");
+        let summary = copy_tree(src.path(), &dst).unwrap();
+
+        // realdir is copied as a dir (1 file inside); dirlink + dangling are links.
+        assert_eq!(summary.files_copied, 1);
+        assert_eq!(
+            summary.symlinks_copied, 2,
+            "dir-link and dangling recreated"
+        );
+        let dirlink = std::fs::symlink_metadata(dst.join("dirlink")).unwrap();
+        assert!(dirlink.file_type().is_symlink(), "dir-link stays a symlink");
+        assert_eq!(
+            std::fs::read_link(dst.join("dirlink")).unwrap(),
+            Path::new("realdir")
+        );
+        let dangling = std::fs::symlink_metadata(dst.join("dangling")).unwrap();
+        assert!(dangling.file_type().is_symlink(), "dangling link recreated");
+        assert!(!dst.join("dangling").exists(), "dangling stays dangling");
+
+        // Verify must report a clean match (regular-file payload identical;
+        // symlinks excluded from the size walk on both sides).
+        let v = verify_copy(src.path(), &dst).unwrap();
+        assert!(v.matches, "verify should match: {v:?}");
     }
 
     #[cfg(unix)]
