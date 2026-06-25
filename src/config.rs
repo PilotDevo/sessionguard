@@ -105,7 +105,15 @@ impl Config {
 }
 
 /// SessionGuard config directory.
+///
+/// Overridable via the `SESSIONGUARD_CONFIG_DIR` environment variable, mirroring
+/// [`Config::data_dir`]'s `SESSIONGUARD_DATA_DIR` knob. Tests and the dogfood
+/// scripts set it so `config show` / `inventory` never read the operator's real
+/// `~/.config/sessionguard`.
 pub fn config_dir() -> PathBuf {
+    if let Ok(dir) = std::env::var("SESSIONGUARD_CONFIG_DIR") {
+        return PathBuf::from(dir);
+    }
     ProjectDirs::from("dev", "droco", "sessionguard")
         .map(|d| d.config_dir().to_owned())
         .unwrap_or_else(|| PathBuf::from(".sessionguard"))
