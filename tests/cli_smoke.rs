@@ -6,11 +6,25 @@
 
 use assert_cmd::Command;
 use predicates::prelude::*;
+use tempfile::TempDir;
+
+/// A `sessionguard` command fully isolated from the operator's real
+/// environment. Points the data dir, config dir, and `HOME` at a throwaway
+/// temp dir so no test reads `~/.config/sessionguard`, the real registry/event
+/// log, or the real `~/.codex` / `~/.local/share/opencode`. Hold the returned
+/// `TempDir` for the command's lifetime.
+fn sg(home: &TempDir) -> Command {
+    let mut c = Command::cargo_bin("sessionguard").unwrap();
+    c.env("SESSIONGUARD_DATA_DIR", home.path().join("data"))
+        .env("SESSIONGUARD_CONFIG_DIR", home.path().join("config"))
+        .env("HOME", home.path());
+    c
+}
 
 #[test]
 fn cli_help() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .arg("--help")
         .assert()
         .success()
@@ -19,8 +33,8 @@ fn cli_help() {
 
 #[test]
 fn cli_version() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .arg("version")
         .assert()
         .success()
@@ -29,17 +43,14 @@ fn cli_version() {
 
 #[test]
 fn cli_status_no_daemon() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
-        .arg("status")
-        .assert()
-        .success();
+    let home = TempDir::new().unwrap();
+    sg(&home).arg("status").assert().success();
 }
 
 #[test]
 fn cli_config_show() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .args(["config", "show"])
         .assert()
         .success()
@@ -48,17 +59,14 @@ fn cli_config_show() {
 
 #[test]
 fn cli_log_empty() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
-        .arg("log")
-        .assert()
-        .success();
+    let home = TempDir::new().unwrap();
+    sg(&home).arg("log").assert().success();
 }
 
 #[test]
 fn cli_tools_list_shows_builtins() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .arg("tools")
         .assert()
         .success()
@@ -73,8 +81,8 @@ fn cli_tools_list_shows_builtins() {
 
 #[test]
 fn cli_tools_list_verbose_shows_patterns() {
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .args(["tools", "list", "--verbose"])
         .assert()
         .success()
@@ -84,8 +92,8 @@ fn cli_tools_list_verbose_shows_patterns() {
 
 #[test]
 fn cli_tools_list_format_json_is_valid_array() {
-    let out = Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
         .args(["tools", "list", "--format", "json"])
         .assert()
         .success()
@@ -109,10 +117,8 @@ fn cli_tools_list_format_json_is_valid_array() {
 
 #[test]
 fn cli_log_format_json_is_valid_array() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let out = Command::cargo_bin("sessionguard")
-        .unwrap()
-        .env("SESSIONGUARD_DATA_DIR", tmp.path())
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
         .args(["log", "--format", "json"])
         .assert()
         .success()
@@ -126,10 +132,8 @@ fn cli_log_format_json_is_valid_array() {
 
 #[test]
 fn cli_status_format_json_has_expected_keys() {
-    let tmp = tempfile::TempDir::new().unwrap();
-    let out = Command::cargo_bin("sessionguard")
-        .unwrap()
-        .env("SESSIONGUARD_DATA_DIR", tmp.path())
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
         .args(["status", "--format", "json"])
         .assert()
         .success()
@@ -144,11 +148,12 @@ fn cli_status_format_json_has_expected_keys() {
 
 #[test]
 fn cli_inventory_text_lists_codex_and_opencode() {
-    // Both codex and opencode declare home_dir_layout as of v0.4 prep
-    // — they should appear in inventory output. Other built-ins
-    // (claude_code, cursor, etc.) don't yet and shouldn't.
-    Command::cargo_bin("sessionguard")
-        .unwrap()
+    // Both codex and opencode declare home_dir_layout, so they're listed by
+    // inventory regardless of whether their data dir exists on this host
+    // (confirmed by inventory's reports_missing_path_with_exists_false unit
+    // test). Other built-ins without a layout don't appear.
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .arg("inventory")
         .assert()
         .success()
@@ -158,8 +163,8 @@ fn cli_inventory_text_lists_codex_and_opencode() {
 
 #[test]
 fn cli_inventory_format_json_is_valid_array() {
-    let out = Command::cargo_bin("sessionguard")
-        .unwrap()
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
         .args(["inventory", "--format", "json"])
         .assert()
         .success()
@@ -186,11 +191,8 @@ fn cli_inventory_format_json_is_valid_array() {
 
 #[test]
 fn cli_undo_no_events_prints_message() {
-    // Fresh in-process data dir so we know the log is empty
-    let tmp = tempfile::TempDir::new().unwrap();
-    Command::cargo_bin("sessionguard")
-        .unwrap()
-        .env("SESSIONGUARD_DATA_DIR", tmp.path())
+    let home = TempDir::new().unwrap();
+    sg(&home)
         .arg("undo")
         .assert()
         .success()

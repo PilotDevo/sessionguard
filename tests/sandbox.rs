@@ -9,6 +9,7 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
 use std::fs;
+use std::path::{Path, PathBuf};
 use tempfile::TempDir;
 
 /// Build a `sessionguard` command with an isolated data directory so tests
@@ -334,4 +335,179 @@ fn sandbox_scan_multi_tool_project() {
         .success()
         .stdout(predicate::str::contains("dual-tool"))
         .stdout(predicate::str::contains("Claude Code"));
+}
+
+// ── migrate / undo / migrate-cleanup end-to-end (config discovery) ──────────
+//
+// These drive the real compiled binary through the v0.4 migrate feature against
+// a throwaway config-discovery tool. Everything is isolated under a temp HOME +
+// data/config dirs and an explicit `--config`, so the operator's real
+// `~/.codex` / `~/.local/share/opencode` are never reachable.
+
+/// A fully-isolated `sessionguard` command for migrate e2e tests.
+fn isolated(root: &Path) -> Command {
+    let mut c = Command::cargo_bin("sessionguard").unwrap();
+    c.env("SESSIONGUARD_DATA_DIR", root.join("sgdata"))
+        .env("SESSIONGUARD_CONFIG_DIR", root.join("sgconfig"))
+        .env("HOME", root);
+    c
+}
+
+/// Build a throwaway config-discovery tool under `root`: a source data dir, a
+/// JSON config file naming it, and a sessionguard config declaring the tool.
+/// Returns (sessionguard_config, source_dir, tool_config).
+fn setup_config_tool(root: &Path) -> (PathBuf, PathBuf, PathBuf) {
+    let src = root.join("toolsrc");
+    fs::create_dir_all(src.join("nested")).unwrap();
+    fs::write(src.join("data.txt"), "payload").unwrap();
+    fs::write(src.join("nested/blob.bin"), vec![7u8; 2048]).unwrap();
+
+    let tool_cfg = root.join("tool.json");
+    fs::write(&tool_cfg, format!(r#"{{"data_dir": "{}"}}"#, src.display())).unwrap();
+
+    let sg_cfg = root.join("sessionguard.toml");
+    fs::write(
+        &sg_cfg,
+        format!(
+            r#"[[tools]]
+name = "demo"
+display_name = "Demo Tool"
+on_move = "notify"
+session_patterns = ["AGENTS.md"]
+
+[tools.home_dir_layout]
+default_path = "{src}"
+discovery = "config"
+
+[[tools.home_dir_layout.config_files]]
+file = "{cfg}"
+field = "data_dir"
+format = "json"
+"#,
+            src = src.display(),
+            cfg = tool_cfg.display(),
+        ),
+    )
+    .unwrap();
+    (sg_cfg, src, tool_cfg)
+}
+
+/// Find the `.migrated-<unix>` sidecar sibling of `src`, if any.
+fn find_sidecar(src: &Path) -> Option<PathBuf> {
+    let parent = src.parent()?;
+    let prefix = format!("{}.migrated-", src.file_name()?.to_str()?);
+    fs::read_dir(parent)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .map(|n| n.starts_with(&prefix))
+                .unwrap_or(false)
+        })
+}
+
+#[test]
+fn sandbox_migrate_undo_round_trips_via_cli() {
+    let home = TempDir::new().unwrap();
+    let root = home.path();
+    let (sg_cfg, src, tool_cfg) = setup_config_tool(root);
+    let dst = root.join("dst");
+
+    // dry-run: walks the state machine, changes nothing.
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["migrate", "demo", "--to"])
+        .arg(&dst)
+        .arg("--dry-run")
+        .assert()
+        .success();
+    assert!(!dst.exists(), "dry-run must not create dst");
+    assert!(src.join("data.txt").exists(), "dry-run must not touch src");
+
+    // real migrate.
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["migrate", "demo", "--to"])
+        .arg(&dst)
+        .assert()
+        .success();
+    assert!(dst.join("data.txt").exists(), "dst should be populated");
+    assert!(dst.join("nested/blob.bin").exists(), "nested file copied");
+    assert!(
+        find_sidecar(&src).is_some(),
+        "original should be preserved as a .migrated-<unix> sidecar"
+    );
+    let cfg_after = fs::read_to_string(&tool_cfg).unwrap();
+    assert!(
+        cfg_after.contains(&dst.display().to_string()),
+        "config should be rewritten to name dst, got: {cfg_after}"
+    );
+
+    // undo migration #1: restore source, remove the copy, restore config.
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["undo", "--migration", "1"])
+        .assert()
+        .success();
+    assert!(
+        src.join("data.txt").exists(),
+        "undo should restore the source"
+    );
+    assert!(!dst.exists(), "undo should remove the migrated copy");
+    let cfg_restored = fs::read_to_string(&tool_cfg).unwrap();
+    assert!(
+        cfg_restored.contains(&src.display().to_string()),
+        "undo should restore the config to name src, got: {cfg_restored}"
+    );
+}
+
+#[test]
+fn sandbox_migrate_cleanup_removes_sidecar_keeps_live_data_via_cli() {
+    let home = TempDir::new().unwrap();
+    let root = home.path();
+    let (sg_cfg, src, _tool_cfg) = setup_config_tool(root);
+    let dst = root.join("dst");
+
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["migrate", "demo", "--to"])
+        .arg(&dst)
+        .assert()
+        .success();
+    let sidecar = find_sidecar(&src).expect("sidecar should exist after migrate");
+    assert!(sidecar.exists());
+
+    // report-only (no --execute) must not delete anything.
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .arg("migrate-cleanup")
+        .assert()
+        .success();
+    assert!(
+        sidecar.exists(),
+        "report-only cleanup must not delete the sidecar"
+    );
+
+    // --execute removes the preserved original; the live copy at dst survives.
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["migrate-cleanup", "--execute"])
+        .assert()
+        .success();
+    assert!(
+        !sidecar.exists(),
+        "cleanup --execute should remove the sidecar"
+    );
+    assert!(
+        dst.join("data.txt").exists(),
+        "live migrated data must survive cleanup"
+    );
 }
