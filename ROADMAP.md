@@ -78,6 +78,21 @@ Goal: the third "move" axis — resume the same session on a *different machine*
   follow-on
 - Secrets never travel in a bundle; one-directional by design; undoable
 
+## Fleet self-update — `sessionguard update`
+
+> **Design**: [`docs/design/update.md`](docs/design/update.md) (draft).
+
+Goal: keep every box on the fleet current with one command (the `fedora` hub was
+found four minor versions behind on 2026-06-25 — exactly the drift this closes).
+
+- `sessionguard update [--check] [--dry-run] [--to <ver>]` — self-replace from
+  GitHub releases; detect the install method and **defer to brew/cargo** rather
+  than fight them; stop/restart a running daemon; atomic swap + `.bak` rollback
+- **Prerequisite (ships independently):** publish a `SHA256SUMS` release asset
+  and verify it in both `install.sh` and `update` — closes a current
+  no-integrity-check gap in the curl-pipe installer
+- `--check` doubles as a read-only fleet-drift probe
+
 ## v0.6 — Tool Pattern Library
 
 Goal: let the community extend the pattern catalog safely.
