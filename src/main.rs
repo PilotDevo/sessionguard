@@ -821,6 +821,95 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Update { check, dry_run, to } => {
+            use sessionguard::update::{
+                check_update, detect_install_method, perform_update, CurlReleaseClient,
+                InstallMethod, REPO,
+            };
+            let current = env!("CARGO_PKG_VERSION");
+            let client = CurlReleaseClient;
+
+            // `--check`: read-only; non-zero exit when behind (scriptable drift probe).
+            if check {
+                let c = check_update(&client, REPO, current)
+                    .map_err(|e| anyhow::anyhow!("update check failed: {e}"))?;
+                if c.update_available {
+                    println!(
+                        "sessionguard {} is available (you have {}).",
+                        c.latest, c.current
+                    );
+                    println!("run `sessionguard update` to upgrade.");
+                    std::process::exit(1);
+                }
+                println!("sessionguard {} is current.", c.current);
+                return Ok(());
+            }
+
+            // Don't fight the package manager.
+            let dest = match detect_install_method()
+                .map_err(|e| anyhow::anyhow!("could not determine install method: {e}"))?
+            {
+                InstallMethod::Standalone { path } => path,
+                InstallMethod::Cargo => {
+                    println!(
+                        "Installed via cargo — run `cargo install sessionguard --force` to update."
+                    );
+                    return Ok(());
+                }
+                InstallMethod::Homebrew => {
+                    println!("Installed via Homebrew — run `brew upgrade sessionguard` to update.");
+                    return Ok(());
+                }
+                InstallMethod::GitCheckout => {
+                    return Err(anyhow::anyhow!(
+                        "running a dev build from a source checkout — rebuild from source \
+                         rather than self-updating."
+                    ));
+                }
+            };
+
+            // Resolve the target tag.
+            let tag = match to {
+                Some(t) if t.starts_with('v') => t,
+                Some(t) => format!("v{t}"),
+                None => {
+                    let c = check_update(&client, REPO, current)
+                        .map_err(|e| anyhow::anyhow!("update check failed: {e}"))?;
+                    if !c.update_available {
+                        println!("sessionguard {} is already current.", c.current);
+                        return Ok(());
+                    }
+                    c.latest
+                }
+            };
+
+            println!(
+                "{} sessionguard {} → {} ({})",
+                if dry_run { "would update" } else { "updating" },
+                current,
+                tag.trim_start_matches('v'),
+                dest.display()
+            );
+            let report = perform_update(&client, &dest, REPO, &tag, current, dry_run)
+                .map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
+            for step in &report.steps {
+                println!("  - {step}");
+            }
+            if dry_run {
+                println!("\n(dry-run only — nothing was changed.)");
+            } else {
+                println!(
+                    "\nupdated to {}. previous binary kept at {}.",
+                    report.to,
+                    report
+                        .backup
+                        .as_ref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_default()
+                );
+            }
+        }
+
         Command::Version => {
             println!(
                 "sessionguard {} ({})",

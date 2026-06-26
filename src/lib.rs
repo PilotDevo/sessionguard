@@ -19,4 +19,5 @@ pub mod migrate;
 pub mod reconciler;
 pub mod registry;
 pub mod tools;
+pub mod update;
 pub mod watcher;

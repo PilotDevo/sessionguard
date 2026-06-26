@@ -83,6 +83,11 @@ jobs:
           SESSIONGUARD_BIN: ./target/release/sessionguard
         run: bash scripts/migrate-dogfood.sh
 
+      - name: Run update-dogfood.sh
+        env:
+          SESSIONGUARD_BIN: ./target/release/sessionguard
+        run: bash scripts/update-dogfood.sh
+
   deny:
     name: Cargo Deny
     runs-on: ubuntu-latest
