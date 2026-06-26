@@ -19,6 +19,10 @@ added symlink-faithful copy plus a repo-health pass (docs realigned to
 reality, end-to-end migrate tests + `migrate-dogfood.sh`, an enforced 1.85
 MSRV CI job, and a non-fatal Homebrew release job).
 
+**v0.5.0** adds **`sessionguard update`** — one-command, checksum-verified,
+rollback-safe self-update across the fleet — plus a published `SHA256SUMS`
+release asset that `install.sh` now verifies.
+
 The local read-only **dashboard** (`tools/dashboard/`) ships with an
 **Activity** tab that gives a per-project, per-assistant view across
 Claude Code, Codex, and OpenCode session stores, and surfaces launcher
@@ -81,20 +85,19 @@ Goal: the third "move" axis — resume the same session on a *different machine*
   follow-on
 - Secrets never travel in a bundle; one-directional by design; undoable
 
-## Fleet self-update — `sessionguard update`
+## Fleet self-update — `sessionguard update`  *(shipped in v0.5.0)*
 
-> **Design**: [`docs/design/update.md`](docs/design/update.md) (draft).
+> **Design**: retired to [`docs/history/update.md`](docs/history/update.md).
 
-Goal: keep every box on the fleet current with one command (the `fedora` hub was
+Keeps every box on the fleet current with one command (the `fedora` hub was
 found four minor versions behind on 2026-06-25 — exactly the drift this closes).
 
-- `sessionguard update [--check] [--dry-run] [--to <ver>]` — self-replace from
-  GitHub releases; detect the install method and **defer to brew/cargo** rather
-  than fight them; stop/restart a running daemon; atomic swap + `.bak` rollback
-- **Prerequisite (ships independently):** publish a `SHA256SUMS` release asset
-  and verify it in both `install.sh` and `update` — closes a current
-  no-integrity-check gap in the curl-pipe installer
-- `--check` doubles as a read-only fleet-drift probe
+- [x] `sessionguard update [--check] [--dry-run] [--to <ver>]` — self-replace
+  from GitHub releases; detect the install method and **defer to brew/cargo**
+  rather than fight them; restart a running daemon; atomic swap + `.bak` rollback
+- [x] Publish a `SHA256SUMS` release asset and verify it in both `install.sh`
+  and `update` — closed the no-integrity-check gap in the curl-pipe installer
+- [x] `--check` doubles as a read-only fleet-drift probe
 
 ## v0.6 — Tool Pattern Library
 

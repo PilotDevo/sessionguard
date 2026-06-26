@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.4.2** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. The v0.4 **Migrate** arc has shipped: `sessionguard inventory` / `migrate` / `migrate-cleanup` relocate a tool's home-dir data between disks, fully reversible via `sessionguard undo`. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.5.0** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. The v0.4 **Migrate** arc shipped (`inventory` / `migrate` / `migrate-cleanup`, fully reversible via `undo`); v0.5 adds **`sessionguard update`** for one-command self-update across machines, with checksum-verified, rollback-safe binary swaps. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -202,6 +202,29 @@ SessionGuard never auto-deletes the source — `migrate-cleanup --execute` is th
 only command that removes a preserved original, and doing so makes that
 migration un-undoable (the live data at the destination is untouched). See
 [`docs/history/migrate.md`](docs/history/migrate.md) for the full design.
+
+### Update
+
+Keep SessionGuard current — handy across a fleet of machines.
+
+```bash
+# Is a newer release out? (read-only; exits non-zero if behind)
+sessionguard update --check
+
+# Upgrade to the latest release
+sessionguard update
+
+# Preview, or pin a specific version
+sessionguard update --dry-run
+sessionguard update --to v0.4.3
+```
+
+`update` self-replaces a standalone install (the `install.sh` target) — it
+verifies the download against the release `SHA256SUMS` (refusing on mismatch),
+keeps the previous binary at `<bin>.bak-<version>` for rollback, and restarts a
+running daemon. If you installed via **Homebrew** or **cargo**, it defers to
+`brew upgrade` / `cargo install --force` rather than fighting the package
+manager. See [`docs/history/update.md`](docs/history/update.md) for the design.
 
 ### Configure
 
