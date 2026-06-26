@@ -24,6 +24,17 @@ need() {
     command -v "$1" >/dev/null 2>&1 || die "Required tool not found: $1 — please install it and retry."
 }
 
+# Print the SHA-256 of a file using whichever tool is available.
+sha256_of() {
+    if command -v sha256sum >/dev/null 2>&1; then
+        sha256sum "$1" | awk '{print $1}'
+    elif command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        die "Need 'sha256sum' or 'shasum' to verify the download integrity."
+    fi
+}
+
 # ── Platform detection ────────────────────────────────────────────────────────
 
 detect_target() {
@@ -108,6 +119,22 @@ main() {
     say "Downloading $URL"
     curl -fsSL "$URL" -o "$TMPDIR/${BINARY}.tar.gz" || \
         die "Download failed. Check that release $VERSION has a binary for $TARGET."
+
+    # Verify integrity against the release's SHA256SUMS asset. Releases from
+    # v0.5.0 on publish it; for older releases that predate it we warn and
+    # proceed rather than fail (back-compat).
+    ASSET="${BINARY}-${TARGET}.tar.gz"
+    SUMS_URL="https://github.com/${REPO}/releases/download/${VERSION}/SHA256SUMS"
+    if curl -fsSL "$SUMS_URL" -o "$TMPDIR/SHA256SUMS" 2>/dev/null; then
+        expected="$(awk -v f="$ASSET" '$2 == f {print $1}' "$TMPDIR/SHA256SUMS" | head -n1)"
+        [ -n "$expected" ] || die "SHA256SUMS has no entry for $ASSET — refusing to install."
+        actual="$(sha256_of "$TMPDIR/${BINARY}.tar.gz")"
+        [ "$expected" = "$actual" ] || \
+            die "Checksum mismatch for $ASSET: expected $expected, got $actual. Aborting."
+        say "Checksum verified ($ASSET)"
+    else
+        warn "No SHA256SUMS published for $VERSION — skipping integrity check (older release)."
+    fi
 
     tar -xzf "$TMPDIR/${BINARY}.tar.gz" -C "$TMPDIR"
     chmod +x "$TMPDIR/$BINARY"

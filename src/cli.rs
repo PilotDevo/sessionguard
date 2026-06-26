@@ -201,6 +201,24 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// Update SessionGuard to the latest release.
+    ///
+    /// Self-replaces a standalone install (the `install.sh` target); defers to
+    /// the package manager for Homebrew/cargo installs; refuses a dev build.
+    /// The download is verified against the release `SHA256SUMS`, the previous
+    /// binary is kept for rollback, and a running daemon is restarted.
+    Update {
+        /// Only report whether a newer release exists; change nothing.
+        #[arg(long)]
+        check: bool,
+        /// Show what would happen without downloading or replacing anything.
+        #[arg(long)]
+        dry_run: bool,
+        /// Install a specific version instead of the latest (e.g. `v0.4.3`).
+        #[arg(long)]
+        to: Option<String>,
+    },
+
     /// Print version info.
     Version,
 

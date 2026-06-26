@@ -2,6 +2,39 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.5.0] - 2026-06-26
+
+### Features — fleet self-update
+
+`sessionguard update` keeps a machine current with one command — built
+after the fedora hub was found four minor versions behind without anyone
+noticing.
+
+- **`sessionguard update [--check] [--dry-run] [--to <ver>]`.** Detects how
+  the binary was installed and **defers to the package manager** rather than
+  fighting it: self-replaces only a standalone (`install.sh`) install,
+  prints the right `brew upgrade` / `cargo install --force` for those, and
+  refuses a dev build. `--check` is a read-only fleet-drift probe (exits
+  non-zero when behind).
+- **Integrity-gated, reversible.** The downloaded asset is verified against
+  the release `SHA256SUMS` and **refused on mismatch** before anything is
+  swapped; the previous binary is kept at `<bin>.bak-<ver>`; a running
+  systemd `--user` daemon is restarted. Uses `sudo` only when the install
+  dir isn't writable.
+
+### Changed — release integrity (prerequisite)
+
+- Releases now publish a **`SHA256SUMS`** asset alongside the tarballs, and
+  `install.sh` verifies the download against it (refuse on mismatch; warn
+  and proceed only for older releases that predate the asset). Closes a
+  no-integrity-check gap in the curl-pipe installer.
+
+### Testing
+
+- `scripts/update-dogfood.sh` exercises the full self-update path offline
+  via a `file://` fake release — swap, `.bak` rollback, and checksum-tamper
+  refusal — on both OSes in CI. 133 lib + 28 integration tests passing.
+
 ## [0.4.3] - 2026-06-25
 
 A repo-health pass: the engine was already solid, but the docs had drifted

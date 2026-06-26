@@ -1,9 +1,13 @@
-# Design: `sessionguard update` — self-update across the fleet (v0.5?)
+# Design: `sessionguard update` — self-update across the fleet — SHIPPED (v0.5.0)
 
-> **Status**: Design draft. No code yet. Land this doc first, take a beat,
-> then implement — same cadence as `migrate.md` (→ v0.4) and `handoff.md`.
-> Reviewers: feedback as GitHub issues. Last revised: 2026-06-25
-> (v0.4.3 baseline).
+> **Status**: SHIPPED in v0.5.0 and retired to `docs/history/`. The
+> implementation in `src/update.rs` follows this contract closely: curl-backed
+> `ReleaseClient` (hand-rolled, not the `self_update` crate), install-method
+> detection with package-manager deferral, SHA256SUMS-verified download, atomic
+> swap with `.bak-<ver>` rollback, systemd `--user` daemon restart. The
+> `SHA256SUMS` prerequisite shipped too (release.yml + install.sh). For current
+> behavior see `src/update.rs`, the README "Update" section, and `CHANGELOG.md`.
+> Originally drafted 2026-06-25 (v0.4.3 baseline).
 
 ## Thesis
 
