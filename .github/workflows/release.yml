@@ -70,11 +70,26 @@ jobs:
         with:
           path: artifacts
 
+      - name: Generate SHA256SUMS
+        # Flatten every per-target tarball into dist/ and checksum them by
+        # basename, so `install.sh` and `sessionguard update` can verify a
+        # downloaded asset against `<sha>  <filename>` lines. This is the
+        # integrity gate both consumers rely on.
+        run: |
+          mkdir -p dist
+          find artifacts -name '*.tar.gz' -exec cp {} dist/ \;
+          cd dist
+          sha256sum *.tar.gz > SHA256SUMS
+          echo "--- SHA256SUMS ---"
+          cat SHA256SUMS
+
       - name: Create release
         uses: softprops/action-gh-release@v3
         with:
           body_path: RELEASE_NOTES.md
-          files: artifacts/**/*.tar.gz
+          files: |
+            dist/*.tar.gz
+            dist/SHA256SUMS
 
   publish:
     name: Publish to crates.io
