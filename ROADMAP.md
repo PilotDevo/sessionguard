@@ -6,7 +6,7 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.4.2 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
+**v0.4.3 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
 v0.1–v0.3 reconcile pipeline (move detection on macOS + Linux, seven built-in
 tools, `undo`, `--format json`, launcher health, `doctor --clean`),
 SessionGuard now relocates a tool's home-dir data between disks:
@@ -14,7 +14,10 @@ SessionGuard now relocates a tool's home-dir data between disks:
 <path>` runs a nine-stage state machine (quiesce → copy → verify → rewrite →
 validate → retain) that's fully reversible via `undo` / `undo --migration
 <id>`; `migrate-cleanup` reclaims the preserved originals. The source is never
-auto-deleted. Dogfooded on a multi-GB OpenCode store → fast pool.
+auto-deleted. Dogfooded on a multi-GB OpenCode store → fast pool. v0.4.3
+added symlink-faithful copy plus a repo-health pass (docs realigned to
+reality, end-to-end migrate tests + `migrate-dogfood.sh`, an enforced 1.85
+MSRV CI job, and a non-fatal Homebrew release job).
 
 The local read-only **dashboard** (`tools/dashboard/`) ships with an
 **Activity** tab that gives a per-project, per-assistant view across
