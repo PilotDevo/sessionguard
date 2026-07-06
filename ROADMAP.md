@@ -6,7 +6,7 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.4.3 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
+**v0.5.0 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
 v0.1–v0.3 reconcile pipeline (move detection on macOS + Linux, seven built-in
 tools, `undo`, `--format json`, launcher health, `doctor --clean`),
 SessionGuard now relocates a tool's home-dir data between disks:

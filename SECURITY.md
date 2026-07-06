@@ -4,8 +4,8 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.4.x   | ✅ Yes     |
-| < 0.4   | ⚠️ Best-effort (upgrade to the latest 0.4.x) |
+| 0.5.x   | ✅ Yes     |
+| < 0.5   | ⚠️ Best-effort (upgrade to the latest 0.5.x) |
 
 ## Reporting a Vulnerability
 

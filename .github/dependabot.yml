@@ -11,3 +11,10 @@ updates:
     schedule:
       interval: weekly
     open-pull-requests-limit: 5
+    ignore:
+      # The MSRV job pins `dtolnay/rust-toolchain@1.85` as the *toolchain
+      # version to test against*, not an action version to keep current.
+      # Dependabot reads the `@1.85` ref as a version and tries to bump it
+      # (e.g. → 1.100), which would silently defeat the MSRV gate. Ignore it;
+      # bump the MSRV deliberately when we actually raise the floor.
+      - dependency-name: "dtolnay/rust-toolchain"
