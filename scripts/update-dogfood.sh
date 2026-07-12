@@ -104,6 +104,27 @@ grep -qi "checksum mismatch" "$WORKDIR/tamper.log" || fail "tamper rejection lac
 "$DEST" version | grep -q "fake-update" && fail "tampered update still swapped the binary"
 echo "  ✓ tampered asset refused; binary untouched"
 
+# ── 5. dev-build (source checkout) is REFUSED, not clobbered ────────────────
+# The under-test binary itself lives under target/, so it classifies as a
+# GitCheckout — a real `update` must refuse rather than overwrite a dev build.
+echo "▶ dev-build refusal..."
+if "$SG" update >"$WORKDIR/devbuild.log" 2>&1; then
+    fail "update did not refuse a dev build"
+fi
+grep -qi "dev build" "$WORKDIR/devbuild.log" || fail "dev-build refusal message missing"
+echo "  ✓ dev build refused (no clobber)"
+
+# ── 6. cargo / homebrew installs DEFER to the package manager ───────────────
+echo "▶ package-manager deferral..."
+CARGO_BIN="$WORKDIR/.cargo/bin"; mkdir -p "$CARGO_BIN"; cp "$SG" "$CARGO_BIN/sessionguard"
+"$CARGO_BIN/sessionguard" update >"$WORKDIR/cargo.log" 2>&1 || fail "cargo-install update should exit 0 (deferral)"
+grep -qi "cargo install" "$WORKDIR/cargo.log" || fail "cargo deferral message missing"
+
+BREW_BIN="$WORKDIR/homebrew/Cellar/sessionguard/9.9/bin"; mkdir -p "$BREW_BIN"; cp "$SG" "$BREW_BIN/sessionguard"
+"$BREW_BIN/sessionguard" update >"$WORKDIR/brew.log" 2>&1 || fail "homebrew update should exit 0 (deferral)"
+grep -qi "brew upgrade" "$WORKDIR/brew.log" || fail "homebrew deferral message missing"
+echo "  ✓ defers to cargo and homebrew (no swap)"
+
 echo
-echo "✅ PASS — update swap + .bak rollback + checksum-gate all correct"
+echo "✅ PASS — swap + rollback + checksum-gate + dev-refusal + pkg-deferral all correct"
 exit 0
