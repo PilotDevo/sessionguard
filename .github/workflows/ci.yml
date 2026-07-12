@@ -90,7 +90,26 @@ jobs:
 
   deny:
     name: Cargo Deny
+    # Also runs the RustSec advisory DB check ([advisories] in deny.toml),
+    # so vulnerability scanning is already gated here — no separate
+    # cargo-audit job needed.
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
       - uses: EmbarkStudios/cargo-deny-action@v2
+
+  coverage:
+    name: Coverage baseline
+    # Establishes a line-coverage signal (previously unmeasured). Non-gating
+    # for now — prints a summary; add `--fail-under-lines N` once we've
+    # settled on a floor.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: llvm-tools-preview
+      - uses: Swatinem/rust-cache@v2
+      - uses: taiki-e/install-action@cargo-llvm-cov
+      - name: Coverage summary
+        run: cargo llvm-cov --workspace --summary-only
