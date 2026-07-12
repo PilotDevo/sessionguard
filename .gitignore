@@ -17,6 +17,12 @@
 .env
 .env.*
 
+# Local secrets / scratch — never commit tokens or keys
+tmp/
+*.cask-api
+*-token
+*.pem
+
 # Coverage
 *.profraw
 *.profdata
