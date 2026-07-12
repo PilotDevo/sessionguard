@@ -19,8 +19,9 @@
 
 # Local secrets / scratch — never commit tokens or keys
 tmp/
-*.cask-api
+*-api
 *-token
+*-key
 *.pem
 
 # Coverage
