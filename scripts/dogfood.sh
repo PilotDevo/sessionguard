@@ -147,7 +147,9 @@ with open('$SETTINGS_FILE') as f:
     exit 0
 else
     echo "❌ FAIL — reconciliation did not fire."
-    echo "           On Linux this is the known RenameMode::From/To half-event gap —"
-    echo "           the daemon sees the rename but doesn't pair the halves yet."
+    echo "           This is unexpected: the daemon pairs Linux rename half-events"
+    echo "           by cookie (watcher.rs RenameBuffer) and this smoke passes on"
+    echo "           both OSes in CI. A failure here is a real regression in the"
+    echo "           watcher → daemon → reconciler pipeline — investigate, don't ignore."
     exit 1
 fi

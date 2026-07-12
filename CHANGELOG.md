@@ -2,6 +2,38 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.5.1] - 2026-07-12
+
+### Testing — close the coverage gaps a deep audit surfaced
+
+A two-track analysis (coverage census + project-state review) drove a
+pre-Handoff hardening pass. No user-facing behavior change.
+
+- **The reconcile pipeline dispatcher is now tested.** `daemon.rs`'s
+  `handle_session_event` (detector → reconciler → registry → event log) had
+  *zero* direct tests — the product's core seam, previously exercised only
+  by `dogfood.sh`. Added 4 unit tests: moved-reconciles-and-reregisters plus
+  the no-artifacts / partial-move / removed-path arms.
+- **`update` install-method branches covered.** `update-dogfood.sh` now
+  proves the dev-build (source checkout) *refusal* and the cargo/homebrew
+  *deferral* — the guards that stop `update` clobbering a package-managed or
+  dev binary.
+- Added: `doctor` launcher-health section renders (sandbox); symlink-discovery
+  migrate→undo through the real CLI; `tools list --format json` carries
+  `binary_status`; `inventory` records a note on a permission-denied dir
+  without panicking.
+- Fixed the stale `dogfood.sh` Linux message (the daemon cookie-pairs rename
+  half-events now; a failure there is a real regression, not an expected gap).
+
+### Changed
+
+- **Split `migrate.rs` (3,798 lines) into a `migrate/` module** —
+  `migrate/mod.rs` (production state machine, 1,968 lines) + `migrate/tests.rs`
+  (test suite). Pure move, zero behavior change; the module was 40% of the
+  codebase and the primary structural debt.
+- **CI: non-gating coverage baseline** via `cargo-llvm-cov` (line coverage was
+  previously unmeasured). Advisory scanning was already gated by `cargo-deny`.
+
 ## [0.5.0] - 2026-06-26
 
 ### Features — fleet self-update

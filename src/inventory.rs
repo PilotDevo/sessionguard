@@ -251,6 +251,37 @@ mod tests {
         assert!(inv[0].last_modified.is_none());
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn permission_denied_dir_records_note_without_panic() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        fs::write(dir.path().join("ok.txt"), b"hi").unwrap();
+        let locked = dir.path().join("locked");
+        fs::create_dir_all(&locked).unwrap();
+        fs::write(locked.join("secret"), b"x").unwrap();
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let t = tool_with_layout("perm", dir.path().to_str().unwrap());
+        let inv = inventory_tools_impl([&t]);
+
+        // Restore perms so the TempDir can be cleaned up on drop.
+        fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert_eq!(inv.len(), 1);
+        let e = &inv[0];
+        assert!(e.exists);
+        assert!(
+            e.notes.iter().any(|n| n.contains("read_dir failed")),
+            "expected a note about the unreadable dir, got: {:?}",
+            e.notes
+        );
+        assert!(
+            e.file_count >= 1,
+            "the readable top-level file is still counted"
+        );
+    }
+
     #[test]
     fn walks_real_dir_and_sums_sizes() {
         let dir = TempDir::new().unwrap();

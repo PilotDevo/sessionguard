@@ -198,3 +198,23 @@ fn cli_undo_no_events_prints_message() {
         .success()
         .stdout(predicate::str::contains("no actions to undo"));
 }
+
+#[test]
+fn cli_tools_list_json_carries_binary_status() {
+    // The launcher-health column the dashboard consumes.
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
+        .args(["tools", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let parsed: serde_json::Value = serde_json::from_slice(&out).expect("tools JSON should parse");
+    for t in parsed.as_array().expect("array") {
+        assert!(
+            t.get("binary_status").is_some(),
+            "each tool entry should carry binary_status"
+        );
+    }
+}

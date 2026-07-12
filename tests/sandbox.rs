@@ -511,3 +511,85 @@ fn sandbox_migrate_cleanup_removes_sidecar_keeps_live_data_via_cli() {
         "live migrated data must survive cleanup"
     );
 }
+
+#[test]
+fn sandbox_doctor_shows_launcher_health_section() {
+    // `doctor` always renders a launcher-health section for every registered
+    // tool (present/missing/not-configured). Surfacing was previously unit-only.
+    let sandbox = TempDir::new().unwrap();
+    cmd(sandbox.path())
+        .arg("doctor")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("launcher health"));
+}
+
+#[test]
+fn sandbox_migrate_symlink_discovery_round_trips_via_cli() {
+    // Parity with the config-discovery e2e, for the symlink discovery branch:
+    // migrate leaves a symlink at the source pointing at the destination and
+    // preserves the original; undo restores the real directory.
+    let home = TempDir::new().unwrap();
+    let root = home.path();
+    let src = root.join("symsrc");
+    fs::create_dir_all(src.join("nested")).unwrap();
+    fs::write(src.join("data.txt"), "payload").unwrap();
+    fs::write(src.join("nested/blob.bin"), vec![9u8; 1024]).unwrap();
+
+    let sg_cfg = root.join("sessionguard.toml");
+    fs::write(
+        &sg_cfg,
+        format!(
+            r#"[[tools]]
+name = "symdemo"
+display_name = "Symlink Demo"
+on_move = "notify"
+session_patterns = ["AGENTS.md"]
+
+[tools.home_dir_layout]
+default_path = "{src}"
+discovery = "symlink"
+"#,
+            src = src.display(),
+        ),
+    )
+    .unwrap();
+
+    let dst = root.join("dst");
+
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["migrate", "symdemo", "--to"])
+        .arg(&dst)
+        .assert()
+        .success();
+    assert!(dst.join("data.txt").exists(), "destination populated");
+    let meta = fs::symlink_metadata(&src).unwrap();
+    assert!(
+        meta.file_type().is_symlink(),
+        "source should be a symlink after symlink-discovery migrate"
+    );
+    assert!(
+        src.join("data.txt").exists(),
+        "the symlink should resolve to the migrated data"
+    );
+    assert!(
+        find_sidecar(&src).is_some(),
+        "original should be preserved as a .migrated sidecar"
+    );
+
+    isolated(root)
+        .arg("--config")
+        .arg(&sg_cfg)
+        .args(["undo", "--migration", "1"])
+        .assert()
+        .success();
+    let meta = fs::symlink_metadata(&src).unwrap();
+    assert!(
+        meta.is_dir() && !meta.file_type().is_symlink(),
+        "source should be restored to a real directory"
+    );
+    assert!(src.join("data.txt").exists(), "source data restored");
+    assert!(!dst.exists(), "destination removed by undo");
+}

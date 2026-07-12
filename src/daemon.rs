@@ -264,3 +264,150 @@ async fn shutdown_signal() {
         _ = terminate => {}
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::handle_session_event;
+    use crate::event_log::EventLog;
+    use crate::registry::Registry;
+    use crate::tools::ToolRegistry;
+    use crate::watcher::SessionEvent;
+    use std::path::{Path, PathBuf};
+    use tempfile::TempDir;
+
+    fn claude_project(root: &Path, name: &str) -> PathBuf {
+        let p = root.join(name);
+        std::fs::create_dir_all(p.join(".claude")).unwrap();
+        std::fs::write(p.join("CLAUDE.md"), "# test").unwrap();
+        std::fs::write(
+            p.join(".claude/settings.json"),
+            format!(r#"{{"project_path": "{}","model": "opus"}}"#, p.display()),
+        )
+        .unwrap();
+        p
+    }
+
+    // The core pipeline seam: a paired Moved event detects the tool at the new
+    // location, reconciles its artifacts, registers the new path, and logs it.
+    #[test]
+    fn handle_session_event_moved_reconciles_and_reregisters() {
+        let dir = TempDir::new().unwrap();
+        let old = claude_project(dir.path(), "alpha");
+        let new = dir.path().join("beta");
+        std::fs::rename(&old, &new).unwrap(); // settings.json still names `old`
+
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+
+        handle_session_event(
+            SessionEvent::Moved {
+                from: Some(old.clone()),
+                to: Some(new.clone()),
+            },
+            &registry,
+            &tools,
+            &log,
+        );
+
+        let settings = std::fs::read_to_string(new.join(".claude/settings.json")).unwrap();
+        assert!(
+            settings.contains(&new.display().to_string()),
+            "project_path should be rewritten to the new path"
+        );
+        assert!(
+            !settings.contains(&old.display().to_string()),
+            "the old path should be gone"
+        );
+
+        let projects = registry.list_projects().unwrap();
+        assert!(
+            projects.iter().any(|p| p.path == new),
+            "new path should be registered"
+        );
+        assert!(
+            !projects.iter().any(|p| p.path == old),
+            "old path should not be registered"
+        );
+        assert!(
+            log.count().unwrap() >= 1,
+            "a reconcile event should be logged"
+        );
+    }
+
+    // Moved to a location with no AI artifacts: detect finds nothing, so the
+    // registry and event log stay untouched.
+    #[test]
+    fn handle_session_event_no_artifacts_leaves_registry_empty() {
+        let dir = TempDir::new().unwrap();
+        let new = dir.path().join("plain-new");
+        std::fs::create_dir_all(&new).unwrap();
+        std::fs::write(new.join("README.md"), "# plain").unwrap();
+
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+
+        handle_session_event(
+            SessionEvent::Moved {
+                from: Some(dir.path().join("plain-old")),
+                to: Some(new),
+            },
+            &registry,
+            &tools,
+            &log,
+        );
+
+        assert!(registry.list_projects().unwrap().is_empty());
+        assert_eq!(log.count().unwrap(), 0);
+    }
+
+    // A partial move (one half of the pair missing) is skipped, not acted on.
+    #[test]
+    fn handle_session_event_partial_move_is_noop() {
+        let dir = TempDir::new().unwrap();
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+
+        handle_session_event(
+            SessionEvent::Moved {
+                from: Some(dir.path().join("x")),
+                to: None,
+            },
+            &registry,
+            &tools,
+            &log,
+        );
+
+        assert!(registry.list_projects().unwrap().is_empty());
+        assert_eq!(log.count().unwrap(), 0);
+    }
+
+    // A Removed event for a tracked-but-vanished path is informational only —
+    // it never mutates the registry or logs a reconcile.
+    #[test]
+    fn handle_session_event_removed_tracked_path_does_not_mutate() {
+        let dir = TempDir::new().unwrap();
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+
+        let gone = dir.path().join("vanished");
+        std::fs::create_dir_all(&gone).unwrap();
+        registry.register_project(&gone).unwrap();
+        std::fs::remove_dir_all(&gone).unwrap();
+
+        handle_session_event(SessionEvent::Removed(gone.clone()), &registry, &tools, &log);
+
+        assert!(
+            registry
+                .list_projects()
+                .unwrap()
+                .iter()
+                .any(|p| p.path == gone),
+            "the entry should remain (Removed is informational)"
+        );
+        assert_eq!(log.count().unwrap(), 0);
+    }
+}
