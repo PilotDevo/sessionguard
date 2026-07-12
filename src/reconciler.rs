@@ -94,7 +94,22 @@ fn rewrite_paths(
                         new_value: pairs[0].1.clone(),
                     };
                     if let Err(e) = event_log.record(&action) {
-                        warn!(error = %e, "failed to record reconciliation action");
+                        // The file is already rewritten. Failing to log it means
+                        // `undo` can never reverse this change, so surface it as
+                        // a hard failure instead of a silent `warn!` — the
+                        // operator needs to know. (H1's WAL + busy_timeout make
+                        // this rare; a swallowed error here was a data-loss gap.)
+                        actions.push(action);
+                        return ReconcileResult {
+                            tool_name: tool.name.clone(),
+                            actions_taken: actions,
+                            success: false,
+                            error: Some(format!(
+                                "rewrote {} but failed to record its undo entry \
+                                 (undo unavailable for this change): {e}",
+                                artifact_path.display()
+                            )),
+                        };
                     }
                     actions.push(action);
                 }

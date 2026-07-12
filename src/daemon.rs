@@ -33,7 +33,7 @@ pub fn write_pid_file() -> Result<()> {
 
     // Refuse if another daemon is already alive.
     if let Ok(Some(existing)) = read_pid() {
-        if existing != std::process::id() && process_exists(existing) {
+        if existing != std::process::id() && is_sessionguard_process(existing) {
             return Err(Error::Daemon(format!(
                 "another sessionguard daemon is already running (PID {existing})"
             )));
@@ -70,24 +70,48 @@ pub fn read_pid() -> Result<Option<u32>> {
     Ok(Some(pid))
 }
 
-/// Check if a daemon is currently running.
+/// Check if a SessionGuard daemon is currently running.
 ///
-/// On non-Unix platforms, returns `true` whenever a PID file exists
-/// (process liveness cannot be verified without `kill(pid, 0)`).
+/// Verifies both that the stored PID is alive AND that the process is actually
+/// sessionguard — not an unrelated process that recycled the PID after a crash.
+/// On non-Unix platforms, returns `true` whenever a PID file exists.
 pub fn is_running() -> bool {
-    read_pid().ok().flatten().is_some_and(process_exists)
+    read_pid()
+        .ok()
+        .flatten()
+        .is_some_and(is_sessionguard_process)
 }
 
-/// Check if a process with the given PID exists.
-fn process_exists(pid: u32) -> bool {
-    // On Unix, signal 0 checks existence without sending a signal.
+/// Whether `pid` is a live process that is a sessionguard daemon.
+///
+/// A bare liveness check (`kill(pid, 0)`) is not enough: after a crash without
+/// cleanup + a reboot, the OS can recycle the stored PID to an unrelated
+/// process, and `stop`/`status` would then signal or report *that* process.
+/// So we also confirm the process command is sessionguard.
+fn is_sessionguard_process(pid: u32) -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        // Must exist (signal 0 sends nothing).
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return false;
+        }
+        // ...and its command must be sessionguard. `ps -p <pid> -o comm=`
+        // works on both Linux and macOS (comm = executable basename).
+        match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .to_lowercase()
+                .contains("sessionguard"),
+            // If `ps` isn't available, fall back to liveness-only rather than
+            // refusing to ever stop a genuine daemon.
+            _ => true,
+        }
     }
     #[cfg(not(unix))]
     {
-        // Fallback: assume running if PID file exists.
+        let _ = pid;
         true
     }
 }
@@ -274,6 +298,20 @@ mod tests {
     use crate::watcher::SessionEvent;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_identity_rejects_non_sessionguard_process() {
+        // PID 1 (init/launchd) is always alive but is NOT sessionguard, so a
+        // liveness-only check would wrongly treat it as our daemon. The
+        // identity check must reject it.
+        assert!(
+            !super::is_sessionguard_process(1),
+            "PID 1 is not sessionguard and must not be treated as a running daemon"
+        );
+        // A very high, almost-certainly-dead PID is also rejected.
+        assert!(!super::is_sessionguard_process(4_000_000_000));
+    }
 
     fn claude_project(root: &Path, name: &str) -> PathBuf {
         let p = root.join(name);

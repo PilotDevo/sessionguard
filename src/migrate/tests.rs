@@ -875,6 +875,43 @@ fn migrate_refuses_env_discovery_when_no_unit_declared() {
     assert!(!dst.exists(), "rollback must remove dst on Env refusal");
 }
 
+#[test]
+fn migrate_resumes_the_service_when_a_stage_aborts() {
+    // A unit quiesced before Copy must be brought back up even if the migration
+    // fails after Quiesce — otherwise the operator's service is left stopped.
+    let tmp = TempDir::new().unwrap();
+    let src = tmp.path().join("src");
+    populate(&src, &[("a.txt", b"hi")]);
+    let dst = tmp.path().join("dst");
+
+    // Config discovery whose config file is invalid JSON → Copy/Verify succeed,
+    // then Rewrite fails. Declare a quiesce unit so Quiesce actually stops it.
+    let bad_cfg = tmp.path().join("config.json");
+    std::fs::write(&bad_cfg, "NOT VALID JSON {{{").unwrap();
+    let mut t = config_tool_json(&bad_cfg, "data_dir", &src.display().to_string());
+    t.home_dir_layout
+        .as_mut()
+        .unwrap()
+        .quiesce
+        .systemd_user_unit = Some("svc.service".into());
+
+    let fake = FakeQuiescer::default();
+    let (ew, _scratch) = fake_env_writer();
+    let err = migrate_with_backends(&t, &src, &dst, false, &fake, &ew).unwrap_err();
+    assert!(matches!(err, MigrateError::StageFailed(Stage::Rewrite, _)));
+
+    let calls = fake.calls();
+    assert!(
+        calls.iter().any(|c| c.starts_with("quiesce")),
+        "should have quiesced"
+    );
+    assert!(
+        calls.iter().any(|c| c.starts_with("resume")),
+        "must resume the unit after aborting; calls: {calls:?}"
+    );
+    assert!(!dst.exists(), "aborted migration should leave no dst");
+}
+
 // ── New in step 6b-config: Config discovery via reconciler adapters
 
 /// Build a Config-discovery tool whose data-dir is named in a JSON

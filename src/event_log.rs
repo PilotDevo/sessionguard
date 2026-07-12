@@ -82,6 +82,7 @@ impl EventLog {
     /// Open (or create) the event log at a specific path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        crate::registry::tune_connection(&conn)?;
         let log = Self { conn };
         log.migrate()?;
         Ok(log)
