@@ -2,6 +2,31 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.5.2] - 2026-07-12
+
+### Fixed — data-safety + update-security (audit Wave 1, 3 BLOCKERs)
+
+A recursive whole-codebase footgun audit surfaced three blocking issues; all
+fixed here. Full register + remaining waves in `docs/design/hardening-audit.md`.
+
+- **Atomic artifact rewrites.** The reconciler's path rewrites used an in-place
+  `fs::write` (truncate-then-write); a crash, power loss, or full disk mid-write
+  could leave a user's session file truncated and unrecoverable. Rewrites now go
+  through a temp sibling → `fsync` → atomic `rename` (mode preserved) — either the
+  old or the new file survives intact, never a torn one.
+- **Rollback-safe self-update swap.** `update` removed the working binary before
+  the new one was in place; a mid-swap failure (disk full, sudo expiry) could
+  leave no `sessionguard` on `PATH`. The swap now stages the new binary, copies
+  the current one aside, and atomically renames — `dest` is never absent, and the
+  root path runs the whole sequence in one `sudo sh -c`.
+- **Closed the update code-execution seam.** `SESSIONGUARD_UPDATE_BASE_URL`
+  (which points the self-replacing binary at an arbitrary release) is now honored
+  only behind an explicit, hidden `--allow-custom-base` flag used by the offline
+  dogfood/tests; production always uses the pinned GitHub release URL.
+- **Downgrade + tag guards.** `update --to` validates the tag shape and refuses
+  installing an older release than the one running unless `--allow-downgrade` is
+  passed.
+
 ## [0.5.1] - 2026-07-12
 
 ### Testing — close the coverage gaps a deep audit surfaced

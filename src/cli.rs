@@ -217,6 +217,13 @@ pub enum Command {
         /// Install a specific version instead of the latest (e.g. `v0.4.3`).
         #[arg(long)]
         to: Option<String>,
+        /// Permit installing an older release than the one running.
+        #[arg(long)]
+        allow_downgrade: bool,
+        /// Honor `SESSIONGUARD_UPDATE_BASE_URL` (a code-execution seam; used by
+        /// the offline dogfood/tests only). Hidden — never needed in normal use.
+        #[arg(long, hide = true)]
+        allow_custom_base: bool,
     },
 
     /// Print version info.

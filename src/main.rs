@@ -821,10 +821,16 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Update { check, dry_run, to } => {
+        Command::Update {
+            check,
+            dry_run,
+            to,
+            allow_downgrade,
+            allow_custom_base,
+        } => {
             use sessionguard::update::{
                 check_update, detect_install_method, perform_update, CurlReleaseClient,
-                InstallMethod, REPO,
+                InstallMethod, UpdateOpts, REPO,
             };
             let current = env!("CARGO_PKG_VERSION");
             let client = CurlReleaseClient;
@@ -890,8 +896,19 @@ async fn main() -> Result<()> {
                 tag.trim_start_matches('v'),
                 dest.display()
             );
-            let report = perform_update(&client, &dest, REPO, &tag, current, dry_run)
-                .map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
+            let report = perform_update(
+                &client,
+                &dest,
+                REPO,
+                &tag,
+                current,
+                dry_run,
+                UpdateOpts {
+                    allow_custom_base,
+                    allow_downgrade,
+                },
+            )
+            .map_err(|e| anyhow::anyhow!("update failed: {e}"))?;
             for step in &report.steps {
                 println!("  - {step}");
             }
