@@ -300,6 +300,14 @@ fn restart_daemon_if_running() -> String {
 /// writable (the root-owned `/usr/local/bin` case).
 fn swap_binary(dest: &Path, new_bin: &Path, backup: &Path) -> Result<(), UpdateError> {
     let dir = dest.parent().unwrap_or(Path::new("/"));
+    let dest_name = dest
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("sessionguard");
+    // Stage the new binary as a temp in the *same directory* so the final step
+    // is an atomic same-filesystem rename.
+    let tmp = dir.join(format!(".{dest_name}.sg-new-{}", std::process::id()));
+
     let writable = dir
         .metadata()
         .map(|m| !m.permissions().readonly())
@@ -312,34 +320,55 @@ fn swap_binary(dest: &Path, new_bin: &Path, backup: &Path) -> Result<(), UpdateE
             .unwrap_or(false);
 
     if writable {
-        // Keep the old binary, then atomically rename the new one over dest.
-        std::fs::rename(dest, backup)?;
-        std::fs::copy(new_bin, dest)?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o755))?;
-        }
-        Ok(())
-    } else {
-        // Root-owned target: do it through sudo (non-interactive-friendly when
-        // passwordless; otherwise prompts).
-        let run = |args: &[&str]| -> Result<(), UpdateError> {
-            let st = std::process::Command::new("sudo").args(args).status()?;
-            if st.success() {
-                Ok(())
-            } else {
-                Err(UpdateError::Refused(format!(
-                    "sudo {} failed",
-                    args.join(" ")
-                )))
+        // Ordering matters: keep `dest` in place until the very last atomic
+        // rename, so a failure at any step leaves the *working* binary intact
+        // (the previous brick-risk: it renamed dest away first).
+        let staged = (|| -> std::io::Result<()> {
+            std::fs::copy(new_bin, &tmp)?; // 1. stage new binary as temp
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o755))?;
             }
-        };
-        run(&["mv", &dest.to_string_lossy(), &backup.to_string_lossy()])?;
-        run(&["cp", &new_bin.to_string_lossy(), &dest.to_string_lossy()])?;
-        run(&["chmod", "755", &dest.to_string_lossy()])?;
-        Ok(())
+            std::fs::copy(dest, backup)?; // 2. copy current aside for rollback (dest stays)
+            std::fs::rename(&tmp, dest) // 3. atomic replace — dest is never absent
+        })();
+        if staged.is_err() {
+            let _ = std::fs::remove_file(&tmp); // dest is untouched; just clean the temp
+        }
+        staged.map_err(UpdateError::Io)
+    } else {
+        // Root-owned dir: run the whole stage→backup→atomic-mv sequence in ONE
+        // `sudo sh -c` with `set -e`, so a partial failure never leaves `dest`
+        // missing — `mv -f` atomically replaces it only as the last step.
+        // Paths are passed as positional args ($1..$4), not interpolated.
+        let script =
+            "set -e; cp \"$1\" \"$4\"; chmod 755 \"$4\"; cp \"$2\" \"$3\"; mv -f \"$4\" \"$2\"";
+        let st = std::process::Command::new("sudo")
+            .args(["sh", "-c", script, "sh"])
+            .arg(new_bin)
+            .arg(dest)
+            .arg(backup)
+            .arg(&tmp)
+            .status()?;
+        if st.success() {
+            Ok(())
+        } else {
+            Err(UpdateError::Refused(
+                "sudo swap failed; the original binary was left intact".into(),
+            ))
+        }
     }
+}
+
+/// Security-relevant opt-ins for [`perform_update`], off by default.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct UpdateOpts {
+    /// Honor the `SESSIONGUARD_UPDATE_BASE_URL` override (a code-execution seam;
+    /// used only by the offline dogfood/tests via an explicit `--allow-custom-base`).
+    pub allow_custom_base: bool,
+    /// Permit installing an older release than the running one.
+    pub allow_downgrade: bool,
 }
 
 /// Perform a self-update of a Standalone install to `tag`. Downloads the
@@ -352,15 +381,38 @@ pub fn perform_update(
     tag: &str,
     current: &str,
     dry_run: bool,
+    opts: UpdateOpts,
 ) -> Result<UpdateReport, UpdateError> {
+    // Validate the tag shape before it's ever interpolated into a URL — rejects
+    // path-traversal / arbitrary strings (`parse_version` returns None for those).
+    let Some(tag_ver) = parse_version(tag) else {
+        return Err(UpdateError::Refused(format!(
+            "`{tag}` is not a valid version tag (expected vX.Y.Z)"
+        )));
+    };
+    // Refuse a downgrade unless explicitly allowed — stops `--to <old-vulnerable>`.
+    if !opts.allow_downgrade {
+        if let Some(cur) = parse_version(current) {
+            if tag_ver < cur {
+                return Err(UpdateError::Refused(format!(
+                    "{tag} is older than the current {current}; pass --allow-downgrade to force it"
+                )));
+            }
+        }
+    }
+
     let triple = target_triple()?;
     let asset = format!("sessionguard-{triple}.tar.gz");
-    // Base URL of the release's assets. Overridable via
-    // `SESSIONGUARD_UPDATE_BASE_URL` so tests / the dogfood script can serve a
-    // fake release over `file://` (curl handles it) without hitting GitHub; it
-    // also allows pointing at a mirror. Defaults to the GitHub release path.
-    let base = std::env::var("SESSIONGUARD_UPDATE_BASE_URL")
-        .unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download/{tag}"));
+    // Base URL of the release's assets. The `SESSIONGUARD_UPDATE_BASE_URL`
+    // override is a code-execution seam (it points the self-replacing binary at
+    // an arbitrary release), so it is honored ONLY when `--allow-custom-base` is
+    // passed — the dogfood/test path opts in explicitly; production never does.
+    let base = if opts.allow_custom_base {
+        std::env::var("SESSIONGUARD_UPDATE_BASE_URL")
+            .unwrap_or_else(|_| format!("https://github.com/{repo}/releases/download/{tag}"))
+    } else {
+        format!("https://github.com/{repo}/releases/download/{tag}")
+    };
     let asset_url = format!("{base}/{asset}");
     let sums_url = format!("{base}/SHA256SUMS");
     let backup = dest.with_file_name(format!(
@@ -570,11 +622,73 @@ c0ffee00  sessionguard-x86_64-unknown-linux-gnu.tar.gz
             tag: "v0.5.0".into(),
         };
         let dest = PathBuf::from("/usr/local/bin/sessionguard");
-        let r = perform_update(&client, &dest, "x/y", "v0.5.0", "0.4.3", true).unwrap();
+        let r = perform_update(
+            &client,
+            &dest,
+            "x/y",
+            "v0.5.0",
+            "0.4.3",
+            true,
+            UpdateOpts::default(),
+        )
+        .unwrap();
         assert!(r.dry_run);
         assert_eq!(r.from, "0.4.3");
         assert_eq!(r.to, "0.5.0");
         assert!(r.backup.is_none());
         assert!(r.steps.iter().any(|s| s.contains("would install")));
+    }
+
+    #[test]
+    fn perform_update_refuses_invalid_tag() {
+        let client = FakeReleaseClient { tag: "v".into() };
+        let dest = PathBuf::from("/usr/local/bin/sessionguard");
+        let err = perform_update(
+            &client,
+            &dest,
+            "x/y",
+            "../../evil",
+            "0.5.0",
+            false,
+            UpdateOpts::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::Refused(_)));
+    }
+
+    #[test]
+    fn perform_update_refuses_downgrade_without_optin() {
+        let client = FakeReleaseClient {
+            tag: "v0.4.0".into(),
+        };
+        let dest = PathBuf::from("/usr/local/bin/sessionguard");
+        // Older tag than current, no allow_downgrade → refused (even on dry-run).
+        let err = perform_update(
+            &client,
+            &dest,
+            "x/y",
+            "v0.4.0",
+            "0.5.0",
+            true,
+            UpdateOpts::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, UpdateError::Refused(m) if m.contains("older")));
+
+        // With the opt-in it proceeds (dry-run).
+        let r = perform_update(
+            &client,
+            &dest,
+            "x/y",
+            "v0.4.0",
+            "0.5.0",
+            true,
+            UpdateOpts {
+                allow_downgrade: true,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        assert!(r.dry_run);
     }
 }

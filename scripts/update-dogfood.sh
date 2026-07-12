@@ -70,7 +70,7 @@ echo
 
 # ── 1. dry-run changes nothing ─────────────────────────────────────────────
 echo "▶ dry-run..."
-SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --to v9.9.9 --dry-run >"$WORKDIR/dry.log" 2>&1 \
+SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --allow-custom-base --to v9.9.9 --dry-run >"$WORKDIR/dry.log" 2>&1 \
     || fail "dry-run exited non-zero"
 "$DEST" version | grep -q "fake-update" && fail "dry-run swapped the binary"
 ls "$BINDIR"/sessionguard.bak-* >/dev/null 2>&1 && fail "dry-run created a backup"
@@ -78,7 +78,7 @@ echo "  ✓ dry-run touched nothing"
 
 # ── 2. real update: download(file://) → verify → swap → .bak ────────────────
 echo "▶ update --to v9.9.9..."
-SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --to v9.9.9 >"$WORKDIR/upd.log" 2>&1 \
+SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --allow-custom-base --to v9.9.9 >"$WORKDIR/upd.log" 2>&1 \
     || { cat "$WORKDIR/upd.log"; fail "update exited non-zero"; }
 "$DEST" version | grep -q "9.9.9 (fake-update)" || fail "binary was not swapped to the new release"
 BAK=$(ls "$BINDIR"/sessionguard.bak-* 2>/dev/null | head -n1)
@@ -97,7 +97,7 @@ echo "  ✓ rollback restored a working original binary"
 echo "▶ checksum-tamper refusal..."
 cp "$SG" "$DEST"                       # fresh original
 printf 'tampered' >> "$REL/$ASSET"     # corrupt the tarball; SHA256SUMS now stale
-if SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --to v9.9.9 >"$WORKDIR/tamper.log" 2>&1; then
+if SESSIONGUARD_UPDATE_BASE_URL="file://$REL" "$DEST" update --allow-custom-base --to v9.9.9 >"$WORKDIR/tamper.log" 2>&1; then
     fail "update accepted a tampered asset (checksum gate failed)"
 fi
 grep -qi "checksum mismatch" "$WORKDIR/tamper.log" || fail "tamper rejection lacked a checksum-mismatch error"

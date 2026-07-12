@@ -249,6 +249,42 @@ fn replace_path_prefix(value: &str, pairs: &[(String, String)]) -> Option<String
     None
 }
 
+/// Write `contents` to `path` **atomically**: write a temp sibling in the same
+/// directory, fsync it, copy the original file's permissions, then `rename` over
+/// the original. Same-filesystem rename is atomic on POSIX, so a crash, power
+/// loss, or `ENOSPC` leaves either the old file or the new file fully intact —
+/// never a truncated one. This is the difference between preserving a user's
+/// session artifact and destroying it; a bare `fs::write` truncates first.
+fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+    use std::io::Write;
+    let dir = path.parent().unwrap_or_else(|| Path::new("."));
+    let file_name = path
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("artifact");
+    // Temp sibling in the same directory (same filesystem → atomic rename).
+    let tmp = dir.join(format!(".{file_name}.sg-tmp-{}", std::process::id()));
+
+    // Preserve the original's permissions on the replacement.
+    let perms = std::fs::metadata(path).map(|m| m.permissions()).ok();
+
+    let result = (|| {
+        let mut f = std::fs::File::create(&tmp)?;
+        f.write_all(contents.as_bytes())?;
+        f.sync_all()?;
+        drop(f);
+        if let Some(p) = perms {
+            let _ = std::fs::set_permissions(&tmp, p);
+        }
+        std::fs::rename(&tmp, path)
+    })();
+
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp); // don't litter a partial temp
+    }
+    result
+}
+
 // ── JSON adapter ─────────────────────────────────────────────────────────────
 
 /// Parse JSON, rewrite only the specified field, write back.
@@ -268,7 +304,7 @@ fn rewrite_json_field(path: &Path, field: &str, pairs: &[(String, String)]) -> R
                 path: path.to_owned(),
                 detail: format!("failed to serialize JSON: {e}"),
             })?;
-        std::fs::write(path, updated)?;
+        atomic_write(path, &updated)?;
         debug!(path = %path.display(), field, "JSON field rewritten");
     }
 
@@ -322,7 +358,7 @@ fn rewrite_toml_field(path: &Path, field: &str, pairs: &[(String, String)]) -> R
                 path: path.to_owned(),
                 detail: format!("failed to serialize TOML: {e}"),
             })?;
-        std::fs::write(path, updated)?;
+        atomic_write(path, &updated)?;
         debug!(path = %path.display(), field, "TOML field rewritten");
     }
 
@@ -369,7 +405,7 @@ fn rewrite_text(path: &Path, pairs: &[(String, String)]) -> Result<bool> {
     for (old_str, new_str) in pairs {
         if content.contains(old_str.as_str()) {
             let updated = content.replace(old_str.as_str(), new_str);
-            std::fs::write(path, updated)?;
+            atomic_write(path, &updated)?;
             return Ok(true);
         }
     }
@@ -389,6 +425,42 @@ mod tests {
     /// Test helper: single (old, new) pair as the adapters now expect.
     fn one_pair(old: &str, new: &str) -> Vec<(String, String)> {
         vec![(old.to_string(), new.to_string())]
+    }
+
+    #[test]
+    fn atomic_write_replaces_content_and_leaves_no_temp() {
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.json");
+        fs::write(&file, "OLD CONTENT").unwrap();
+
+        atomic_write(&file, "NEW CONTENT").unwrap();
+        assert_eq!(fs::read_to_string(&file).unwrap(), "NEW CONTENT");
+
+        // No `.sg-tmp-*` sibling left behind after the rename.
+        let leftovers: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .flatten()
+            .filter(|e| e.file_name().to_string_lossy().contains("sg-tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "temp file was not cleaned up");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn atomic_write_preserves_permissions() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("cfg.toml");
+        fs::write(&file, "a").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o640)).unwrap();
+
+        atomic_write(&file, "b").unwrap();
+
+        let mode = fs::metadata(&file).unwrap().permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o640,
+            "atomic_write should preserve the original mode"
+        );
     }
 
     #[test]
