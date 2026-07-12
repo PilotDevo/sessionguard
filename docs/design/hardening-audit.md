@@ -5,7 +5,8 @@
 > This is the correction backlog; work top-down. `file:line` refs are at
 > audit time.
 
-> **Status:** Wave 1 (B1, B2, B3, + H8) fixed in **v0.5.2** (2026-07-12). Waves 2–3 open.
+> **Status:** Wave 1 (B1, B2, B3, + H8) fixed in **v0.5.2**. Wave 2 (H1–H7)
+> fixed in **v0.6.0** (2026-07-12). Wave 3 (MED/LOW) open.
 
 ## BLOCKER — fix before more users (data-loss / brick / RCE) — ✅ FIXED v0.5.2
 
@@ -34,7 +35,7 @@
   **Fix:** gate the env override behind `#[cfg(test)]` (or `--allow-custom-base`);
   add a detached signature verified against a compiled-in public key before swap.
 
-## HIGH
+## HIGH — ✅ FIXED v0.6.0 (H8 in v0.5.2)
 
 - **H1 · No `busy_timeout`/WAL on any SQLite conn** (`registry.rs:52`,
   `event_log.rs:83`). Daemon+CLI concurrency fails instantly with "database is

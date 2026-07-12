@@ -33,7 +33,7 @@ pub fn write_pid_file() -> Result<()> {
 
     // Refuse if another daemon is already alive.
     if let Ok(Some(existing)) = read_pid() {
-        if existing != std::process::id() && process_exists(existing) {
+        if existing != std::process::id() && is_sessionguard_process(existing) {
             return Err(Error::Daemon(format!(
                 "another sessionguard daemon is already running (PID {existing})"
             )));
@@ -70,24 +70,67 @@ pub fn read_pid() -> Result<Option<u32>> {
     Ok(Some(pid))
 }
 
-/// Check if a daemon is currently running.
+/// Check if a SessionGuard daemon is currently running.
 ///
-/// On non-Unix platforms, returns `true` whenever a PID file exists
-/// (process liveness cannot be verified without `kill(pid, 0)`).
+/// Verifies both that the stored PID is alive AND that the process is actually
+/// sessionguard — not an unrelated process that recycled the PID after a crash.
+/// On non-Unix platforms, returns `true` whenever a PID file exists.
 pub fn is_running() -> bool {
-    read_pid().ok().flatten().is_some_and(process_exists)
+    read_pid()
+        .ok()
+        .flatten()
+        .is_some_and(is_sessionguard_process)
 }
 
-/// Check if a process with the given PID exists.
-fn process_exists(pid: u32) -> bool {
-    // On Unix, signal 0 checks existence without sending a signal.
+/// Ask a running daemon to reload its watch set (SIGHUP). Best-effort; returns
+/// whether a signal was sent. Lets `watch`/`unwatch` take effect without a
+/// restart.
+pub fn signal_reload() -> bool {
     #[cfg(unix)]
     {
-        unsafe { libc::kill(pid as i32, 0) == 0 }
+        if let Ok(Some(pid)) = read_pid() {
+            if is_sessionguard_process(pid) {
+                return unsafe { libc::kill(pid as i32, libc::SIGHUP) == 0 };
+            }
+        }
+        false
     }
     #[cfg(not(unix))]
     {
-        // Fallback: assume running if PID file exists.
+        false
+    }
+}
+
+/// Whether `pid` is a live process that is a sessionguard daemon.
+///
+/// A bare liveness check (`kill(pid, 0)`) is not enough: after a crash without
+/// cleanup + a reboot, the OS can recycle the stored PID to an unrelated
+/// process, and `stop`/`status` would then signal or report *that* process.
+/// So we also confirm the process command is sessionguard.
+fn is_sessionguard_process(pid: u32) -> bool {
+    #[cfg(unix)]
+    {
+        // Must exist (signal 0 sends nothing).
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            return false;
+        }
+        // ...and its command must be sessionguard. `ps -p <pid> -o comm=`
+        // works on both Linux and macOS (comm = executable basename).
+        match std::process::Command::new("ps")
+            .args(["-p", &pid.to_string(), "-o", "comm="])
+            .output()
+        {
+            Ok(out) if out.status.success() => String::from_utf8_lossy(&out.stdout)
+                .to_lowercase()
+                .contains("sessionguard"),
+            // If `ps` isn't available, fall back to liveness-only rather than
+            // refusing to ever stop a genuine daemon.
+            _ => true,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = pid;
         true
     }
 }
@@ -112,13 +155,13 @@ pub async fn run(config: &Config) -> Result<()> {
     let registry = crate::registry::Registry::open_default()?;
     let event_log = crate::event_log::EventLog::open_default()?;
 
-    // Start filesystem watcher
-    let mut watcher = crate::watcher::FsWatcher::new(&config.watch_roots, &config.watch_mode)?;
+    // Start filesystem watcher over the configured roots AND every registered
+    // project's parent, so a project tracked via `watch` (which may live outside
+    // any configured root) is actually monitored.
+    let watch_set = build_watch_set(config, &registry);
+    let mut watcher = crate::watcher::FsWatcher::new(&watch_set, &config.watch_mode)?;
 
-    info!(
-        watch_roots = ?config.watch_roots,
-        "watching for filesystem events"
-    );
+    info!(watch_roots = ?watch_set, "watching for filesystem events");
 
     // Main event loop
     loop {
@@ -126,6 +169,20 @@ pub async fn run(config: &Config) -> Result<()> {
             Some(event) = watcher.events.recv() => {
                 tracing::debug!(?event, "received filesystem event");
                 handle_session_event(event, &registry, &tool_registry, &event_log);
+            }
+            _ = reload_signal() => {
+                // SIGHUP: pick up newly-registered projects without a restart
+                // (the `watch` command sends this to us).
+                let set = build_watch_set(config, &registry);
+                match crate::watcher::FsWatcher::new(&set, &config.watch_mode) {
+                    Ok(w) => {
+                        watcher = w;
+                        info!(watch_roots = ?set, "reloaded watch set (SIGHUP)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "watch reload failed; keeping previous set");
+                    }
+                }
             }
             _ = shutdown_signal() => {
                 info!("shutdown signal received");
@@ -136,6 +193,43 @@ pub async fn run(config: &Config) -> Result<()> {
 
     info!("daemon stopped");
     Ok(())
+}
+
+/// The set of directories the daemon should watch: the configured `watch_roots`
+/// plus the parent directory of every registered project (so a project renamed
+/// or moved is seen even if it lives outside a configured root). Deduplicated
+/// and filtered to existing directories.
+fn build_watch_set(
+    config: &Config,
+    registry: &crate::registry::Registry,
+) -> Vec<std::path::PathBuf> {
+    let mut set: Vec<std::path::PathBuf> = config.watch_roots.clone();
+    for p in registry.list_projects().unwrap_or_default() {
+        if let Some(parent) = p.path.parent() {
+            set.push(parent.to_path_buf());
+        }
+    }
+    set.sort();
+    set.dedup();
+    set.retain(|p| p.is_dir());
+    set
+}
+
+/// Resolve when a reload (SIGHUP) is requested. On non-Unix it never fires.
+#[cfg(unix)]
+async fn reload_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::hangup()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_signal() {
+    std::future::pending::<()>().await;
 }
 
 /// Dispatch a filesystem event through the detector → reconciler pipeline.
@@ -274,6 +368,20 @@ mod tests {
     use crate::watcher::SessionEvent;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
+
+    #[cfg(unix)]
+    #[test]
+    fn pid_identity_rejects_non_sessionguard_process() {
+        // PID 1 (init/launchd) is always alive but is NOT sessionguard, so a
+        // liveness-only check would wrongly treat it as our daemon. The
+        // identity check must reject it.
+        assert!(
+            !super::is_sessionguard_process(1),
+            "PID 1 is not sessionguard and must not be treated as a running daemon"
+        );
+        // A very high, almost-certainly-dead PID is also rejected.
+        assert!(!super::is_sessionguard_process(4_000_000_000));
+    }
 
     fn claude_project(root: &Path, name: &str) -> PathBuf {
         let p = root.join(name);

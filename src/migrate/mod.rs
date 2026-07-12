@@ -1563,6 +1563,14 @@ pub fn migrate_with_backends(
     };
     record(Stage::Quiesce, &detail, &mut events);
 
+    // After Quiesce, ANY abort before the Resume stage must bring the service
+    // back up — otherwise a Copy/Verify/Rewrite failure leaves the operator's
+    // unit stopped (a silent outage on a server). Best-effort; the migration
+    // still fails, but not with the service down.
+    let resume_on_abort = || {
+        let _ = quiescer.resume(&resume_action, dry_run);
+    };
+
     // Stage 3: copy — dry-run enumerates the work; real run actually
     // copies via `copy_tree`. The `NotYetMutating` gate now sits BEFORE
     // Stage::Rewrite rather than here; Copy + Verify are read-only on
@@ -1601,6 +1609,7 @@ pub fn migrate_with_backends(
                     &format!("copy failed and partial dst removed: {e}"),
                     &mut events,
                 );
+                resume_on_abort();
                 return Err(e);
             }
         }
@@ -1638,10 +1647,12 @@ pub fn migrate_with_backends(
                     v.src_files, v.src_bytes, v.dst_files, v.dst_bytes
                 );
                 record(Stage::Verify, &detail, &mut events);
+                resume_on_abort();
                 return Err(MigrateError::StageFailed(Stage::Verify, detail));
             }
             Err(e) => {
                 cleanup_partial_copy(dst);
+                resume_on_abort();
                 return Err(e);
             }
         }
@@ -1662,6 +1673,7 @@ pub fn migrate_with_backends(
                 Ok(o) => o,
                 Err(e) => {
                     cleanup_partial_copy(dst);
+                    resume_on_abort();
                     return Err(e);
                 }
             },
@@ -1669,6 +1681,7 @@ pub fn migrate_with_backends(
                 Ok(o) => o,
                 Err(e) => {
                     cleanup_partial_copy(dst);
+                    resume_on_abort();
                     return Err(e);
                 }
             },
@@ -1676,12 +1689,14 @@ pub fn migrate_with_backends(
                 Ok(o) => o,
                 Err(e) => {
                     cleanup_partial_copy(dst);
+                    resume_on_abort();
                     return Err(e);
                 }
             },
             HomeDirDiscovery::Compile => {
                 // Already rejected in preflight, but be defensive.
                 cleanup_partial_copy(dst);
+                resume_on_abort();
                 return Err(MigrateError::CompileBaked);
             }
         }

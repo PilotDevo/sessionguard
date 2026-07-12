@@ -40,6 +40,12 @@ use crate::error::Result;
 /// halves reasonably quickly.
 const RENAME_PAIRING_TTL: Duration = Duration::from_millis(500);
 
+/// Cookieless (macOS) FIFO pairing window. Much tighter than the cookie TTL:
+/// without a cookie, pairing is pure FIFO, so a wide window risks fusing two
+/// *unrelated* renames in flight (an editor atomic-save + a project rename)
+/// into a bogus (from, to). notify emits genuine halves within a few ms.
+const RENAME_FIFO_WINDOW: Duration = Duration::from_millis(100);
+
 /// A filesystem event relevant to SessionGuard.
 #[derive(Debug, Clone)]
 pub enum SessionEvent {
@@ -177,9 +183,17 @@ impl RenameBuffer {
             }
         }
 
-        // Fall back to FIFO pairing among cookie-less entries (macOS)
+        // Fall back to FIFO pairing among cookie-less entries (macOS). Two
+        // guards keep unrelated renames from being cross-paired: a tight time
+        // window, and a plausibility check — a completed rename means the
+        // source path is gone, so a still-present `from` is not our other half.
         if cookie.is_none() {
-            if let Some(i) = self.pending.iter().position(|p| p.cookie.is_none()) {
+            let now = Instant::now();
+            if let Some(i) = self.pending.iter().position(|p| {
+                p.cookie.is_none()
+                    && now.duration_since(p.when) <= RENAME_FIFO_WINDOW
+                    && !p.path.exists()
+            }) {
                 let from = self.pending.remove(i);
                 return Some(SessionEvent::Moved {
                     from: Some(from.path),

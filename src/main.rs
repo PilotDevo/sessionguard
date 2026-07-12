@@ -34,12 +34,11 @@ async fn main() -> Result<()> {
 
     match cli.command {
         Command::Start { foreground, .. } => {
-            if !foreground {
-                eprintln!(
-                    "hint: background daemonization not yet implemented, running in foreground"
-                );
+            if foreground {
+                sessionguard::daemon::run(&config).await?;
+            } else {
+                spawn_background_daemon(cli.config.as_deref())?;
             }
-            sessionguard::daemon::run(&config).await?;
         }
 
         Command::Stop => {
@@ -94,7 +93,7 @@ async fn main() -> Result<()> {
 
         Command::Watch { path } => {
             let path = std::fs::canonicalize(&path)
-                .with_context(|| format!("path does not exist: {}", path.display()))?;
+                .with_context(|| format!("cannot access {}", path.display()))?;
             let registry = Registry::open_default()?;
             let id = registry.register_project(&path)?;
 
@@ -113,7 +112,11 @@ async fn main() -> Result<()> {
                 );
             }
 
-            println!("watching: {}", path.display());
+            if sessionguard::daemon::signal_reload() {
+                println!("watching: {} (running daemon notified)", path.display());
+            } else {
+                println!("watching: {}", path.display());
+            }
         }
 
         Command::Unwatch { path } => {
@@ -941,6 +944,66 @@ async fn main() -> Result<()> {
         }
     }
 
+    Ok(())
+}
+
+/// Start the daemon detached in the background by re-exec'ing `start
+/// --foreground` in a new session with stdio pointed at a log file.
+///
+/// We re-exec rather than `fork()` because by this point the tokio runtime is
+/// already running, and forking a multi-threaded process is unsound. The child
+/// is a fresh single-threaded process that then builds its own runtime.
+fn spawn_background_daemon(config_path: Option<&std::path::Path>) -> Result<()> {
+    use std::process::{Command as PCommand, Stdio};
+
+    if sessionguard::daemon::is_running() {
+        if let Some(pid) = sessionguard::daemon::read_pid()? {
+            anyhow::bail!("a sessionguard daemon is already running (PID {pid})");
+        }
+    }
+
+    let exe = std::env::current_exe().context("cannot locate own executable")?;
+    let log_path = Config::data_dir().join("daemon.log");
+    if let Some(parent) = log_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let log = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("cannot open daemon log {}", log_path.display()))?;
+    let log_err = log.try_clone()?;
+
+    let mut cmd = PCommand::new(&exe);
+    if let Some(cfg) = config_path {
+        cmd.arg("--config").arg(cfg);
+    }
+    cmd.arg("start")
+        .arg("--foreground")
+        .stdin(Stdio::null())
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(log_err));
+
+    #[cfg(unix)]
+    // SAFETY: `setsid` in the child before exec detaches it from the
+    // controlling terminal so it survives the shell closing. It touches no
+    // shared state and only calls an async-signal-safe libc function.
+    unsafe {
+        use std::os::unix::process::CommandExt;
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+
+    let child = cmd.spawn().context("failed to spawn background daemon")?;
+    println!(
+        "sessionguard daemon started in background (PID {}); logs: {}",
+        child.id(),
+        log_path.display()
+    );
     Ok(())
 }
 

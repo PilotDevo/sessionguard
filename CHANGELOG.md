@@ -2,6 +2,36 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.6.0] - 2026-07-12
+
+### Fixed / Changed — correctness hardening (audit Wave 2, HIGH items)
+
+The remaining HIGH-severity findings from the codebase audit
+(`docs/design/hardening-audit.md`). Several are behavior changes.
+
+- **`start` now actually backgrounds** (H7). `sessionguard start` re-execs a
+  detached daemon (new session, logs to `<data-dir>/daemon.log`) and returns
+  immediately, instead of printing "not implemented" and running in the
+  foreground. `--foreground` keeps the old behavior. Double-start is refused.
+- **`watch` is no longer home-locked** (H4). The daemon now watches the
+  configured `watch_roots` **plus the parent of every registered project**, so a
+  project tracked via `watch` that lives outside a configured root is actually
+  monitored. `watch`/`unwatch` send the running daemon `SIGHUP` to reload its
+  watch set live — no restart needed.
+- **SQLite concurrency** (H1). Every registry/event-log connection sets
+  `journal_mode=WAL` + `busy_timeout=5000`, so the daemon writing while the CLI
+  reads no longer fails instantly with "database is locked".
+- **`stop` can't signal the wrong process** (H3). Liveness checks now verify the
+  PID belongs to a sessionguard process (not one that recycled the PID after a
+  crash + reboot) before signaling or reporting a running daemon.
+- **No orphaned, un-undoable rewrites** (H2). A failed undo-log write is now a
+  hard error surfaced to the operator, not a swallowed `warn!`.
+- **Migrate resumes on abort** (H5). Any Copy/Verify/Rewrite failure after
+  Quiesce now restarts the stopped unit before returning — no silent outage.
+- **Tighter rename pairing** (H6). Cookieless (macOS) rename halves pair only
+  within a 100 ms window and only when the source path is actually gone,
+  preventing two unrelated renames from being fused into a bogus move.
+
 ## [0.5.2] - 2026-07-12
 
 ### Fixed — data-safety + update-security (audit Wave 1, 3 BLOCKERs)

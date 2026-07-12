@@ -39,6 +39,18 @@ pub struct Registry {
     conn: Connection,
 }
 
+/// Apply concurrency pragmas to a SQLite connection, shared by the registry and
+/// the event log — both of which the daemon writes while the CLI reads.
+/// `WAL` lets readers proceed without blocking the writer, and a 5s
+/// `busy_timeout` makes a momentary lock *wait* instead of failing instantly
+/// with "database is locked".
+pub(crate) fn tune_connection(conn: &Connection) -> Result<()> {
+    conn.busy_timeout(std::time::Duration::from_millis(5000))?;
+    conn.pragma_update(None, "journal_mode", "WAL")?;
+    conn.pragma_update(None, "synchronous", "NORMAL")?;
+    Ok(())
+}
+
 impl Registry {
     /// Open the registry at the default data directory location.
     pub fn open_default() -> Result<Self> {
@@ -51,6 +63,7 @@ impl Registry {
     /// Open (or create) the registry at a specific path.
     pub fn open(path: &Path) -> Result<Self> {
         let conn = Connection::open(path)?;
+        tune_connection(&conn)?;
         let registry = Self { conn };
         registry.migrate()?;
         Ok(registry)
@@ -198,6 +211,24 @@ impl Registry {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn file_backed_registry_enables_wal_and_busy_timeout() {
+        // WAL lets the CLI read while the daemon writes; busy_timeout makes a
+        // momentary lock wait instead of failing with "database is locked".
+        let dir = tempfile::TempDir::new().unwrap();
+        let reg = Registry::open(&dir.path().join("registry.db")).unwrap();
+        let mode: String = reg
+            .conn
+            .query_row("PRAGMA journal_mode", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(mode.to_lowercase(), "wal");
+        let timeout: i64 = reg
+            .conn
+            .query_row("PRAGMA busy_timeout", [], |r| r.get(0))
+            .unwrap();
+        assert!(timeout >= 5000, "busy_timeout should be set, got {timeout}");
+    }
 
     #[test]
     fn registry_round_trip() {
