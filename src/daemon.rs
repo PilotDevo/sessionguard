@@ -82,6 +82,25 @@ pub fn is_running() -> bool {
         .is_some_and(is_sessionguard_process)
 }
 
+/// Ask a running daemon to reload its watch set (SIGHUP). Best-effort; returns
+/// whether a signal was sent. Lets `watch`/`unwatch` take effect without a
+/// restart.
+pub fn signal_reload() -> bool {
+    #[cfg(unix)]
+    {
+        if let Ok(Some(pid)) = read_pid() {
+            if is_sessionguard_process(pid) {
+                return unsafe { libc::kill(pid as i32, libc::SIGHUP) == 0 };
+            }
+        }
+        false
+    }
+    #[cfg(not(unix))]
+    {
+        false
+    }
+}
+
 /// Whether `pid` is a live process that is a sessionguard daemon.
 ///
 /// A bare liveness check (`kill(pid, 0)`) is not enough: after a crash without
@@ -136,13 +155,13 @@ pub async fn run(config: &Config) -> Result<()> {
     let registry = crate::registry::Registry::open_default()?;
     let event_log = crate::event_log::EventLog::open_default()?;
 
-    // Start filesystem watcher
-    let mut watcher = crate::watcher::FsWatcher::new(&config.watch_roots, &config.watch_mode)?;
+    // Start filesystem watcher over the configured roots AND every registered
+    // project's parent, so a project tracked via `watch` (which may live outside
+    // any configured root) is actually monitored.
+    let watch_set = build_watch_set(config, &registry);
+    let mut watcher = crate::watcher::FsWatcher::new(&watch_set, &config.watch_mode)?;
 
-    info!(
-        watch_roots = ?config.watch_roots,
-        "watching for filesystem events"
-    );
+    info!(watch_roots = ?watch_set, "watching for filesystem events");
 
     // Main event loop
     loop {
@@ -150,6 +169,20 @@ pub async fn run(config: &Config) -> Result<()> {
             Some(event) = watcher.events.recv() => {
                 tracing::debug!(?event, "received filesystem event");
                 handle_session_event(event, &registry, &tool_registry, &event_log);
+            }
+            _ = reload_signal() => {
+                // SIGHUP: pick up newly-registered projects without a restart
+                // (the `watch` command sends this to us).
+                let set = build_watch_set(config, &registry);
+                match crate::watcher::FsWatcher::new(&set, &config.watch_mode) {
+                    Ok(w) => {
+                        watcher = w;
+                        info!(watch_roots = ?set, "reloaded watch set (SIGHUP)");
+                    }
+                    Err(e) => {
+                        tracing::warn!(error = %e, "watch reload failed; keeping previous set");
+                    }
+                }
             }
             _ = shutdown_signal() => {
                 info!("shutdown signal received");
@@ -160,6 +193,43 @@ pub async fn run(config: &Config) -> Result<()> {
 
     info!("daemon stopped");
     Ok(())
+}
+
+/// The set of directories the daemon should watch: the configured `watch_roots`
+/// plus the parent directory of every registered project (so a project renamed
+/// or moved is seen even if it lives outside a configured root). Deduplicated
+/// and filtered to existing directories.
+fn build_watch_set(
+    config: &Config,
+    registry: &crate::registry::Registry,
+) -> Vec<std::path::PathBuf> {
+    let mut set: Vec<std::path::PathBuf> = config.watch_roots.clone();
+    for p in registry.list_projects().unwrap_or_default() {
+        if let Some(parent) = p.path.parent() {
+            set.push(parent.to_path_buf());
+        }
+    }
+    set.sort();
+    set.dedup();
+    set.retain(|p| p.is_dir());
+    set
+}
+
+/// Resolve when a reload (SIGHUP) is requested. On non-Unix it never fires.
+#[cfg(unix)]
+async fn reload_signal() {
+    use tokio::signal::unix::{signal, SignalKind};
+    match signal(SignalKind::hangup()) {
+        Ok(mut s) => {
+            s.recv().await;
+        }
+        Err(_) => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(not(unix))]
+async fn reload_signal() {
+    std::future::pending::<()>().await;
 }
 
 /// Dispatch a filesystem event through the detector → reconciler pipeline.
