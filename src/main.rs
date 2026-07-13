@@ -27,8 +27,18 @@ async fn main() -> Result<()> {
         .init();
 
     let config = match &cli.config {
-        Some(path) => Config::load_from(path)
+        // A `--config` path that doesn't exist yet is fine — `init` creates it,
+        // and other commands should fall back to defaults rather than hard-fail
+        // on first run. A typo'd path surfaces via the note below.
+        Some(path) if path.exists() => Config::load_from(path)
             .with_context(|| format!("failed to load config from {}", path.display()))?,
+        Some(path) => {
+            eprintln!(
+                "note: {} does not exist yet; using defaults",
+                path.display()
+            );
+            Config::default()
+        }
         None => Config::load().context("failed to load config")?,
     };
 
@@ -126,41 +136,161 @@ async fn main() -> Result<()> {
             println!("unwatched: {}", path.display());
         }
 
-        Command::Scan { path } => {
+        Command::Scan { path, depth } => {
             let roots = match path {
                 Some(p) => vec![p],
                 None => config.watch_roots.clone(),
             };
+            if roots.is_empty() {
+                println!(
+                    "no watch roots configured and no path given.\n\
+                     run `sessionguard init` to discover projects under your home, \
+                     or `sessionguard scan <path>`."
+                );
+                return Ok(());
+            }
             let tool_registry = ToolRegistry::new_with_config(&config)?;
             let registry = Registry::open_default()?;
 
+            let mut total = 0usize;
             for root in &roots {
                 if !root.is_dir() {
                     continue;
                 }
-                println!("scanning: {}", root.display());
-                if let Ok(entries) = std::fs::read_dir(root) {
-                    for entry in entries.flatten() {
-                        let path = entry.path();
-                        if path.is_dir() {
-                            // Canonicalize so registered paths match what the
-                            // daemon sees from filesystem events (e.g. on macOS,
-                            // `/var/foo` → `/private/var/foo`). `Watch` already
-                            // does this — `Scan` must match for consistency.
-                            let canonical = std::fs::canonicalize(&path).unwrap_or(path);
-                            let detected = detector::detect_tools(&canonical, &tool_registry);
-                            if !detected.is_empty() {
-                                let id = registry.register_project(&canonical)?;
-                                for d in &detected {
-                                    for artifact in &d.artifact_files {
-                                        registry.add_artifact(id, &d.tool_name, artifact)?;
-                                    }
-                                }
-                                let tools: Vec<_> =
-                                    detected.iter().map(|d| d.display_name.as_str()).collect();
-                                println!("  found: {} [{}]", canonical.display(), tools.join(", "));
-                            }
+                println!("scanning: {} (depth {depth})", root.display());
+                let (projects, truncated) =
+                    detector::walk_for_projects(root, depth, &tool_registry);
+                for project in projects {
+                    // Canonicalize so registered paths match what the daemon
+                    // sees from filesystem events (macOS `/var` → `/private/var`).
+                    let canonical = std::fs::canonicalize(&project).unwrap_or(project);
+                    let detected = detector::detect_tools(&canonical, &tool_registry);
+                    let id = registry.register_project(&canonical)?;
+                    for d in &detected {
+                        for artifact in &d.artifact_files {
+                            registry.add_artifact(id, &d.tool_name, artifact)?;
                         }
+                    }
+                    let tools: Vec<_> = detected.iter().map(|d| d.display_name.as_str()).collect();
+                    println!("  found: {} [{}]", canonical.display(), tools.join(", "));
+                    total += 1;
+                }
+                if truncated {
+                    eprintln!(
+                        "  note: scan stopped early after hitting the directory cap; \
+                         pass a narrower path or lower --depth"
+                    );
+                }
+            }
+            println!("registered {total} project(s).");
+            if sessionguard::daemon::signal_reload() {
+                println!("notified the running daemon to watch them.");
+            }
+        }
+
+        Command::Init { dry_run, depth } => {
+            let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_owned()) else {
+                anyhow::bail!("cannot determine your home directory");
+            };
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            println!(
+                "scanning {} for AI-tool projects (depth {depth})...",
+                home.display()
+            );
+            let (projects, truncated) = detector::walk_for_projects(&home, depth, &tool_registry);
+            if truncated {
+                eprintln!("note: scan hit the directory cap; results may be partial.");
+            }
+            if projects.is_empty() {
+                println!("no AI-tool projects found under {}.", home.display());
+                println!("you can still track any project directly: `sessionguard watch <path>`.");
+                return Ok(());
+            }
+
+            // watch_roots = the unique parent directories that contain projects.
+            let mut roots: Vec<std::path::PathBuf> = projects
+                .iter()
+                .filter_map(|p| p.parent().map(|x| x.to_path_buf()))
+                .collect();
+            roots.sort();
+            roots.dedup();
+            println!(
+                "found {} project(s) across {} root(s):",
+                projects.len(),
+                roots.len()
+            );
+            for r in &roots {
+                println!("  {}", r.display());
+            }
+
+            // Merge discovered roots into the config (preserving existing ones).
+            let mut new_config = config.clone();
+            for r in &roots {
+                if !new_config.watch_roots.contains(r) {
+                    new_config.watch_roots.push(r.clone());
+                }
+            }
+            new_config.watch_roots.sort();
+            new_config.watch_roots.dedup();
+
+            let target = cli.config.clone().unwrap_or_else(Config::default_path);
+            if dry_run {
+                println!(
+                    "\n(dry-run) would write these watch_roots to {}:",
+                    target.display()
+                );
+                for r in &new_config.watch_roots {
+                    println!("  {}", r.display());
+                }
+                return Ok(());
+            }
+            if let Some(parent) = target.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            let toml = toml::to_string_pretty(&new_config).context("failed to serialize config")?;
+            std::fs::write(&target, toml)
+                .with_context(|| format!("failed to write config to {}", target.display()))?;
+            println!(
+                "\nwrote {} watch root(s) to {}. start the daemon with `sessionguard start`.",
+                new_config.watch_roots.len(),
+                target.display()
+            );
+        }
+
+        Command::Logs { lines, follow } => {
+            let log_path = Config::data_dir().join("daemon.log");
+            if !log_path.exists() {
+                println!(
+                    "no daemon log yet at {} — has the daemon run? (`sessionguard start`)",
+                    log_path.display()
+                );
+                return Ok(());
+            }
+            // Print the last `lines` lines.
+            let content = std::fs::read_to_string(&log_path).unwrap_or_default();
+            let all: Vec<&str> = content.lines().collect();
+            let start = all.len().saturating_sub(lines);
+            for l in &all[start..] {
+                println!("{l}");
+            }
+
+            if follow {
+                use std::io::{Read, Seek, SeekFrom, Write};
+                let mut f = std::fs::File::open(&log_path)?;
+                let mut pos = f.seek(SeekFrom::End(0))?;
+                loop {
+                    std::thread::sleep(std::time::Duration::from_millis(500));
+                    let len = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(pos);
+                    if len < pos {
+                        pos = 0; // file was truncated/rotated
+                    }
+                    if len > pos {
+                        f.seek(SeekFrom::Start(pos))?;
+                        let mut buf = String::new();
+                        f.read_to_string(&mut buf)?;
+                        print!("{buf}");
+                        std::io::stdout().flush().ok();
+                        pos = len;
                     }
                 }
             }

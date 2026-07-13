@@ -131,14 +131,21 @@ systemctl --user enable --now sessionguard
 ### Basic usage
 
 ```bash
-# Start the daemon (foreground, watches configured directories)
-sessionguard start --foreground
+# First-run setup: find your projects and configure watch roots
+sessionguard init                        # scan ~ for projects, write watch_roots
+sessionguard init --dry-run              # preview without writing config
 
-# Register a specific project root
+# Start the daemon (backgrounds by default; logs to <data-dir>/daemon.log)
+sessionguard start
+sessionguard start --foreground          # run attached instead
+sessionguard logs --follow               # tail the daemon log
+
+# Register a specific project root (notifies a running daemon)
 sessionguard watch ~/projects/my-app
 
-# Discover existing AI sessions under a directory
-sessionguard scan ~/projects
+# Recursively discover existing AI sessions under a directory
+sessionguard scan ~/projects             # recurses (default depth 4)
+sessionguard scan ~/work --depth 6
 
 # Check status of tracked projects + daemon state
 sessionguard status

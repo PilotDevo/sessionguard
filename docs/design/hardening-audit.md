@@ -6,7 +6,8 @@
 > audit time.
 
 > **Status:** Wave 1 (B1, B2, B3, + H8) fixed in **v0.5.2**. Wave 2 (H1–H7)
-> fixed in **v0.6.0** (2026-07-12). Wave 3 (MED/LOW) open.
+> fixed in **v0.6.0**. Wave 3: M4 (recursive scan) + M5 (`init` onboarding)
+> shipped in **v0.6.1** (2026-07-12). Remaining MED/LOW open.
 
 ## BLOCKER — fix before more users (data-loss / brick / RCE) — ✅ FIXED v0.5.2
 
