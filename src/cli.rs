@@ -78,10 +78,38 @@ pub enum Command {
         path: PathBuf,
     },
 
+    /// First-run setup: scan your home directory for AI-tool projects and
+    /// write the directories that contain them to `watch_roots` in the config,
+    /// so the daemon monitors where your projects actually live.
+    Init {
+        /// Show what would be discovered and written without touching config.
+        #[arg(long)]
+        dry_run: bool,
+        /// How deep to search under home for projects.
+        #[arg(long, default_value = "4")]
+        depth: usize,
+    },
+
     /// One-time scan to discover and register existing sessions.
+    ///
+    /// Recurses to `--depth` levels (default 4), registering every directory
+    /// that contains AI-tool artifacts. Pruned at each detected project.
     Scan {
         /// Directory to scan (defaults to configured watch roots).
         path: Option<PathBuf>,
+        /// Maximum directory depth to recurse.
+        #[arg(long, default_value = "4")]
+        depth: usize,
+    },
+
+    /// Tail the background daemon's log file.
+    Logs {
+        /// Number of trailing lines to print.
+        #[arg(long, default_value = "50")]
+        lines: usize,
+        /// Keep streaming new lines as they're written (Ctrl-C to stop).
+        #[arg(short, long)]
+        follow: bool,
     },
 
     /// Dry-run a move/rename and show what would be reconciled.

@@ -2,6 +2,28 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.6.1] - 2026-07-12
+
+### Added — CLI quality-of-life
+
+- **`sessionguard init`** — first-run onboarding. Recursively scans your home
+  directory for AI-tool projects and writes the directories that contain them to
+  `watch_roots`, so the daemon monitors where your projects actually live instead
+  of only the conventional `~/{projects,repos,code,dev}`. `--dry-run` previews;
+  `--depth` bounds the search. (Closes the empty-config footgun, audit M5.)
+- **`sessionguard logs [--lines N] [--follow]`** — tail the background daemon's
+  log (`<data-dir>/daemon.log`, new in v0.6.0).
+- **`sessionguard scan` is now recursive** (`--depth`, default 4) instead of a
+  single level, so nested/monorepo project layouts are discovered; it prunes at
+  each detected project and skips VCS/dependency/build dirs. `scan` and `watch`
+  now also SIGHUP a running daemon so newly-registered projects are picked up
+  live. (Audit M4.)
+
+### Fixed
+
+- A `--config <path>` that doesn't exist yet no longer hard-fails at startup —
+  it falls back to defaults (with a note), so `init` can create it on first run.
+
 ## [0.6.0] - 2026-07-12
 
 ### Fixed / Changed — correctness hardening (audit Wave 2, HIGH items)

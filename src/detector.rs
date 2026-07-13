@@ -6,9 +6,13 @@
 //! Scans a project directory to determine which AI coding tools have
 //! session artifacts present, using the patterns from the tool registry.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::tools::{ToolDefinition, ToolRegistry};
+
+/// Upper bound on directories visited by [`walk_for_projects`], so a
+/// pathological tree can't spin forever or blow memory.
+const WALK_DIR_CAP: usize = 50_000;
 
 /// Result of detecting AI tool artifacts in a project directory.
 #[derive(Debug, Clone)]
@@ -26,6 +30,60 @@ pub fn detect_tools(project_root: &Path, registry: &ToolRegistry) -> Vec<Detecti
         .all()
         .filter_map(|tool| detect_single_tool(project_root, tool))
         .collect()
+}
+
+/// Recursively discover project directories under `root`, up to `max_depth`
+/// levels deep. A directory that contains AI-tool artifacts is a project; we
+/// record it and do NOT descend into it (a project's subdirectories are part of
+/// that project, not separate ones). Skips version-control/dependency/build
+/// dirs and other dot-directories, and stops after [`WALK_DIR_CAP`] directories.
+///
+/// Returns whether the walk was truncated by the cap, plus the projects found.
+pub fn walk_for_projects(
+    root: &Path,
+    max_depth: usize,
+    registry: &ToolRegistry,
+) -> (Vec<PathBuf>, bool) {
+    let mut found = Vec::new();
+    let mut stack = vec![(root.to_path_buf(), 0usize)];
+    let mut visited = 0usize;
+
+    while let Some((dir, depth)) = stack.pop() {
+        visited += 1;
+        if visited > WALK_DIR_CAP {
+            return (found, true);
+        }
+        if !detect_tools(&dir, registry).is_empty() {
+            found.push(dir);
+            continue; // prune: don't descend into a detected project
+        }
+        if depth >= max_depth {
+            continue;
+        }
+        if let Ok(entries) = std::fs::read_dir(&dir) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() && !is_skippable_dir(&p) {
+                    stack.push((p, depth + 1));
+                }
+            }
+        }
+    }
+    (found, false)
+}
+
+/// Directories we never descend into during discovery: VCS, dependency, and
+/// build trees, plus any dot-directory (session artifacts live *inside* a
+/// project dir, which we detect at the project level, so we needn't recurse
+/// into hidden dirs to find projects).
+fn is_skippable_dir(p: &Path) -> bool {
+    let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+        return true;
+    };
+    matches!(
+        name,
+        "node_modules" | "target" | "vendor" | "__pycache__" | "dist" | "build"
+    ) || name.starts_with('.')
 }
 
 /// Check one tool's patterns against a project directory.
@@ -78,6 +136,37 @@ mod tests {
     use super::*;
     use crate::tools::ToolRegistry;
     use tempfile::TempDir;
+
+    #[test]
+    fn walk_for_projects_finds_nested_prunes_and_respects_depth() {
+        let root = TempDir::new().unwrap();
+        let reg = ToolRegistry::new().unwrap();
+
+        // A project nested 3 deep, with a sub-subdir that also has a .claude
+        // (must NOT be reported separately — pruned as part of the project).
+        let proj = root.path().join("work/client/proj");
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::write(proj.join(".claude/settings.json"), "{}").unwrap();
+        std::fs::create_dir_all(proj.join("sub/.claude")).unwrap();
+        std::fs::write(proj.join("sub/.claude/settings.json"), "{}").unwrap();
+        // A skippable dir (node_modules) containing a decoy artifact — ignored.
+        std::fs::create_dir_all(root.path().join("node_modules/.claude")).unwrap();
+
+        let (found, truncated) = walk_for_projects(root.path(), 5, &reg);
+        assert!(!truncated);
+        assert_eq!(
+            found,
+            vec![proj.clone()],
+            "should find exactly the one project, pruned"
+        );
+
+        // Too-shallow depth can't reach a project 3 levels down.
+        let (shallow, _) = walk_for_projects(root.path(), 1, &reg);
+        assert!(
+            shallow.is_empty(),
+            "depth 1 shouldn't reach a depth-3 project"
+        );
+    }
 
     #[test]
     fn detects_claude_code_artifacts() {
