@@ -17,14 +17,16 @@ use sessionguard::tools::ToolRegistry;
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    // Initialize tracing
-    let filter = if cli.verbose { "debug" } else { "info" };
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(filter)),
-        )
-        .init();
+    // Initialize tracing. An explicit `--verbose` beats an ambient RUST_LOG —
+    // a user who asks for debug output must get it, not silently inherit
+    // whatever their shell exported.
+    let env_filter = if cli.verbose {
+        tracing_subscriber::EnvFilter::new("debug")
+    } else {
+        tracing_subscriber::EnvFilter::try_from_default_env()
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+    };
+    tracing_subscriber::fmt().with_env_filter(env_filter).init();
 
     let config = match &cli.config {
         // A `--config` path that doesn't exist yet is fine — `init` creates it,
@@ -55,18 +57,29 @@ async fn main() -> Result<()> {
             match sessionguard::daemon::read_pid()? {
                 Some(pid) if sessionguard::daemon::is_running() => {
                     #[cfg(unix)]
-                    // SAFETY: `kill(pid, SIGTERM)` with a valid u32-as-i32 PID. We
-                    // verified the process exists above; worst case, the PID races
-                    // and gets recycled between is_running() and kill(), which is
-                    // inherent to any PID-based IPC.
-                    unsafe {
-                        libc::kill(pid as i32, libc::SIGTERM);
+                    {
+                        // SAFETY: `kill(pid, SIGTERM)` with a valid u32-as-i32 PID. We
+                        // verified the process exists above; worst case, the PID races
+                        // and gets recycled between is_running() and kill(), which is
+                        // inherent to any PID-based IPC.
+                        let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
+                        if rc == 0 {
+                            println!("sent stop signal to daemon (PID {pid})");
+                        } else {
+                            // Don't claim success we didn't have (EPERM etc.).
+                            let err = std::io::Error::last_os_error();
+                            anyhow::bail!("failed to signal daemon (PID {pid}): {err}");
+                        }
                     }
-                    println!("sent stop signal to daemon (PID {pid})");
+                    #[cfg(not(unix))]
+                    println!("daemon signaling is not supported on this platform (PID {pid})");
                 }
                 Some(pid) => {
                     // PID file exists but the process is gone — clean it up.
-                    let _ = sessionguard::daemon::remove_pid_file();
+                    // (Deliberate operator cleanup of a stale file, so use the
+                    // unconditional variant; the self-guarded remove only
+                    // deletes the calling process's own entry.)
+                    let _ = sessionguard::daemon::clear_pid_file();
                     println!("stale PID file removed (PID {pid} no longer running)");
                 }
                 None => {
@@ -131,9 +144,22 @@ async fn main() -> Result<()> {
 
         Command::Unwatch { path } => {
             let registry = Registry::open_default()?;
+            // canonicalize fails when the dir no longer exists — exactly the
+            // case where the registry may hold the ORIGINAL canonical form, so
+            // fall back to the raw argument and report honestly either way.
             let path = std::fs::canonicalize(&path).unwrap_or(path);
-            registry.unregister_project(&path)?;
-            println!("unwatched: {}", path.display());
+            let removed = registry.unregister_project(&path)?;
+            if removed > 0 {
+                println!("unwatched: {}", path.display());
+                let _ = sessionguard::daemon::signal_reload();
+            } else {
+                println!(
+                    "no tracked project matched {} — nothing removed.\n\
+                     (if the directory was moved or deleted, `sessionguard doctor --clean` \
+                     prunes stale entries.)",
+                    path.display()
+                );
+            }
         }
 
         Command::Scan { path, depth } => {
@@ -495,13 +521,39 @@ async fn main() -> Result<()> {
         }
 
         Command::Export { output } => {
+            // Export the FULL graph — projects AND their artifact mappings.
+            // The artifact rows are the tool's core data; a backup that only
+            // kept bare paths silently lost them (audit M2).
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
+            let mut entries = Vec::with_capacity(projects.len());
+            let mut artifact_total = 0usize;
+            for p in &projects {
+                let artifacts: Vec<serde_json::Value> = registry
+                    .get_artifacts(p.id)?
+                    .into_iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "tool_name": a.tool_name,
+                            "artifact_path": a.artifact_path,
+                        })
+                    })
+                    .collect();
+                artifact_total += artifacts.len();
+                entries.push(serde_json::json!({
+                    "path": p.path,
+                    "artifacts": artifacts,
+                }));
+            }
+            let bundle = serde_json::json!({
+                "sessionguard_export_version": 2,
+                "projects": entries,
+            });
             let json =
-                serde_json::to_string_pretty(&projects).context("failed to serialize projects")?;
+                serde_json::to_string_pretty(&bundle).context("failed to serialize export")?;
             std::fs::write(&output, json)?;
             println!(
-                "exported {} projects to {}",
+                "exported {} project(s) ({artifact_total} artifact mapping(s)) to {}",
                 projects.len(),
                 output.display()
             );
@@ -509,15 +561,48 @@ async fn main() -> Result<()> {
 
         Command::Import { input } => {
             let content = std::fs::read_to_string(&input)?;
-            let projects: Vec<sessionguard::registry::ProjectEntry> =
+            let value: serde_json::Value =
                 serde_json::from_str(&content).context("failed to parse import file")?;
             let registry = Registry::open_default()?;
-            for p in &projects {
-                registry.register_project(&p.path)?;
+
+            let mut projects = 0usize;
+            let mut artifacts = 0usize;
+            if let Some(list) = value.get("projects").and_then(|p| p.as_array()) {
+                // v2 bundle: projects + artifact mappings.
+                for entry in list {
+                    let Some(path) = entry.get("path").and_then(|p| p.as_str()) else {
+                        continue;
+                    };
+                    let id = registry.register_project(std::path::Path::new(path))?;
+                    projects += 1;
+                    for a in entry
+                        .get("artifacts")
+                        .and_then(|a| a.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let (Some(tool), Some(ap)) = (
+                            a.get("tool_name").and_then(|t| t.as_str()),
+                            a.get("artifact_path").and_then(|p| p.as_str()),
+                        ) {
+                            registry.add_artifact(id, tool, std::path::Path::new(ap))?;
+                            artifacts += 1;
+                        }
+                    }
+                }
+            } else if let Some(list) = value.as_array() {
+                // v1 legacy export: a bare array of ProjectEntry (paths only).
+                for entry in list {
+                    if let Some(path) = entry.get("path").and_then(|p| p.as_str()) {
+                        registry.register_project(std::path::Path::new(path))?;
+                        projects += 1;
+                    }
+                }
+            } else {
+                anyhow::bail!("unrecognized import format (expected a sessionguard export)");
             }
             println!(
-                "imported {} projects from {}",
-                projects.len(),
+                "imported {projects} project(s) ({artifacts} artifact mapping(s)) from {}",
                 input.display()
             );
         }
@@ -540,6 +625,17 @@ async fn main() -> Result<()> {
                     .arg(&path)
                     .status()
                     .with_context(|| format!("failed to launch {editor}"))?;
+                // Validate immediately — a TOML typo discovered now (with a
+                // line/column) beats a mystery failure on the next command.
+                if path.exists() {
+                    match Config::load_from(&path) {
+                        Ok(_) => println!("config OK: {}", path.display()),
+                        Err(e) => eprintln!(
+                            "warning: {} does not parse — fix it before the next run:\n  {e}",
+                            path.display()
+                        ),
+                    }
+                }
             }
         },
 
@@ -1057,6 +1153,16 @@ async fn main() -> Result<()> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_default()
                 );
+                // The systemd path restarts itself; a pid-file daemon (macOS,
+                // plain `sessionguard start`) keeps running the OLD binary
+                // from memory after the on-disk swap — say so instead of
+                // leaving it silently stale.
+                if sessionguard::daemon::is_running() {
+                    println!(
+                        "note: the running daemon is still the previous binary — \
+                         restart it: `sessionguard stop && sessionguard start`"
+                    );
+                }
             }
         }
 

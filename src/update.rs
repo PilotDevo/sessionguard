@@ -66,13 +66,24 @@ pub enum InstallMethod {
 
 /// Classify an executable path into an [`InstallMethod`]. Pure (no FS access)
 /// so it's unit-testable with synthetic paths.
+///
+/// Package-manager markers are anchored to the path shapes those managers
+/// actually produce (brew prefixes, `~/.cargo/bin`), not bare substrings —
+/// a standalone install that merely has "homebrew" somewhere in its path must
+/// not be refused, and misclassifying the other way would overwrite a managed
+/// binary (the one thing this module promises never to do).
 pub fn classify_install_method(exe: &Path) -> InstallMethod {
     let s = exe.to_string_lossy();
     if s.contains("/target/debug/") || s.contains("/target/release/") {
         InstallMethod::GitCheckout
     } else if s.contains("/.cargo/bin/") {
         InstallMethod::Cargo
-    } else if s.contains("/Cellar/") || s.contains("/homebrew/") {
+    } else if s.starts_with("/opt/homebrew/")
+        || s.starts_with("/home/linuxbrew/")
+        || s.contains("/Cellar/")
+        || s.contains("/linuxbrew/")
+        || s.contains("/Homebrew/")
+    {
         InstallMethod::Homebrew
     } else {
         // Everything else is a manually-placed binary we can overwrite —
@@ -443,8 +454,26 @@ pub fn perform_update(
         });
     }
 
-    let tmp = std::env::temp_dir().join(format!("sg-update-{}", std::process::id()));
-    std::fs::create_dir_all(&tmp)?;
+    // Unpredictable, owner-only workdir. A guessable name in shared /tmp is a
+    // symlink-attack target: a local attacker who pre-creates the path could
+    // redirect where the verified tarball/binary lands. `create_dir` (not
+    // create_dir_all) fails if the path already exists — never adopt a
+    // directory we didn't create — and 0700 keeps other users out.
+    let tmp = {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let dir =
+            std::env::temp_dir().join(format!("sg-update-{}-{nanos:08x}", std::process::id()));
+        std::fs::create_dir(&dir)?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700))?;
+        }
+        dir
+    };
     let tarball = tmp.join(&asset);
 
     // 1. download

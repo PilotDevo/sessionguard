@@ -123,14 +123,16 @@ impl Registry {
         Ok(id)
     }
 
-    /// Remove a project and its artifacts from the registry.
-    pub fn unregister_project(&self, path: &Path) -> Result<()> {
+    /// Remove a project and its artifacts from the registry. Returns how many
+    /// rows matched, so callers can tell the user when nothing was removed
+    /// instead of printing a false success.
+    pub fn unregister_project(&self, path: &Path) -> Result<usize> {
         let path_str = path.to_string_lossy();
-        self.conn.execute(
+        let n = self.conn.execute(
             "DELETE FROM projects WHERE path = ?1",
             params![path_str.as_ref()],
         )?;
-        Ok(())
+        Ok(n)
     }
 
     /// Record a session artifact for a project.

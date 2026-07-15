@@ -100,8 +100,20 @@ impl Config {
         }
         ProjectDirs::from("dev", "droco", "sessionguard")
             .map(|d| d.data_dir().to_owned())
-            .unwrap_or_else(|| PathBuf::from(".sessionguard"))
+            .unwrap_or_else(fallback_state_dir)
     }
+}
+
+/// Stable, ABSOLUTE fallback when the platform dirs can't be resolved (HOME
+/// unset — containers, hardened systemd units). A cwd-relative fallback here
+/// meant the PID file and registry changed with the working directory: two
+/// daemons could start, and `stop`/`status` from another cwd saw nothing.
+fn fallback_state_dir() -> PathBuf {
+    #[cfg(unix)]
+    let uid = unsafe { libc::getuid() };
+    #[cfg(not(unix))]
+    let uid = 0;
+    std::env::temp_dir().join(format!("sessionguard-{uid}"))
 }
 
 /// SessionGuard config directory.
@@ -116,7 +128,7 @@ pub fn config_dir() -> PathBuf {
     }
     ProjectDirs::from("dev", "droco", "sessionguard")
         .map(|d| d.config_dir().to_owned())
-        .unwrap_or_else(|| PathBuf::from(".sessionguard"))
+        .unwrap_or_else(fallback_state_dir)
 }
 
 #[cfg(test)]

@@ -85,7 +85,28 @@ impl EventLog {
         crate::registry::tune_connection(&conn)?;
         let log = Self { conn };
         log.migrate()?;
+        log.prune_undone()?;
         Ok(log)
+    }
+
+    /// How many already-undone reconcile events to retain (the newest N).
+    /// Pending events — the ones `undo` can still act on — are NEVER pruned;
+    /// without retention the log grows unboundedly on a busy watch tree.
+    const UNDONE_RETENTION: i64 = 5_000;
+
+    /// Drop already-undone events beyond the newest [`Self::UNDONE_RETENTION`].
+    fn prune_undone(&self) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM events
+             WHERE undone_at IS NOT NULL
+               AND id NOT IN (
+                   SELECT id FROM events
+                   WHERE undone_at IS NOT NULL
+                   ORDER BY id DESC LIMIT ?1
+               )",
+            rusqlite::params![Self::UNDONE_RETENTION],
+        )?;
+        Ok(())
     }
 
     /// Open an in-memory event log (for testing).

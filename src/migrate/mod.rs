@@ -476,9 +476,10 @@ pub struct CopySummary {
 /// creating intermediate directories as needed.
 ///
 /// Design constraints from `docs/history/migrate.md`:
-/// - Symlinks are **skipped** (cycles + off-tree pointers). Use rsync
-///   externally if you need symlink semantics; the migrate target tools
-///   (Codex, OpenCode) store regular files only.
+/// - Symlinks are **recreated as symlinks** (not followed — no cycle risk).
+///   Absolute targets pointing inside the source tree are remapped onto the
+///   destination so the copied link resolves post-migrate; relative and
+///   external targets are recreated verbatim. See `copy_symlink`.
 /// - File permissions are mirrored (Unix mode bits) so executables and
 ///   read-only files preserve their character.
 /// - **No-overwrite**: `dst` must not exist before the call. The
@@ -633,23 +634,136 @@ pub struct VerifyOutcome {
     pub dst_files: usize,
     pub src_bytes: u64,
     pub dst_bytes: u64,
-    /// `true` iff src and dst agree on file count *and* total bytes.
+    /// `true` iff every src entry exists at dst with the same size (and
+    /// symlinks with the same class), and dst has nothing extra.
     pub matches: bool,
+    /// Human-readable descriptions of the first few per-file mismatches
+    /// (empty when `matches`). Bounded so the event log stays small.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mismatches: Vec<String>,
 }
 
-/// Walk both `src` and `dst`, comparing file count and total bytes.
-/// Returns `Ok(VerifyOutcome)` regardless of whether they match; the
-/// caller decides whether to fail the migration on `matches == false`.
+/// How many per-file mismatches to describe before summarizing.
+const VERIFY_MISMATCH_CAP: usize = 8;
+
+/// Compare `src` and `dst` **per file**, not just by totals: every relative
+/// path must exist on both sides with the same byte size (symlinks: same
+/// target). Totals alone couldn't tell "one file missing + one file grew" from
+/// a clean copy (audit M3). Not a content hash — a same-size bit-flip still
+/// passes — but it catches every dropped, truncated, extra, or swapped file,
+/// which are the realistic copy failures. The source is never deleted, so even
+/// a Verify escape is recoverable.
 pub fn verify_copy(src: &Path, dst: &Path) -> Result<VerifyOutcome, MigrateError> {
-    let (src_files, src_bytes) = walk_size(src);
-    let (dst_files, dst_bytes) = walk_size(dst);
+    let src_map = walk_manifest(src);
+    let dst_map = walk_manifest(dst);
+
+    let mut mismatches = Vec::new();
+    for (rel, s_entry) in &src_map {
+        match dst_map.get(rel) {
+            // A correct copy REMAPS absolute in-tree symlink targets from the
+            // src root onto the dst root (see `copy_symlink`), so the expected
+            // dst-side entry for a symlink is the remapped one.
+            Some(d_entry) if *d_entry == expect_at_dst(s_entry, src, dst) => {}
+            Some(d_entry) => {
+                if mismatches.len() < VERIFY_MISMATCH_CAP {
+                    mismatches.push(format!("{}: src {s_entry} != dst {d_entry}", rel.display()));
+                }
+            }
+            None => {
+                if mismatches.len() < VERIFY_MISMATCH_CAP {
+                    mismatches.push(format!("{}: missing at destination", rel.display()));
+                }
+            }
+        }
+    }
+    for rel in dst_map.keys() {
+        if !src_map.contains_key(rel) && mismatches.len() < VERIFY_MISMATCH_CAP {
+            mismatches.push(format!("{}: extra at destination", rel.display()));
+        }
+    }
+
+    let sum = |m: &std::collections::BTreeMap<PathBuf, ManifestEntry>| {
+        m.values()
+            .map(|e| match e {
+                ManifestEntry::File(b) => *b,
+                ManifestEntry::Symlink(_) => 0,
+            })
+            .sum::<u64>()
+    };
     Ok(VerifyOutcome {
-        src_files,
-        dst_files,
-        src_bytes,
-        dst_bytes,
-        matches: src_files == dst_files && src_bytes == dst_bytes,
+        src_files: src_map.len(),
+        dst_files: dst_map.len(),
+        src_bytes: sum(&src_map),
+        dst_bytes: sum(&dst_map),
+        matches: mismatches.is_empty(),
+        mismatches,
     })
+}
+
+/// What a src-side manifest entry should look like on the dst side after a
+/// correct copy: identical, except an absolute symlink target inside the src
+/// root is remapped onto the dst root (mirroring `copy_symlink`).
+fn expect_at_dst(s_entry: &ManifestEntry, src: &Path, dst: &Path) -> ManifestEntry {
+    match s_entry {
+        ManifestEntry::Symlink(target) => {
+            if let Ok(rest) = target.strip_prefix(src) {
+                ManifestEntry::Symlink(dst.join(rest))
+            } else {
+                s_entry.clone()
+            }
+        }
+        other => other.clone(),
+    }
+}
+
+/// One comparable entry in a copy manifest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManifestEntry {
+    /// Regular file with its byte size.
+    File(u64),
+    /// Symlink with its literal target.
+    Symlink(PathBuf),
+}
+
+impl std::fmt::Display for ManifestEntry {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            ManifestEntry::File(b) => write!(f, "file({b}B)"),
+            ManifestEntry::Symlink(t) => write!(f, "symlink({})", t.display()),
+        }
+    }
+}
+
+/// Build a relative-path → entry manifest under `root`. Does not follow
+/// symlinks; unreadable entries are skipped (they'd be skipped identically on
+/// both sides or show up as a mismatch).
+fn walk_manifest(root: &Path) -> std::collections::BTreeMap<PathBuf, ManifestEntry> {
+    let mut map = std::collections::BTreeMap::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(rd) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in rd.flatten() {
+            let p = entry.path();
+            let Ok(meta) = std::fs::symlink_metadata(&p) else {
+                continue;
+            };
+            let Ok(rel) = p.strip_prefix(root).map(|r| r.to_path_buf()) else {
+                continue;
+            };
+            if meta.file_type().is_symlink() {
+                if let Ok(target) = std::fs::read_link(&p) {
+                    map.insert(rel, ManifestEntry::Symlink(target));
+                }
+            } else if meta.is_dir() {
+                stack.push(p);
+            } else if meta.is_file() {
+                map.insert(rel, ManifestEntry::File(meta.len()));
+            }
+        }
+    }
+    map
 }
 
 // ── Rewrite (stage 5) ────────────────────────────────────────────────────
@@ -877,7 +991,7 @@ fn rewrite_via_config(
                 ),
             )
         })?;
-        if !changed {
+        if changed.is_none() {
             // Field wasn't present, or didn't carry the src prefix.
             // That's a misconfigured layout — fail loud rather than
             // pretend the rewrite happened.
@@ -903,7 +1017,17 @@ fn rewrite_via_config(
 /// edit we made earlier in the same pass.
 fn restore_config_backups(backups: &[ConfigBackup]) {
     for b in backups {
-        let _ = std::fs::rename(&b.backup, &b.original);
+        // Best-effort by design (we're already unwinding a failure), but a
+        // restore that ITSELF fails leaves a half-reverted config — say so
+        // instead of unwinding silently.
+        if let Err(e) = std::fs::rename(&b.backup, &b.original) {
+            tracing::warn!(
+                original = %b.original.display(),
+                backup = %b.backup.display(),
+                error = %e,
+                "failed to restore config backup during rollback — restore it manually"
+            );
+        }
     }
 }
 

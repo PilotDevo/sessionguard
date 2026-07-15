@@ -71,6 +71,7 @@ fn rewrite_paths(
     event_log: &EventLog,
 ) -> ReconcileResult {
     let mut actions = Vec::new();
+    let mut errors: Vec<String> = Vec::new();
     let pairs: Vec<(String, String)> = path_pair_candidates(old_root, new_root);
 
     for field_spec in &tool.path_fields {
@@ -83,49 +84,61 @@ fn rewrite_paths(
         let result = rewrite_field(&artifact_path, field_spec, &pairs);
 
         match result {
-            Ok(changed) => {
-                if changed {
-                    let action = ReconcileAction {
-                        tool_name: tool.name.clone(),
-                        file_path: artifact_path.clone(),
-                        field: field_spec.field.clone(),
-                        format: field_spec.format.clone(),
-                        old_value: pairs[0].0.clone(),
-                        new_value: pairs[0].1.clone(),
-                    };
-                    if let Err(e) = event_log.record(&action) {
-                        // The file is already rewritten. Failing to log it means
-                        // `undo` can never reverse this change, so surface it as
-                        // a hard failure instead of a silent `warn!` — the
-                        // operator needs to know. (H1's WAL + busy_timeout make
-                        // this rare; a swallowed error here was a data-loss gap.)
-                        actions.push(action);
-                        return ReconcileResult {
-                            tool_name: tool.name.clone(),
-                            actions_taken: actions,
-                            success: false,
-                            error: Some(format!(
-                                "rewrote {} but failed to record its undo entry \
-                                 (undo unavailable for this change): {e}",
-                                artifact_path.display()
-                            )),
-                        };
-                    }
-                    actions.push(action);
-                }
-            }
-            Err(e) => {
-                return ReconcileResult {
+            Ok(Some(idx)) => {
+                // Record the pair that ACTUALLY matched (not pairs[0]) so
+                // `undo` reverses the strings that were really written — on
+                // macOS the applied pair may be the `/private`-prefixed
+                // variant, and logging pairs[0] made undo a silent no-op.
+                let action = ReconcileAction {
                     tool_name: tool.name.clone(),
-                    actions_taken: actions,
-                    success: false,
-                    error: Some(format!(
-                        "failed to rewrite {}: {e}",
-                        artifact_path.display()
-                    )),
+                    file_path: artifact_path.clone(),
+                    field: field_spec.field.clone(),
+                    format: field_spec.format.clone(),
+                    old_value: pairs[idx].0.clone(),
+                    new_value: pairs[idx].1.clone(),
                 };
+                if let Err(e) = event_log.record(&action) {
+                    // The file is already rewritten. Failing to log it means
+                    // `undo` can never reverse this change, so surface it as
+                    // a hard failure instead of a silent `warn!` — the
+                    // operator needs to know. (H1's WAL + busy_timeout make
+                    // this rare; a swallowed error here was a data-loss gap.)
+                    actions.push(action);
+                    return ReconcileResult {
+                        tool_name: tool.name.clone(),
+                        actions_taken: actions,
+                        success: false,
+                        error: Some(format!(
+                            "rewrote {} but failed to record its undo entry \
+                             (undo unavailable for this change): {e}",
+                            artifact_path.display()
+                        )),
+                    };
+                }
+                actions.push(action);
+            }
+            Ok(None) => {}
+            Err(e) => {
+                // One bad artifact must not silently strand the tool's OTHER
+                // fields un-reconciled — keep going, then report failure with
+                // everything that did succeed recorded.
+                warn!(
+                    path = %artifact_path.display(),
+                    error = %e,
+                    "failed to rewrite artifact; continuing with remaining fields"
+                );
+                errors.push(format!("{}: {e}", artifact_path.display()));
             }
         }
+    }
+
+    if !errors.is_empty() {
+        return ReconcileResult {
+            tool_name: tool.name.clone(),
+            actions_taken: actions,
+            success: false,
+            error: Some(format!("failed to rewrite: {}", errors.join("; "))),
+        };
     }
 
     ReconcileResult {
@@ -173,7 +186,7 @@ pub fn undo_event(entry: &LogEntry, dry_run: bool) -> Result<bool> {
 
     // Swap old ↔ new: rewrite new_value back to old_value.
     let pairs = vec![(entry.new_value.clone(), entry.old_value.clone())];
-    rewrite_field(&entry.file_path, &field_spec, &pairs)
+    Ok(rewrite_field(&entry.file_path, &field_spec, &pairs)?.is_some())
 }
 
 /// Produce paired (old, new) path-string candidates to try in order.
@@ -226,15 +239,50 @@ fn path_pair_candidates(old: &Path, new: &Path) -> Vec<(String, String)> {
 /// `~/.config/<tool>/config.toml`-style data-dir field). The migrate
 /// driver constructs a synthetic `PathFieldSpec` from `HomeDirConfigFile`
 /// and a single `(old_data_dir, new_data_dir)` pair.
+/// Returns the index of the pair that was applied (so the caller can log the
+/// ACTUAL (old, new) strings written, not just `pairs[0]` — undo depends on it).
 pub(crate) fn rewrite_field(
     path: &Path,
     field_spec: &PathFieldSpec,
     pairs: &[(String, String)],
-) -> Result<bool> {
+) -> Result<Option<usize>> {
     match field_spec.format.as_str() {
         "json" => rewrite_json_field(path, &field_spec.field, pairs),
         "toml" => rewrite_toml_field(path, &field_spec.field, pairs),
         _ => rewrite_text(path, pairs),
+    }
+}
+
+/// Largest artifact we'll load into memory for rewriting. Chat-history files
+/// (e.g. aider's) grow without bound; slurping hundreds of MB to rewrite a
+/// path is worse than skipping with a warning the operator can act on.
+const MAX_ARTIFACT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Read an artifact for rewriting, with guardrails: files over
+/// [`MAX_ARTIFACT_BYTES`] and non-UTF-8 files are skipped (with a warning)
+/// rather than erroring — one odd file must not abort a whole tool's
+/// reconciliation.
+fn read_artifact(path: &Path) -> Result<Option<String>> {
+    if let Ok(meta) = std::fs::metadata(path) {
+        if meta.len() > MAX_ARTIFACT_BYTES {
+            warn!(
+                path = %path.display(),
+                size = meta.len(),
+                "artifact exceeds the rewrite size cap; skipping (paths inside it were NOT rewritten)"
+            );
+            return Ok(None);
+        }
+    }
+    match std::fs::read_to_string(path) {
+        Ok(s) => Ok(Some(s)),
+        Err(e) if e.kind() == std::io::ErrorKind::InvalidData => {
+            warn!(
+                path = %path.display(),
+                "artifact is not valid UTF-8; skipping (paths inside it were NOT rewritten)"
+            );
+            Ok(None)
+        }
+        Err(e) => Err(e.into()),
     }
 }
 
@@ -245,23 +293,59 @@ pub(crate) fn rewrite_field(
 /// `old_root` followed by a path separator (`/` or `\`). When a pair matches,
 /// `value` is rewritten using THAT pair's `new_root` — preserving whichever
 /// form the stored path used (e.g. `/var/...` stays `/var/...`, not
-/// `/private/var/...`).
+/// `/private/var/...`). Returns the rewritten value plus the index of the pair
+/// that matched.
 ///
 /// Protects against substring collisions like `/home/me/code` being
 /// rewritten inside `/home/me/code-backup/foo`.
-fn replace_path_prefix(value: &str, pairs: &[(String, String)]) -> Option<String> {
-    for (old_root, new_root) in pairs {
+fn replace_path_prefix(value: &str, pairs: &[(String, String)]) -> Option<(String, usize)> {
+    for (i, (old_root, new_root)) in pairs.iter().enumerate() {
         if value == old_root {
-            return Some(new_root.clone());
+            return Some((new_root.clone(), i));
         }
         for sep in ['/', '\\'] {
             let prefix = format!("{old_root}{sep}");
             if let Some(rest) = value.strip_prefix(&prefix) {
-                return Some(format!("{new_root}{sep}{rest}"));
+                return Some((format!("{new_root}{sep}{rest}"), i));
             }
         }
     }
     None
+}
+
+/// Boundary-guarded global replace for the text adapter: replaces every
+/// occurrence of `old` that is followed by a path boundary (end of file, `/`,
+/// `\`, or any character that can't continue a path segment). This gives the
+/// text fallback the same substring-collision protection the structured
+/// adapters get from [`replace_path_prefix`] — `/home/me/code` never rewrites
+/// inside `/home/me/code-backup` mentioned in e.g. a chat-history body.
+fn replace_all_with_boundary(content: &str, old: &str, new: &str) -> Option<String> {
+    fn continues_path_segment(c: char) -> bool {
+        c.is_alphanumeric() || matches!(c, '-' | '_' | '.')
+    }
+    let mut out = String::with_capacity(content.len());
+    let mut rest = content;
+    let mut replaced = false;
+    while let Some(idx) = rest.find(old) {
+        let after = &rest[idx + old.len()..];
+        let boundary = after
+            .chars()
+            .next()
+            .is_none_or(|c| !continues_path_segment(c));
+        out.push_str(&rest[..idx]);
+        if boundary {
+            out.push_str(new);
+            replaced = true;
+        } else {
+            out.push_str(old);
+        }
+        rest = after;
+    }
+    if !replaced {
+        return None;
+    }
+    out.push_str(rest);
+    Some(out)
 }
 
 /// Write `contents` to `path` **atomically**: write a temp sibling in the same
@@ -302,18 +386,25 @@ fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
 
 // ── JSON adapter ─────────────────────────────────────────────────────────────
 
-/// Parse JSON, rewrite only the specified field, write back.
-fn rewrite_json_field(path: &Path, field: &str, pairs: &[(String, String)]) -> Result<bool> {
-    let content = std::fs::read_to_string(path)?;
+/// Parse JSON, rewrite only the specified field, write back. Returns the
+/// index of the (old, new) pair that was applied, if any.
+fn rewrite_json_field(
+    path: &Path,
+    field: &str,
+    pairs: &[(String, String)],
+) -> Result<Option<usize>> {
+    let Some(content) = read_artifact(path)? else {
+        return Ok(None);
+    };
     let mut value: serde_json::Value =
         serde_json::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
             path: path.to_owned(),
             detail: format!("invalid JSON: {e}"),
         })?;
 
-    let changed = json_set_field(&mut value, field, pairs);
+    let matched = json_set_field(&mut value, field, pairs);
 
-    if changed {
+    if matched.is_some() {
         let updated =
             serde_json::to_string_pretty(&value).map_err(|e| crate::error::Error::Reconcile {
                 path: path.to_owned(),
@@ -323,11 +414,16 @@ fn rewrite_json_field(path: &Path, field: &str, pairs: &[(String, String)]) -> R
         debug!(path = %path.display(), field, "JSON field rewritten");
     }
 
-    Ok(changed)
+    Ok(matched)
 }
 
-/// Walk a dot-separated field path in a JSON value and replace the old path prefix.
-fn json_set_field(value: &mut serde_json::Value, field: &str, pairs: &[(String, String)]) -> bool {
+/// Walk a dot-separated field path in a JSON value and replace the old path
+/// prefix. Returns the index of the pair that matched.
+fn json_set_field(
+    value: &mut serde_json::Value,
+    field: &str,
+    pairs: &[(String, String)],
+) -> Option<usize> {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = value;
 
@@ -337,37 +433,44 @@ fn json_set_field(value: &mut serde_json::Value, field: &str, pairs: &[(String, 
                 if let Some(v) = map.get_mut(*part) {
                     current = v;
                 } else {
-                    return false;
+                    return None;
                 }
             }
-            _ => return false,
+            _ => return None,
         }
     }
 
     if let serde_json::Value::String(s) = current {
-        if let Some(rewritten) = replace_path_prefix(s, pairs) {
+        if let Some((rewritten, idx)) = replace_path_prefix(s, pairs) {
             *s = rewritten;
-            return true;
+            return Some(idx);
         }
     }
 
-    false
+    None
 }
 
 // ── TOML adapter ─────────────────────────────────────────────────────────────
 
-/// Parse TOML, rewrite only the specified field, write back.
-fn rewrite_toml_field(path: &Path, field: &str, pairs: &[(String, String)]) -> Result<bool> {
-    let content = std::fs::read_to_string(path)?;
+/// Parse TOML, rewrite only the specified field, write back. Returns the
+/// index of the (old, new) pair that was applied, if any.
+fn rewrite_toml_field(
+    path: &Path,
+    field: &str,
+    pairs: &[(String, String)],
+) -> Result<Option<usize>> {
+    let Some(content) = read_artifact(path)? else {
+        return Ok(None);
+    };
     let mut value: toml::Value =
         toml::from_str(&content).map_err(|e| crate::error::Error::Reconcile {
             path: path.to_owned(),
             detail: format!("invalid TOML: {e}"),
         })?;
 
-    let changed = toml_set_field(&mut value, field, pairs);
+    let matched = toml_set_field(&mut value, field, pairs);
 
-    if changed {
+    if matched.is_some() {
         let updated =
             toml::to_string_pretty(&value).map_err(|e| crate::error::Error::Reconcile {
                 path: path.to_owned(),
@@ -377,11 +480,16 @@ fn rewrite_toml_field(path: &Path, field: &str, pairs: &[(String, String)]) -> R
         debug!(path = %path.display(), field, "TOML field rewritten");
     }
 
-    Ok(changed)
+    Ok(matched)
 }
 
-/// Walk a dot-separated field path in a TOML value and replace the old path prefix.
-fn toml_set_field(value: &mut toml::Value, field: &str, pairs: &[(String, String)]) -> bool {
+/// Walk a dot-separated field path in a TOML value and replace the old path
+/// prefix. Returns the index of the pair that matched.
+fn toml_set_field(
+    value: &mut toml::Value,
+    field: &str,
+    pairs: &[(String, String)],
+) -> Option<usize> {
     let parts: Vec<&str> = field.split('.').collect();
     let mut current = value;
 
@@ -391,40 +499,44 @@ fn toml_set_field(value: &mut toml::Value, field: &str, pairs: &[(String, String
                 if let Some(v) = table.get_mut(*part) {
                     current = v;
                 } else {
-                    return false;
+                    return None;
                 }
             }
-            _ => return false,
+            _ => return None,
         }
     }
 
     if let toml::Value::String(s) = current {
-        if let Some(rewritten) = replace_path_prefix(s, pairs) {
+        if let Some((rewritten, idx)) = replace_path_prefix(s, pairs) {
             *s = rewritten;
-            return true;
+            return Some(idx);
         }
     }
 
-    false
+    None
 }
 
 // ── Text adapter (fallback) ──────────────────────────────────────────────────
 
-/// Simple string replacement in a file. Returns true if any changes were made.
-/// Tries each candidate in `old_roots`; first whose literal substring is found
-/// is replaced. Unlike the structured JSON/TOML adapters, this is a raw
-/// substring replace and doesn't guard against prefix collisions — reserved
-/// for formats where we have no semantic understanding.
-fn rewrite_text(path: &Path, pairs: &[(String, String)]) -> Result<bool> {
-    let content = std::fs::read_to_string(path)?;
-    for (old_str, new_str) in pairs {
-        if content.contains(old_str.as_str()) {
-            let updated = content.replace(old_str.as_str(), new_str);
+/// Boundary-guarded string replacement in a file. Tries each candidate pair in
+/// order; the first whose `old` string occurs (at a path boundary) is applied
+/// to every boundary-safe occurrence. Returns the index of the pair applied.
+///
+/// Unlike the structured adapters we have no field to scope to, but the
+/// boundary guard gives the same substring-collision protection: an incidental
+/// `/home/me/code-backup` in a chat-history body is never corrupted by a
+/// `/home/me/code` rewrite.
+fn rewrite_text(path: &Path, pairs: &[(String, String)]) -> Result<Option<usize>> {
+    let Some(content) = read_artifact(path)? else {
+        return Ok(None);
+    };
+    for (i, (old_str, new_str)) in pairs.iter().enumerate() {
+        if let Some(updated) = replace_all_with_boundary(&content, old_str, new_str) {
             atomic_write(path, &updated)?;
-            return Ok(true);
+            return Ok(Some(i));
         }
     }
-    Ok(false)
+    Ok(None)
 }
 
 #[cfg(test)]
@@ -485,7 +597,7 @@ mod tests {
         fs::write(&file, "path = /old/project").unwrap();
 
         let changed = rewrite_text(&file, &one_pair("/old/project", "/new/project")).unwrap();
-        assert!(changed);
+        assert!(changed.is_some());
 
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("/new/project"));
@@ -499,7 +611,74 @@ mod tests {
         fs::write(&file, "path = /some/other/path").unwrap();
 
         let changed = rewrite_text(&file, &one_pair("/old/project", "/new/project")).unwrap();
-        assert!(!changed);
+        assert!(changed.is_none());
+    }
+
+    #[test]
+    fn text_adapter_boundary_guard_protects_sibling_paths() {
+        // The aider chat-history case: prose mentions both the project path
+        // and a sibling that shares it as a prefix. Only the true path (and
+        // its sub-paths) may be rewritten.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("history.md");
+        fs::write(
+            &file,
+            "worked in /home/me/code today\n\
+             backup lives at /home/me/code-backup/notes\n\
+             edited /home/me/code/src/main.rs\n",
+        )
+        .unwrap();
+
+        let changed = rewrite_text(&file, &one_pair("/home/me/code", "/new/root")).unwrap();
+        assert!(changed.is_some());
+
+        let content = fs::read_to_string(&file).unwrap();
+        assert!(content.contains("worked in /new/root today"));
+        assert!(content.contains("edited /new/root/src/main.rs"));
+        assert!(
+            content.contains("/home/me/code-backup/notes"),
+            "sibling prefix must be untouched, got: {content}"
+        );
+    }
+
+    #[test]
+    fn non_utf8_artifact_is_skipped_not_errored() {
+        // One binary-ish file must not abort a tool's reconciliation.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("blob.txt");
+        std::fs::write(&file, [0xFF, 0xFE, 0x2F, 0x6F, 0x6C, 0x64]).unwrap();
+
+        let changed = rewrite_text(&file, &one_pair("/old", "/new")).unwrap();
+        assert!(changed.is_none(), "non-UTF8 should skip, not rewrite");
+    }
+
+    #[test]
+    fn rewrite_field_reports_the_matched_pair_index() {
+        // The value carries the SHORT (/var) form; pairs[0] is the /private
+        // long form (no match), pairs[1] the short form (match). The returned
+        // index must be 1 so the event log records what was really written —
+        // otherwise undo looks for strings that aren't in the file.
+        let dir = TempDir::new().unwrap();
+        let file = dir.path().join("settings.json");
+        fs::write(&file, r#"{"project_path": "/var/folders/xx/proj"}"#).unwrap();
+
+        let pairs = vec![
+            (
+                "/private/var/folders/xx/proj".to_string(),
+                "/private/var/folders/yy/proj".to_string(),
+            ),
+            (
+                "/var/folders/xx/proj".to_string(),
+                "/var/folders/yy/proj".to_string(),
+            ),
+        ];
+        let spec = PathFieldSpec {
+            file: String::new(),
+            field: "project_path".into(),
+            format: "json".into(),
+        };
+        let matched = rewrite_field(&file, &spec, &pairs).unwrap();
+        assert_eq!(matched, Some(1), "must report the pair actually applied");
     }
 
     #[test]
@@ -514,7 +693,7 @@ mod tests {
 
         let changed =
             rewrite_json_field(&file, "project_path", &one_pair("/old/root", "/new/root")).unwrap();
-        assert!(changed);
+        assert!(changed.is_some());
 
         let content = fs::read_to_string(&file).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -534,7 +713,7 @@ mod tests {
 
         let changed =
             rewrite_json_field(&file, "cache.dir", &one_pair("/old/root", "/new/root")).unwrap();
-        assert!(changed);
+        assert!(changed.is_some());
 
         let content = fs::read_to_string(&file).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -546,7 +725,7 @@ mod tests {
     fn replace_path_prefix_exact_match() {
         assert_eq!(
             replace_path_prefix("/home/me/code", &one_pair("/home/me/code", "/new/root")),
-            Some("/new/root".to_string())
+            Some(("/new/root".to_string(), 0))
         );
     }
 
@@ -557,7 +736,7 @@ mod tests {
                 "/home/me/code/src/main.rs",
                 &one_pair("/home/me/code", "/new/root")
             ),
-            Some("/new/root/src/main.rs".to_string())
+            Some(("/new/root/src/main.rs".to_string(), 0))
         );
     }
 
@@ -586,7 +765,7 @@ mod tests {
                 r"C:\old\project\src",
                 &one_pair(r"C:\old\project", r"D:\new")
             ),
-            Some(r"D:\new\src".to_string())
+            Some((r"D:\new\src".to_string(), 0))
         );
     }
 
@@ -604,7 +783,7 @@ mod tests {
         ];
         assert_eq!(
             replace_path_prefix("/var/folders/xx/foo", &pairs),
-            Some("/var/folders/yy/foo".to_string())
+            Some(("/var/folders/yy/foo".to_string(), 1))
         );
     }
 
@@ -620,7 +799,10 @@ mod tests {
             &one_pair("/home/me/code", "/new/root"),
         )
         .unwrap();
-        assert!(!changed, "sibling path must not be treated as a prefix");
+        assert!(
+            changed.is_none(),
+            "sibling path must not be treated as a prefix"
+        );
 
         let content = fs::read_to_string(&file).unwrap();
         assert!(content.contains("/home/me/code-backup/notes"));
@@ -634,7 +816,7 @@ mod tests {
 
         let changed =
             rewrite_json_field(&file, "project_path", &one_pair("/old/root", "/new/root")).unwrap();
-        assert!(!changed);
+        assert!(changed.is_none());
     }
 
     #[test]
@@ -649,7 +831,7 @@ mod tests {
 
         let changed =
             rewrite_toml_field(&file, "project_root", &one_pair("/old/root", "/new/root")).unwrap();
-        assert!(changed);
+        assert!(changed.is_some());
 
         let content = fs::read_to_string(&file).unwrap();
         let v: toml::Value = toml::from_str(&content).unwrap();
@@ -669,7 +851,7 @@ mod tests {
 
         let changed =
             rewrite_toml_field(&file, "cache.dir", &one_pair("/old/root", "/new/root")).unwrap();
-        assert!(changed);
+        assert!(changed.is_some());
 
         let content = fs::read_to_string(&file).unwrap();
         let v: toml::Value = toml::from_str(&content).unwrap();

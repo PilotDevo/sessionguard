@@ -21,37 +21,71 @@ fn pid_file_path() -> PathBuf {
 
 /// Write the current process PID to the PID file.
 ///
-/// Refuses to overwrite a PID file belonging to a currently-running daemon.
-/// Stale PID files (daemon crashed, PID not alive) are replaced. Writes are
-/// atomic: we write to a tempfile then rename over the target so a crash
-/// mid-write never leaves a truncated PID file.
+/// Uses `create_new` (O_EXCL) so acquiring the PID file is ATOMIC — two
+/// daemons racing to start cannot both succeed (the old check-then-write had a
+/// TOCTOU window where both saw "no daemon" and both wrote). If the file
+/// already exists it's either a live daemon (refuse) or stale (remove and
+/// retry the exclusive create once).
 pub fn write_pid_file() -> Result<()> {
+    use std::io::Write;
     let pid_path = pid_file_path();
     if let Some(parent) = pid_path.parent() {
         std::fs::create_dir_all(parent)?;
     }
 
-    // Refuse if another daemon is already alive.
-    if let Ok(Some(existing)) = read_pid() {
-        if existing != std::process::id() && is_sessionguard_process(existing) {
-            return Err(Error::Daemon(format!(
-                "another sessionguard daemon is already running (PID {existing})"
-            )));
+    for attempt in 0..2 {
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&pid_path)
+        {
+            Ok(mut f) => {
+                f.write_all(std::process::id().to_string().as_bytes())?;
+                f.sync_all()?;
+                return Ok(());
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists && attempt == 0 => {
+                // Live daemon → refuse. Stale/foreign file → clear and retry.
+                if let Ok(Some(existing)) = read_pid() {
+                    if existing != std::process::id() && is_sessionguard_process(existing) {
+                        return Err(Error::Daemon(format!(
+                            "another sessionguard daemon is already running (PID {existing})"
+                        )));
+                    }
+                }
+                let _ = std::fs::remove_file(&pid_path);
+            }
+            Err(e) => return Err(e.into()),
         }
     }
-
-    // Atomic write: write to a sibling tempfile, then rename.
-    let tmp_path = pid_path.with_extension("pid.tmp");
-    std::fs::write(&tmp_path, std::process::id().to_string())?;
-    std::fs::rename(&tmp_path, &pid_path)?;
-    Ok(())
+    Err(Error::Daemon(
+        "could not acquire the PID file (another daemon raced us to it)".into(),
+    ))
 }
 
-/// Remove the PID file.
-pub fn remove_pid_file() -> Result<()> {
+/// Unconditionally delete the PID file. For deliberate operator cleanup of a
+/// STALE file (`stop` after verifying the process is gone) — the daemon's own
+/// exit path uses [`remove_pid_file`], which only deletes its own entry.
+pub fn clear_pid_file() -> Result<()> {
     let pid_path = pid_file_path();
     if pid_path.exists() {
         std::fs::remove_file(&pid_path)?;
+    }
+    Ok(())
+}
+
+/// Remove the PID file — but only if it still records OUR pid. A losing racer
+/// or late guard must never delete the winner's PID file.
+pub fn remove_pid_file() -> Result<()> {
+    let pid_path = pid_file_path();
+    if pid_path.exists() {
+        let ours = std::fs::read_to_string(&pid_path)
+            .ok()
+            .and_then(|s| s.trim().parse::<u32>().ok())
+            == Some(std::process::id());
+        if ours {
+            std::fs::remove_file(&pid_path)?;
+        }
     }
     Ok(())
 }
