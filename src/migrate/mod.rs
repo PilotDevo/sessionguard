@@ -877,7 +877,7 @@ fn rewrite_via_config(
                 ),
             )
         })?;
-        if !changed {
+        if changed.is_none() {
             // Field wasn't present, or didn't carry the src prefix.
             // That's a misconfigured layout — fail loud rather than
             // pretend the rewrite happened.
