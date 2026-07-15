@@ -114,7 +114,23 @@ impl FsWatcher {
         for root in watch_roots {
             if root.is_dir() {
                 info!(path = %root.display(), "watching directory");
-                watcher.watch(root, RecursiveMode::Recursive)?;
+                watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+                    // On Linux, recursive watches consume one inotify watch per
+                    // directory; a big tree exhausts the kernel budget and the
+                    // raw ENOSPC ("No space left on device") sends operators
+                    // chasing disk space. Name the real fix instead.
+                    if matches!(e.kind, notify::ErrorKind::Io(ref io) if io.raw_os_error() == Some(28))
+                    {
+                        notify::Error::generic(&format!(
+                            "ran out of inotify watches while watching {} — raise the limit: \
+                             `sudo sysctl fs.inotify.max_user_watches=524288`, or narrow \
+                             watch_roots",
+                            root.display()
+                        ))
+                    } else {
+                        e
+                    }
+                })?;
             } else {
                 debug!(path = %root.display(), "skipping non-existent watch root");
             }

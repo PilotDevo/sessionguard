@@ -476,9 +476,10 @@ pub struct CopySummary {
 /// creating intermediate directories as needed.
 ///
 /// Design constraints from `docs/history/migrate.md`:
-/// - Symlinks are **skipped** (cycles + off-tree pointers). Use rsync
-///   externally if you need symlink semantics; the migrate target tools
-///   (Codex, OpenCode) store regular files only.
+/// - Symlinks are **recreated as symlinks** (not followed — no cycle risk).
+///   Absolute targets pointing inside the source tree are remapped onto the
+///   destination so the copied link resolves post-migrate; relative and
+///   external targets are recreated verbatim. See `copy_symlink`.
 /// - File permissions are mirrored (Unix mode bits) so executables and
 ///   read-only files preserve their character.
 /// - **No-overwrite**: `dst` must not exist before the call. The
@@ -903,7 +904,17 @@ fn rewrite_via_config(
 /// edit we made earlier in the same pass.
 fn restore_config_backups(backups: &[ConfigBackup]) {
     for b in backups {
-        let _ = std::fs::rename(&b.backup, &b.original);
+        // Best-effort by design (we're already unwinding a failure), but a
+        // restore that ITSELF fails leaves a half-reverted config — say so
+        // instead of unwinding silently.
+        if let Err(e) = std::fs::rename(&b.backup, &b.original) {
+            tracing::warn!(
+                original = %b.original.display(),
+                backup = %b.backup.display(),
+                error = %e,
+                "failed to restore config backup during rollback — restore it manually"
+            );
+        }
     }
 }
 
