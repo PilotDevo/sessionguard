@@ -430,11 +430,7 @@ fn json_set_field(
     for part in &parts {
         match current {
             serde_json::Value::Object(map) => {
-                if let Some(v) = map.get_mut(*part) {
-                    current = v;
-                } else {
-                    return None;
-                }
+                current = map.get_mut(*part)?;
             }
             _ => return None,
         }
@@ -496,11 +492,7 @@ fn toml_set_field(
     for part in &parts {
         match current {
             toml::Value::Table(table) => {
-                if let Some(v) = table.get_mut(*part) {
-                    current = v;
-                } else {
-                    return None;
-                }
+                current = table.get_mut(*part)?;
             }
             _ => return None,
         }
