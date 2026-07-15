@@ -325,6 +325,50 @@ fn sandbox_export_import_round_trip() {
 }
 
 #[test]
+fn sandbox_export_import_preserves_artifact_mappings() {
+    // The v2 export carries the artifact graph — importing into a FRESH data
+    // dir must restore the tool associations, not just bare project paths
+    // (the v1 format silently dropped them; audit M2).
+    let sandbox = TempDir::new().unwrap();
+    let project = create_claude_project(sandbox.path(), "graph-test");
+    let export_file = sandbox.path().join("export.json");
+
+    cmd(sandbox.path())
+        .args(["watch", &project.to_string_lossy()])
+        .assert()
+        .success();
+    cmd(sandbox.path())
+        .args(["export", "-o", &export_file.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("artifact mapping"));
+
+    // The bundle itself must carry the artifact rows.
+    let content = fs::read_to_string(&export_file).unwrap();
+    let v: serde_json::Value = serde_json::from_str(&content).unwrap();
+    assert_eq!(v["sessionguard_export_version"], 2);
+    let arts = v["projects"][0]["artifacts"].as_array().unwrap();
+    assert!(
+        !arts.is_empty(),
+        "export must include artifact mappings, got: {content}"
+    );
+
+    // Import into a brand-new data dir and confirm the project came back.
+    let fresh = TempDir::new().unwrap();
+    cmd(fresh.path())
+        .args(["import", "-i", &export_file.to_string_lossy()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 project(s)"))
+        .stdout(predicate::str::is_match(r"[1-9]\d* artifact mapping").unwrap());
+    cmd(fresh.path())
+        .arg("status")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("graph-test"));
+}
+
+#[test]
 fn sandbox_scan_multi_tool_project() {
     let sandbox = TempDir::new().unwrap();
     create_multi_tool_project(sandbox.path(), "dual-tool");

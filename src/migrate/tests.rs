@@ -682,6 +682,51 @@ fn verify_copy_detects_mismatch_when_file_removed() {
 }
 
 #[test]
+fn verify_copy_catches_same_total_swap() {
+    // Two files whose sizes are swapped at dst: identical file COUNT and
+    // identical TOTAL bytes — the old totals-only verify passed this. The
+    // per-file manifest must fail it and name the offenders.
+    let src = TempDir::new().unwrap();
+    populate(src.path(), &[("a", b"12345"), ("b", b"xyz")]);
+    let dst_dir = TempDir::new().unwrap();
+    let dst = dst_dir.path().join("out");
+    copy_tree(src.path(), &dst).unwrap();
+    std::fs::write(dst.join("a"), b"xyz").unwrap();
+    std::fs::write(dst.join("b"), b"12345").unwrap();
+
+    let outcome = verify_copy(src.path(), &dst).unwrap();
+    assert!(
+        !outcome.matches,
+        "per-file verify must catch a same-total size swap"
+    );
+    assert!(
+        !outcome.mismatches.is_empty(),
+        "mismatches should name the offending files"
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn verify_copy_accepts_remapped_in_tree_symlink() {
+    // copy_tree remaps an absolute in-tree symlink target from src → dst; the
+    // literal targets differ on the two sides, but that IS the correct copy —
+    // verify must not flag it.
+    let src = TempDir::new().unwrap();
+    populate(src.path(), &[("real.txt", b"hello")]);
+    std::os::unix::fs::symlink(src.path().join("real.txt"), src.path().join("link.txt")).unwrap();
+    let dst_dir = TempDir::new().unwrap();
+    let dst = dst_dir.path().join("out");
+    copy_tree(src.path(), &dst).unwrap();
+
+    let outcome = verify_copy(src.path(), &dst).unwrap();
+    assert!(
+        outcome.matches,
+        "remapped in-tree symlink is correct, not a mismatch: {:?}",
+        outcome.mismatches
+    );
+}
+
+#[test]
 fn cleanup_partial_copy_removes_dst() {
     let dst_dir = TempDir::new().unwrap();
     let dst = dst_dir.path().join("partial");

@@ -521,13 +521,39 @@ async fn main() -> Result<()> {
         }
 
         Command::Export { output } => {
+            // Export the FULL graph — projects AND their artifact mappings.
+            // The artifact rows are the tool's core data; a backup that only
+            // kept bare paths silently lost them (audit M2).
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
+            let mut entries = Vec::with_capacity(projects.len());
+            let mut artifact_total = 0usize;
+            for p in &projects {
+                let artifacts: Vec<serde_json::Value> = registry
+                    .get_artifacts(p.id)?
+                    .into_iter()
+                    .map(|a| {
+                        serde_json::json!({
+                            "tool_name": a.tool_name,
+                            "artifact_path": a.artifact_path,
+                        })
+                    })
+                    .collect();
+                artifact_total += artifacts.len();
+                entries.push(serde_json::json!({
+                    "path": p.path,
+                    "artifacts": artifacts,
+                }));
+            }
+            let bundle = serde_json::json!({
+                "sessionguard_export_version": 2,
+                "projects": entries,
+            });
             let json =
-                serde_json::to_string_pretty(&projects).context("failed to serialize projects")?;
+                serde_json::to_string_pretty(&bundle).context("failed to serialize export")?;
             std::fs::write(&output, json)?;
             println!(
-                "exported {} projects to {}",
+                "exported {} project(s) ({artifact_total} artifact mapping(s)) to {}",
                 projects.len(),
                 output.display()
             );
@@ -535,15 +561,48 @@ async fn main() -> Result<()> {
 
         Command::Import { input } => {
             let content = std::fs::read_to_string(&input)?;
-            let projects: Vec<sessionguard::registry::ProjectEntry> =
+            let value: serde_json::Value =
                 serde_json::from_str(&content).context("failed to parse import file")?;
             let registry = Registry::open_default()?;
-            for p in &projects {
-                registry.register_project(&p.path)?;
+
+            let mut projects = 0usize;
+            let mut artifacts = 0usize;
+            if let Some(list) = value.get("projects").and_then(|p| p.as_array()) {
+                // v2 bundle: projects + artifact mappings.
+                for entry in list {
+                    let Some(path) = entry.get("path").and_then(|p| p.as_str()) else {
+                        continue;
+                    };
+                    let id = registry.register_project(std::path::Path::new(path))?;
+                    projects += 1;
+                    for a in entry
+                        .get("artifacts")
+                        .and_then(|a| a.as_array())
+                        .into_iter()
+                        .flatten()
+                    {
+                        if let (Some(tool), Some(ap)) = (
+                            a.get("tool_name").and_then(|t| t.as_str()),
+                            a.get("artifact_path").and_then(|p| p.as_str()),
+                        ) {
+                            registry.add_artifact(id, tool, std::path::Path::new(ap))?;
+                            artifacts += 1;
+                        }
+                    }
+                }
+            } else if let Some(list) = value.as_array() {
+                // v1 legacy export: a bare array of ProjectEntry (paths only).
+                for entry in list {
+                    if let Some(path) = entry.get("path").and_then(|p| p.as_str()) {
+                        registry.register_project(std::path::Path::new(path))?;
+                        projects += 1;
+                    }
+                }
+            } else {
+                anyhow::bail!("unrecognized import format (expected a sessionguard export)");
             }
             println!(
-                "imported {} projects from {}",
-                projects.len(),
+                "imported {projects} project(s) ({artifacts} artifact mapping(s)) from {}",
                 input.display()
             );
         }
