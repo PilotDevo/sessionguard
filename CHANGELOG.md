@@ -2,6 +2,49 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.6.2] - 2026-07-19
+
+### Fixed / Changed — deep-hardening (audit Wave 3)
+
+The remaining MED/LOW findings from the codebase audit
+(`docs/design/hardening-audit.md`), in three batches.
+
+**Reconciler correctness**
+- The text adapter now replaces only at path boundaries — an incidental
+  `/home/me/code-backup` in an aider chat-history body is no longer corrupted
+  by a `/home/me/code` rewrite (M1).
+- The event log records the (old, new) pair the adapter ACTUALLY applied, so
+  `undo` works for projects under macOS `/var`, `/tmp`, `/private` paths
+  instead of silently no-oping (M9).
+- Artifacts over 32 MB and non-UTF-8 files are skipped with a warning instead
+  of erroring, and one bad artifact no longer aborts a tool's remaining
+  fields (M18).
+
+**Daemon / CLI robustness**
+- PID-file acquisition is atomic (`O_EXCL`) — two racing daemons can't both
+  start, and a losing racer can't delete the winner's PID file (M7).
+- HOME-unset environments fall back to a stable absolute per-uid dir instead
+  of a cwd-relative `./.sessionguard` (M6).
+- `update`'s download workdir is unpredictable and 0700 (M13); install-method
+  detection is anchored to real brew prefixes (M15); after an update, a
+  still-running pid-file daemon is called out as stale (M14).
+- inotify-watch exhaustion now names the `fs.inotify.max_user_watches` fix
+  (M16). The event log prunes already-undone events beyond the newest 5,000 —
+  pending undo entries are never pruned (M17).
+- `stop` no longer claims success when the signal fails (L1); `unwatch`
+  reports when nothing matched (L2); `--verbose` beats an ambient `RUST_LOG`
+  (L3); `config edit` validates the TOML immediately (L4); failed
+  config-backup restores during migrate rollback are surfaced (L8).
+
+**Data integrity**
+- `export` writes a versioned bundle including each project's artifact
+  mappings; `import` restores the full graph (and still reads the old
+  paths-only format). Backups no longer silently drop the core data (M2).
+- Migrate's Verify stage compares src/dst **per file** (path + size;
+  symlinks by target, remap-aware) instead of totals — a dropped file plus a
+  same-size growth elsewhere can no longer cancel out; mismatches are named
+  (M3).
+
 ## [0.6.1] - 2026-07-12
 
 ### Added — CLI quality-of-life
