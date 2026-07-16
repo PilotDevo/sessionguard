@@ -176,6 +176,25 @@ pub enum Command {
         format: Format,
     },
 
+    /// Per-project session census across the tools' home-dir stores
+    /// (Claude Code, Codex, OpenCode): which projects have sessions, how
+    /// many, how fresh — and which are ORPHANED (project dir gone).
+    /// Read-only.
+    Sessions {
+        /// Only show orphaned groups (project directory no longer exists).
+        #[arg(long)]
+        orphans: bool,
+        /// Only show sessions for this tool (e.g. `claude_code`).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Only show the group for this project directory.
+        #[arg(long)]
+        project: Option<PathBuf>,
+        /// Output format.
+        #[arg(long, value_enum, default_value_t = Format::Text)]
+        format: Format,
+    },
+
     /// Migrate a tool's home-dir data to a new location, preserving the
     /// original. Runs the full state machine and records a reversible
     /// migration (`sessionguard undo`). See `docs/history/migrate.md`.

@@ -200,6 +200,60 @@ fn cli_undo_no_events_prints_message() {
 }
 
 #[test]
+fn cli_sessions_census_groups_and_flags_orphans() {
+    // One live Claude project (store dir decodes against the real fs) and one
+    // Codex session whose cwd no longer exists (orphan). Orphan detection is
+    // exact for Codex/OpenCode (they store literal paths); an undecodable
+    // Claude store shows [ENCODED NAME] instead, because its sanitization is
+    // lossy and "gone" can't be proven from the name alone.
+    let home = TempDir::new().unwrap();
+    let live = home.path().join("work/app");
+    std::fs::create_dir_all(&live).unwrap();
+    let enc_live = live.display().to_string().replace('/', "-");
+    let store = home.path().join(".claude/projects").join(&enc_live);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("session.jsonl"), "{}").unwrap();
+
+    let gone = home.path().join("work/deleted-proj");
+    let codex = home.path().join(".codex/sessions/2026/07");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("rollout-1.jsonl"),
+        format!("{{\"cwd\": \"{}\"}}\n", gone.display()),
+    )
+    .unwrap();
+
+    let out = sg(&home)
+        .args(["sessions", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let groups: serde_json::Value = serde_json::from_slice(&out).expect("sessions JSON parses");
+    let arr = groups.as_array().expect("array of groups");
+    assert_eq!(arr.len(), 2, "two projects with sessions");
+    let live_g = arr
+        .iter()
+        .find(|g| g["project_path"] == live.display().to_string())
+        .expect("live group");
+    assert_eq!(live_g["orphaned"], false);
+    assert_eq!(live_g["tools"]["claude_code"]["count"], 1);
+    assert!(
+        arr.iter().any(|g| g["orphaned"] == true),
+        "deleted project must be flagged orphaned"
+    );
+
+    // --orphans filters to just the orphan.
+    sg(&home)
+        .args(["sessions", "--orphans"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("[ORPHANED]"))
+        .stdout(predicate::str::contains("1 project(s) with sessions"));
+}
+
+#[test]
 fn cli_tools_list_json_carries_binary_status() {
     // The launcher-health column the dashboard consumes.
     let home = TempDir::new().unwrap();

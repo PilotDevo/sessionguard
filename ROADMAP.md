@@ -6,7 +6,13 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.6.3 (current)** — Three arcs shipped and hardened. The v0.5.2–v0.6.x
+**v0.7.0 (current)** — `sessionguard sessions`: a per-project session census
+across the home-dir stores (Claude Code / Codex / OpenCode) with orphan
+detection, now the single source of truth behind the dashboard's Activity
+tab (red `orphaned` pills included) — and the discovery groundwork for the
+handoff arc's `pack` command.
+
+**v0.6.x** — Three arcs shipped and hardened. The v0.5.2–v0.6.x
 releases closed a full codebase audit (see
 [`docs/design/hardening-audit.md`](docs/design/hardening-audit.md)): atomic
 session-file rewrites, brick-proof update swaps, race-free daemon lifecycle

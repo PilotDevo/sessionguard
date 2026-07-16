@@ -2,6 +2,29 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.7.0] - 2026-07-16
+
+### Added — per-project session census (`sessionguard sessions`)
+
+A new discovery axis: where `inventory` totals each tool's home-dir store,
+`sessions` answers *"for each project, which assistants have sessions, how
+many, and how fresh?"* — including **orphaned** groups whose project directory
+no longer exists (the first control signal for cleaning up stale session
+data).
+
+- **`sessionguard sessions [--orphans] [--tool <name>] [--project <path>]
+  [--format json]`** — groups sessions by project directory across the three
+  home-dir stores: Claude Code (`~/.claude/projects/<encoded>/`, with
+  filesystem-validated DFS decoding of the hyphen-ambiguous dir names), Codex
+  (`~/.codex/sessions/**/*.jsonl` via the first-line `cwd`), and OpenCode
+  (`opencode.db`, read-only SQLite). Undecodable Claude store names are shown
+  as `[ENCODED NAME]` rather than hidden; orphan detection is exact for
+  Codex/OpenCode (literal paths) and conservative for encoded names.
+- **The dashboard's Activity tab now consumes `sessions --format json`** —
+  the binary is the single source of truth for store discovery (the tab's
+  Python walkers remain only as a fallback for older/missing binaries), and
+  orphaned projects get a red `orphaned` pill in the UI.
+
 ## [0.6.3] - 2026-07-16
 
 ### Fixed — wiring & scaffolding audit
