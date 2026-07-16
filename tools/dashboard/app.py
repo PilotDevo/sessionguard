@@ -456,6 +456,56 @@ def _activity_from_opencode(home: Path) -> dict[str, dict[str, Any]]:
     return out
 
 
+def _activity_from_cli() -> list[dict[str, Any]] | None:
+    """Fetch the per-project session census from `sessionguard sessions
+    --format json` (v0.7+) and adapt it to the Activity-tab row shape.
+
+    The Rust binary is the single source of truth for store discovery
+    (Claude dir decoding, Codex cwd extraction, OpenCode SQLite) — the
+    Python walkers below are retained only as a fallback for standalone
+    use with an older/missing binary. Returns None when the CLI is
+    unavailable or predates the `sessions` command.
+    """
+    binary = os.environ.get("SESSIONGUARD_BIN", "sessionguard")
+    try:
+        out = subprocess.run(
+            [binary, "sessions", "--format", "json"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return None
+    if out.returncode != 0 or not out.stdout.strip():
+        return None
+    try:
+        groups = json.loads(out.stdout)
+    except json.JSONDecodeError:
+        return None
+    if not isinstance(groups, list):
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for g in groups:
+        tools = {
+            name: {
+                "count": s.get("count", 0),
+                "last_activity": float(s.get("last_active_unix", 0)),
+            }
+            for name, s in (g.get("tools") or {}).items()
+        }
+        rows.append(
+            {
+                "project_path": g.get("project_path", ""),
+                "encoded": not g.get("decoded", False),
+                "orphaned": bool(g.get("orphaned", False)),
+                "tools": tools,
+            }
+        )
+    return rows
+
+
 def list_activity(tracked_paths: set[str]) -> list[dict[str, Any]]:
     """Build a unified per-project view across the three known stores.
 
@@ -469,6 +519,25 @@ def list_activity(tracked_paths: set[str]) -> list[dict[str, Any]]:
     if cached is not None and (now - _activity_cache["ts"]) < 30.0:
         return cached
 
+    # Preferred path: the binary's census (single source of truth).
+    cli_rows = _activity_from_cli()
+    if cli_rows is not None:
+        out: list[dict[str, Any]] = []
+        for row in cli_rows:
+            last = max((t["last_activity"] for t in row["tools"].values()), default=0.0)
+            out.append(
+                {
+                    **row,
+                    "tracked": row["project_path"] in tracked_paths,
+                    "last_activity": last,
+                }
+            )
+        out.sort(key=lambda e: e["last_activity"], reverse=True)
+        _activity_cache["ts"] = now
+        _activity_cache["data"] = out
+        return out
+
+    # Fallback: legacy in-process walkers (older/missing binary).
     home = Path.home()
     merged: dict[str, dict[str, Any]] = {}
     for source in (
@@ -495,6 +564,9 @@ def list_activity(tracked_paths: set[str]) -> list[dict[str, Any]]:
             {
                 "project_path": path,
                 "encoded": info["encoded"],
+                # Orphan detection matches the CLI census: a confidently
+                # decoded project path that no longer exists on disk.
+                "orphaned": (not info["encoded"]) and not Path(path).exists(),
                 "tracked": path in tracked_paths,
                 "tools": info["tools"],
                 "last_activity": last,
@@ -693,6 +765,9 @@ INDEX_HTML = r"""<!doctype html>
       const tracked = p.tracked
         ? `<span class="tag good" title="registered with the SessionGuard daemon — auto-reconciled on move">tracked</span>`
         : `<span class="tag muted" title="not registered; SessionGuard sees the history but won't reconcile a move">untracked</span>`;
+      const orphaned = p.orphaned
+        ? ` <span class="tag bad" title="project directory no longer exists — sessions are orphaned (candidates for cleanup)">orphaned</span>`
+        : "";
       const encoded = p.encoded
         ? ` <span class="tag warn" title="Claude Code dir name could not be decoded to a real path">encoded</span>`
         : "";
@@ -715,7 +790,7 @@ INDEX_HTML = r"""<!doctype html>
 
       return `
         <tr>
-          <td>${overallTag}<code>${esc(p.project_path)}</code>${encoded}</td>
+          <td>${overallTag}<code>${esc(p.project_path)}</code>${encoded}${orphaned}</td>
           <td>${tracked}</td>
           ${cells}
           <td class="muted">${esc(fmtAge(p.last_activity))} ago</td>

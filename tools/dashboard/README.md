@@ -83,6 +83,10 @@ design:
   (see `ROADMAP.md`).
 - The `Tools` tab reads `sessionguard tools list --format json` (as do the
   other tabs that need the resolution chain).
+- The `Activity` tab reads `sessionguard sessions --format json` (v0.7+) —
+  the binary is the single source of truth for store discovery, including
+  ORPHANED detection (project dir gone). With an older/missing binary the
+  dashboard falls back to its built-in walkers (no orphan pills).
 - `--host 0.0.0.0` exposes project paths and event history over the
   network. If you bind beyond localhost, make sure the network is
   trusted — there's no authentication layer.

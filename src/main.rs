@@ -914,6 +914,77 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Sessions {
+            orphans,
+            tool,
+            project,
+            format,
+        } => {
+            let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_owned()) else {
+                anyhow::bail!("cannot determine your home directory");
+            };
+            let mut groups = sessionguard::sessions::census(&home);
+
+            if orphans {
+                groups.retain(|g| g.orphaned);
+            }
+            if let Some(t) = &tool {
+                groups.retain(|g| g.tools.contains_key(t));
+            }
+            if let Some(p) = &project {
+                let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
+                let want = canonical.display().to_string();
+                groups.retain(|g| g.project_path == want);
+            }
+
+            match format {
+                sessionguard::cli::Format::Json => {
+                    println!("{}", serde_json::to_string_pretty(&groups)?);
+                }
+                sessionguard::cli::Format::Text => {
+                    if groups.is_empty() {
+                        println!("no sessions found.");
+                        return Ok(());
+                    }
+                    let orphan_count = groups.iter().filter(|g| g.orphaned).count();
+                    for g in &groups {
+                        let mut markers = String::new();
+                        if g.orphaned {
+                            markers.push_str("  [ORPHANED]");
+                        }
+                        if !g.decoded {
+                            markers.push_str("  [ENCODED NAME]");
+                        }
+                        println!("{}{}", g.project_path, markers);
+                        for (tool_name, s) in &g.tools {
+                            println!(
+                                "    {:<12} {:>4} session(s)  {:>9}  last active {}",
+                                tool_name,
+                                s.count,
+                                if s.bytes > 0 {
+                                    fmt_size(s.bytes)
+                                } else {
+                                    "-".to_string()
+                                },
+                                if s.last_active_unix > 0 {
+                                    fmt_ago(s.last_active_unix)
+                                } else {
+                                    "unknown".to_string()
+                                }
+                            );
+                        }
+                    }
+                    println!("\n{} project(s) with sessions.", groups.len());
+                    if orphan_count > 0 && !orphans {
+                        println!(
+                            "{orphan_count} orphaned (project dir gone) — list with \
+                             `sessionguard sessions --orphans`."
+                        );
+                    }
+                }
+            }
+        }
+
         Command::Undo {
             last,
             id,

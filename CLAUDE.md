@@ -70,6 +70,7 @@ Events flow:
 - **`health.rs`** — Tool-presence / launcher health checks (binary on PATH, etc.).
 - **`inventory.rs`** — Bounded filesystem walk that enumerates each tool's declared `home_dir_layout`: location, size, file count, last-modified. Backs `sessionguard inventory`; read-only lead-in to `migrate`.
 - **`migrate/`** (`mod.rs` + `tests.rs`) — The v0.4 migration engine: a nine-stage state machine (Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite → Resume → Validate → Retain, then Done) with trait-DI backends (`Quiescer`/`EnvWriter` + `Fake*` test doubles), `undo_migration`, and `cleanup_migration`. Returns a `MigrationResult`; `main.rs` persists it to the event log. Driven by `home_dir_layout` on `ToolDefinition`.
+- **`sessions.rs`** — Per-project session census across the tools' home-dir stores (Claude Code encoded-dir DFS decoding, Codex JSONL `cwd`, OpenCode SQLite read-only). Backs `sessionguard sessions` (+ `--orphans`); the dashboard's Activity tab consumes its `--format json`.
 - **`update.rs`** — Self-update for `sessionguard update` (v0.5): install-method detection (defer to brew/cargo, refuse dev builds), version compare, a curl-backed `ReleaseClient` trait (faked in tests), and SHA256SUMS-verified download → atomic swap with `.bak-<ver>` rollback → daemon restart. Carries its own `UpdateError`.
 - **`error.rs`** — `thiserror` error enum used across the daemon/reconciler core (`migrate.rs` and `update.rs` carry their own domain errors).
 
