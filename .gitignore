@@ -37,3 +37,7 @@ Thumbs.db
 # MCP tool artifacts
 .playwright-mcp/
 .mcp-*/
+
+# Python bytecode (dashboard dev)
+__pycache__/
+*.pyc
