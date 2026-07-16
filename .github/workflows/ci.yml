@@ -28,6 +28,12 @@ jobs:
       - name: Check formatting
         run: cargo fmt -- --check
 
+      - name: Release-metadata consistency
+        # Fails when README/ROADMAP/SECURITY/CHANGELOG drift from Cargo.toml's
+        # version, or install.sh offers a target release.yml doesn't build.
+        # This drift has recurred three times; now it can't ship silently.
+        run: bash scripts/check-consistency.sh
+
       - name: Clippy
         run: cargo clippy -- -D warnings
 

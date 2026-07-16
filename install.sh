@@ -45,7 +45,10 @@ detect_target() {
         Linux)
             case "$ARCH" in
                 x86_64)  echo "x86_64-unknown-linux-gnu" ;;
-                aarch64|arm64) echo "aarch64-unknown-linux-gnu" ;;
+                # No prebuilt ARM-Linux binary is published (release builds
+                # x86_64-linux + both macOS targets only) — advertising the
+                # triple here used to produce a guaranteed download 404.
+                aarch64|arm64) die "No prebuilt binary for ARM Linux yet. Use: cargo install $BINARY" ;;
                 *) die "Unsupported Linux architecture: $ARCH. Try: cargo install $BINARY" ;;
             esac
             ;;
@@ -155,19 +158,17 @@ main() {
         *) warn "$INSTALL_DIR is not in your PATH. Add it to your shell profile." ;;
     esac
 
-    # Verify
-    if command -v "$BINARY" >/dev/null 2>&1; then
-        say "All done! $(sessionguard --version)"
-        echo ""
-        echo "  Quick start:"
-        echo "    sessionguard watch ~/your-project   # start tracking a project"
-        echo "    sessionguard start --foreground     # run the daemon"
-        echo "    sessionguard status                 # check what's tracked"
-        echo "    sessionguard --help                 # all commands"
-        echo ""
-    else
-        say "Installed successfully. Run: $DEST --version"
-    fi
+    # Verify the binary we just INSTALLED — not whatever `sessionguard` PATH
+    # happens to resolve to (a stale copy earlier in PATH would report the
+    # wrong version and mask a half-successful install).
+    say "All done! $("$DEST" --version)"
+    echo ""
+    echo "  Quick start:"
+    echo "    sessionguard init                   # find your projects, set up watch roots"
+    echo "    sessionguard start                  # run the daemon (backgrounds itself)"
+    echo "    sessionguard status                 # check what's tracked"
+    echo "    sessionguard --help                 # all commands"
+    echo ""
 }
 
 main "$@"

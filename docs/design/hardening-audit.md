@@ -7,7 +7,7 @@
 
 > **Status:** Wave 1 (B1, B2, B3, + H8) fixed in **v0.5.2**. Wave 2 (H1–H7)
 > fixed in **v0.6.0**. Wave 3: M4/M5 in **v0.6.1**; M1, M2, M3, M6, M7, M9,
-> M13–M18, L1–L5, L8 in **v0.6.2** (2026-07-19).
+> M13–M18, L1–L5, L8 in **v0.6.2** (2026-07-14).
 > **Deliberately deferred** (dedicated passes, not forgotten): M8 config-file
 > re-read on SIGHUP (watch-set reload shipped in v0.6.0; full config re-read
 > needs the daemon to re-load from its config path), M10 comment-preserving

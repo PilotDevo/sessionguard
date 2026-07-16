@@ -3,7 +3,7 @@
 > **Status**: SHIPPED in v0.4.0–v0.4.2 and retired to `docs/history/`. This is
 > the original design contract, kept for the record. Where the shipped code
 > diverged from this draft, the divergences are flagged inline as **SHIPPED
-> NOTE**. For current behavior see the `src/migrate.rs` module docs, the README
+> NOTE**. For current behavior see the `src/migrate/` module docs, the README
 > "Migrate" section, and `CHANGELOG.md`.
 > Originally drafted 2026-05-26 (v0.3.4 baseline).
 

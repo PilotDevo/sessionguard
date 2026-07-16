@@ -10,6 +10,10 @@
 #
 # View logs:
 #   journalctl --user -u sessionguard -f
+#
+# NOTE on ExecStart: install.sh installs to /usr/local/bin when writable,
+# falling back to ~/.local/bin. If your binary lives at ~/.local/bin (or a
+# cargo install at ~/.cargo/bin), edit ExecStart accordingly.
 
 [Unit]
 Description=SessionGuard — AI session artifact reconciliation daemon
@@ -18,17 +22,21 @@ After=network.target
 
 [Service]
 Type=simple
-ExecStart=%h/.local/bin/sessionguard start --foreground
+ExecStart=/usr/local/bin/sessionguard start --foreground
 Restart=on-failure
 RestartSec=5s
 Environment=RUST_LOG=info
 
-# Security hardening
+# Security hardening.
+#
+# Deliberately NOT ProtectSystem=strict / ProtectHome: SessionGuard's core
+# job is REWRITING session artifacts inside your project directories (e.g.
+# ~/projects/app/.claude/settings.json) when they move. A read-only home
+# turns the daemon into a bystander that watches moves it can never fix.
+# ProtectSystem=full still keeps /usr, /boot, and /etc read-only.
 PrivateTmp=true
 NoNewPrivileges=true
-ProtectSystem=strict
-ProtectHome=read-only
-ReadWritePaths=%h/.local/share/sessionguard %h/.config/sessionguard
+ProtectSystem=full
 
 [Install]
 WantedBy=default.target

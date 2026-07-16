@@ -47,11 +47,12 @@ pub struct Cli {
 pub enum Command {
     /// Start the SessionGuard daemon.
     Start {
-        /// Run in the foreground (don't daemonize).
-        #[arg(long)]
+        /// Run attached in the foreground (don't background).
+        #[arg(long, conflicts_with = "daemon")]
         foreground: bool,
 
-        /// Daemonize (run in the background).
+        /// Run in the background. This is already the default; the flag is
+        /// kept for explicitness and compatibility.
         #[arg(short, long)]
         daemon: bool,
     },

@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.5.0** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. The v0.4 **Migrate** arc shipped (`inventory` / `migrate` / `migrate-cleanup`, fully reversible via `undo`); v0.5 adds **`sessionguard update`** for one-command self-update across machines, with checksum-verified, rollback-safe binary swaps. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.6.3** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -223,7 +223,7 @@ sessionguard update
 
 # Preview, or pin a specific version
 sessionguard update --dry-run
-sessionguard update --to v0.4.3
+sessionguard update --to v0.6.2
 ```
 
 `update` self-replaces a standalone install (the `install.sh` target) — it
@@ -231,7 +231,9 @@ verifies the download against the release `SHA256SUMS` (refusing on mismatch),
 keeps the previous binary at `<bin>.bak-<version>` for rollback, and restarts a
 running daemon. If you installed via **Homebrew** or **cargo**, it defers to
 `brew upgrade` / `cargo install --force` rather than fighting the package
-manager. See [`docs/history/update.md`](docs/history/update.md) for the design.
+manager. Installing a version *older* than the one running is refused unless
+you pass `--allow-downgrade`. See
+[`docs/history/update.md`](docs/history/update.md) for the design.
 
 ### Configure
 
@@ -282,7 +284,7 @@ The dashboard opens the SQLite registry with `mode=ro` and talks to
 the daemon only via `sessionguard tools list --format json` — no write
 paths. Action controls (click-to-undo, click-to-migrate) are intentionally
 deferred until the underlying CLI commands they'd drive are fully
-designed; see [ROADMAP.md](ROADMAP.md) for v0.5+ plans.
+designed; see [ROADMAP.md](ROADMAP.md) for later plans.
 
 See [`tools/dashboard/README.md`](tools/dashboard/README.md) for a
 systemd `--user` unit if you want it persistent.
@@ -313,7 +315,7 @@ AI tools evolve fast. New tools appear constantly. By defining tool patterns as 
 
 See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
 
-**Shipped** *(v0.1 – v0.4.2)*
+**Shipped** *(v0.1 – v0.6.x)*
 - Full watcher → detector → reconciler pipeline, verified end-to-end on
   macOS + Linux with real-data dogfooding (not just unit tests)
 - Seven built-in tool patterns
@@ -328,9 +330,20 @@ See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
   copy → verify → rewrite → validate → retain), fully reversible via
   `undo`, and `migrate-cleanup` to reclaim preserved originals. Dogfooded on a
   multi-GB OpenCode store → fast pool. The source is never auto-deleted.
+- **v0.5 "Update"** — `sessionguard update [--check]`: checksum-verified,
+  rollback-safe self-update from GitHub releases that defers to brew/cargo
+  and refuses dev builds; releases publish a `SHA256SUMS` asset verified by
+  both `install.sh` and the updater
+- **v0.5.2–v0.6.x hardening arc** — a whole-codebase audit fixed and shipped:
+  atomic session-file rewrites, brick-proof update swaps, race-free daemon
+  lifecycle with PID-identity checks, real background `start`, an
+  un-home-locked watch model with live SIGHUP reload, `init` onboarding,
+  recursive `scan --depth`, `logs --follow`, boundary-safe text rewrites,
+  per-file migrate verification, and full-graph `export`/`import` (v2 format)
 - Read-only local dashboard (`tools/dashboard/`)
-- CI dogfood matrix on Ubuntu + macOS (the regression gate for the
-  classes of bugs unit tests historically missed)
+- CI matrix on Ubuntu + macOS: fmt, clippy, MSRV, cargo-deny (incl. RustSec
+  advisories), coverage baseline, release-metadata consistency gate, and
+  three e2e dogfood smokes (reconcile, migrate → undo, self-update)
 - Homebrew tap + crates.io publishing, both automated on release
   (see [`docs/ops/homebrew-tap-token.md`](docs/ops/homebrew-tap-token.md)
   for the one-time `HOMEBREW_TAP_TOKEN` setup that activates the tap update)
@@ -421,7 +434,7 @@ Yes — a minimal read-only one. `python3 tools/dashboard/app.py` serves a local
 - **Sessions** — total store sizes per assistant
 - **Tools** — registered tool patterns
 
-No dependencies beyond the Python stdlib. An interactive UI that also drives actions (undo, migrate) is planned for v0.5+.
+No dependencies beyond the Python stdlib. An interactive UI that also drives actions (undo, migrate) is planned for a later version.
 
 ## License
 

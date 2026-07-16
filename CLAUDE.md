@@ -89,7 +89,7 @@ To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_
 Tests use `SESSIONGUARD_DATA_DIR` (and `SESSIONGUARD_CONFIG_DIR`) to point each test at an isolated per-test SQLite registry and config dir — no shared state, and no reads of the operator's real `~/.config`/`$HOME`.
 
 ```bash
-cargo test                           # ~150 tests (unit + integration)
+cargo test                           # ~180 tests (unit + integration)
 cargo test sandbox_                  # integration tests only
 cargo test reconcile_               # end-to-end reconciliation proofs
 cargo test -- --nocapture            # with stdout
@@ -97,7 +97,7 @@ cargo test -- --nocapture            # with stdout
 
 The `cmd()` helper in `tests/sandbox.rs` wraps `Command::cargo_bin` and injects the isolation env vars automatically — use it for all new sandbox tests.
 
-End-to-end smoke scripts live in `scripts/`: `dogfood.sh` (reconcile path) and `migrate-dogfood.sh` (migrate → undo round-trip). Both isolate via the env vars and a throwaway config; CI runs them on both OSes.
+End-to-end smoke scripts live in `scripts/`: `dogfood.sh` (reconcile path), `migrate-dogfood.sh` (migrate → undo round-trip), and `update-dogfood.sh` (self-update swap/rollback/tamper-refusal via a file:// fake release). All isolate via the env vars and a throwaway config; CI runs all three on both OSes. `scripts/check-consistency.sh` gates release-metadata drift in CI.
 
 ## CI/CD
 
@@ -130,6 +130,8 @@ examples/
 scripts/
   dogfood.sh            # E2E reconcile smoke test
   migrate-dogfood.sh    # E2E migrate → undo smoke test
+  update-dogfood.sh     # E2E self-update smoke test (offline fake release)
+  check-consistency.sh  # release-metadata consistency gate (runs in CI)
 docs/
   design/               # Active design drafts (e.g. handoff.md)
   history/              # Retired design docs (e.g. migrate.md, shipped in v0.4)

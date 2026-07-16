@@ -2,7 +2,44 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
-## [0.6.2] - 2026-07-19
+## [0.6.3] - 2026-07-16
+
+### Fixed — wiring & scaffolding audit
+
+A root-to-leaf wiring audit (every module, command, script, config file, and
+cross-file contract) found the code fully wired but several scaffolding
+artifacts miswired or stale; all fixed.
+
+- **`install.sh` no longer 404s on ARM Linux.** It advertised
+  `aarch64-unknown-linux-gnu`, a target no release builds — it now refuses
+  with a `cargo install` hint (matching the updater's behavior). The final
+  version check also verifies the binary it just installed instead of
+  whatever `PATH` resolves, and the quick-start reflects `init` + background
+  `start`.
+- **`contrib/sessionguard.service` could never do its job.**
+  `ProtectHome=read-only` blocked the reconciler's writes into project
+  directories (the daemon's core function), and `ExecStart` pointed at
+  `~/.local/bin` while `install.sh` defaults to `/usr/local/bin`. Hardening
+  relaxed to `ProtectSystem=full` (with rationale) and the path corrected.
+- **`start --daemon` is truthful again** — it was silently ignored; it now
+  explicitly means background (the default) and conflicts with
+  `--foreground`.
+- **`release.toml`** would have produced a release commit cliff's changelog
+  doesn't skip (`chore:` vs `chore(release):`) under an invalid `[workspace]`
+  header; both corrected.
+- **New CI gate: `scripts/check-consistency.sh`.** README/ROADMAP/SECURITY/
+  CHANGELOG version stamps and install-target wiring are now verified on
+  every push — the "docs sat out N releases" drift (which had recurred three
+  times, most recently leaving README at v0.5.0 while 0.6.2 shipped) is now a
+  CI failure, not an audit finding.
+- Docs re-synced to reality: README status/Shipped/downgrade-guard note,
+  ROADMAP current marker + shipped checkboxes (backgrounding, dogfood CI,
+  advisories-via-cargo-deny), SECURITY 0.6.x, CLAUDE.md test count + scripts,
+  the skill's per-file Verify wording, the dashboard's "until v0.4 lands"
+  string, handoff.md's export premise (v2 full-graph) + re-baseline, and the
+  future-dated 0.6.2 changelog entry (tagged 2026-07-14).
+
+## [0.6.2] - 2026-07-14
 
 ### Fixed / Changed — deep-hardening (audit Wave 3)
 
