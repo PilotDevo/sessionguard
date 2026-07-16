@@ -65,3 +65,10 @@ changelog:
 # Bump version (patch/minor/major)
 bump LEVEL="patch":
     cargo release {{LEVEL}} --no-publish --execute
+
+# Run all three e2e dogfood smokes against a fresh release build (CI's gate)
+dogfood:
+    cargo build --release --quiet
+    SESSIONGUARD_BIN=./target/release/sessionguard bash scripts/dogfood.sh
+    SESSIONGUARD_BIN=./target/release/sessionguard bash scripts/migrate-dogfood.sh
+    SESSIONGUARD_BIN=./target/release/sessionguard bash scripts/update-dogfood.sh

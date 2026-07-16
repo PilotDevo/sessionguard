@@ -16,7 +16,7 @@
 //! | Snapshot  | Stubbed     | Records intent only (btrfs detect comes later) |
 //! | Quiesce   | Implemented | `systemctl stop` via [`Quiescer`] |
 //! | Copy      | Implemented | Recursive copy into the new path |
-//! | Verify    | Implemented | Compares file count + total size |
+//! | Verify    | Implemented | Per-file compare (path + size; symlinks by remapped target) |
 //! | Rewrite   | Implemented | Symlink / config edit / systemd drop-in per discovery |
 //! | Resume    | Implemented | `systemctl start` via [`Quiescer`] |
 //! | Validate  | Implemented | Runs `validate.command` with timeout |

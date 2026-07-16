@@ -1,9 +1,9 @@
-# Design: `sessionguard handoff` — cross-machine session portability (v0.5?)
+# Design: `sessionguard handoff` — cross-machine session portability (next arc)
 
 > **Status**: Design draft. No code yet. Land this doc first, take a
 > beat, then implement — same cadence as `migrate.md` preceded v0.4.
-> Reviewers: feedback as GitHub issues. Last revised: 2026-06-25
-> (v0.4.2 baseline).
+> Reviewers: feedback as GitHub issues. Last revised: 2026-07-16
+> (v0.6.x baseline).
 
 ## Thesis: the third axis
 
@@ -53,11 +53,13 @@ its source bundle from there instead of from machine A directly.
 
 ## What `export` / `import` do today (the starting point)
 
-Current `export` writes the registry's project list (paths only) as
-JSON; `import` re-registers those paths. **Bookkeeping, not content** —
-no artifacts, no keys, no rewriting. Handoff is the content-bearing,
-re-keying superset. The existing commands stay as-is for registry
-backup; handoff is a new, focused pair (see Commands).
+As of v0.6.2, `export` writes a versioned bundle carrying the registry's
+full graph — project paths **plus their artifact mappings** — and `import`
+restores both. That's still **registry bookkeeping, not session content**:
+no session files travel, no keys are re-keyed, no paths are rewritten for a
+different machine. Handoff is the content-bearing, re-keying superset. The
+existing commands stay as-is for registry backup; handoff is a new, focused
+pair (see Commands).
 
 ## Concrete first target
 

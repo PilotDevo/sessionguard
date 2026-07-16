@@ -148,7 +148,9 @@ back to the user:
   declared" is also fine.
 - **Copy** — recursive copy source → destination (shows file/byte counts). A
   custom `std::fs` walk, not rsync — no delta detection.
-- **Verify** — compares size/count between source and destination.
+- **Verify** — per-file compare between source and destination (every
+  relative path must match in size; symlinks checked by target). Mismatches
+  are named in the output.
 - **Rewrite** — repoints the tool: installs a symlink (OpenCode), edits a config
   file, or drops a systemd `Environment=` override (Codex / `CODEX_HOME`).
 - **Resume** — restarts anything Quiesce stopped.

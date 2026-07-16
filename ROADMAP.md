@@ -6,7 +6,17 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.5.0 (current)** — The v0.4 **Migrate** arc has shipped. On top of the
+**v0.6.3 (current)** — Three arcs shipped and hardened. The v0.5.2–v0.6.x
+releases closed a full codebase audit (see
+[`docs/design/hardening-audit.md`](docs/design/hardening-audit.md)): atomic
+session-file rewrites, brick-proof update swaps, race-free daemon lifecycle
+with PID-identity checks, real background `start`, an un-home-locked watch
+model with live SIGHUP reload, `init` onboarding, recursive `scan`,
+`logs --follow`, boundary-safe text rewrites, per-file migrate verification,
+and full-graph `export`/`import`. CI now gates release-metadata consistency
+so docs can't silently drift from the shipped version again.
+
+**v0.4.x** — The v0.4 **Migrate** arc shipped. On top of the
 v0.1–v0.3 reconcile pipeline (move detection on macOS + Linux, seven built-in
 tools, `undo`, `--format json`, launcher health, `doctor --clean`),
 SessionGuard now relocates a tool's home-dir data between disks:
@@ -35,7 +45,7 @@ The v0.4 *migrate* design is retired to
 cross-machine session **handoff** — is drafted in
 [`docs/design/handoff.md`](docs/design/handoff.md).
 
-## v0.3 — Undo + More Patterns  *(shipping)*
+## v0.3 — Undo + More Patterns  *(shipped)*
 
 Goal: build trust. Users won't run an auto-reconciler they can't reverse.
 
@@ -46,9 +56,9 @@ Goal: build trust. Users won't run an auto-reconciler they can't reverse.
 - [x] `sessionguard tools [list] [--verbose]` — inspect registered patterns
 - [x] Event log stores `format` + `undone_at`; schema migration for
       pre-v0.3 logs
-- [ ] Real background daemonisation (`--daemon` that actually forks)
-      *(deferred to v0.3.x)*
-- [ ] `scripts/dogfood.sh` as a required CI check *(deferred)*
+- [x] Real background daemonisation — shipped in v0.6.0 (`start` backgrounds
+      by default via re-exec; `--foreground` runs attached)
+- [x] `scripts/dogfood.sh` as a required CI check (all three dogfoods gate CI)
 
 ## v0.4 — Migrate  *(shipped)*
 
@@ -99,7 +109,10 @@ found four minor versions behind on 2026-06-25 — exactly the drift this closes
   and `update` — closed the no-integrity-check gap in the curl-pipe installer
 - [x] `--check` doubles as a read-only fleet-drift probe
 
-## v0.6 — Tool Pattern Library
+## Later — Tool Pattern Library
+
+> Note: the v0.6 version number ended up used by the hardening arc; this
+> milestone keeps its content, unpinned from a number.
 
 Goal: let the community extend the pattern catalog safely.
 
@@ -107,7 +120,7 @@ Goal: let the community extend the pattern catalog safely.
   `contrib/tools/` dir)
 - `sessionguard tools validate <toml>` — lint contributor TOMLs
 - Docs: contributing guide, pattern authoring cookbook
-- `cargo-audit` integration in CI
+- [x] RustSec advisory scanning in CI (covered by the cargo-deny job's `[advisories]` check — no separate cargo-audit needed)
 - Homebrew formula auto-publish workflow
 
 ## Launcher health  *(Path A shipped in v0.3.3 — `src/health.rs`)*

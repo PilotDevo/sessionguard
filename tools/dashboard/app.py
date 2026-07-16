@@ -173,8 +173,8 @@ def list_tools() -> list[dict[str, Any]]:
 #   1. *in-project* state — SessionGuard reconciles this automatically
 #      via the tool patterns' `path_fields`.
 #   2. *home-dir* state — session histories under ~/.codex, ~/.local/share,
-#      etc., keyed on absolute project paths. SessionGuard can't rewrite
-#      these yet (v0.4 `migrate` scope), but it CAN surface them so you
+#      etc., keyed on absolute project paths. `sessionguard migrate` (v0.4+)
+#      relocates these stores; the dashboard surfaces them read-only so you
 #      know what's there.
 #
 # This section enumerates home-dir stores for visibility. Results are
@@ -849,7 +849,7 @@ INDEX_HTML = r"""<!doctype html>
         </table>
         <div class="muted" style="margin-top:0.75rem;font-size:12px">
           Home-dir session stores. SessionGuard reconciles <em>in-project</em> state today;
-          these home-dir stores are visibility-only until v0.4 <code>migrate</code> lands.
+          these home-dir stores are relocatable via <code>sessionguard migrate</code> (v0.4+).
           (cached 30s)
         </div>
       </div>`;
