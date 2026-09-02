@@ -70,9 +70,10 @@ Events flow:
 - **`health.rs`** — Tool-presence / launcher health checks (binary on PATH, etc.).
 - **`inventory.rs`** — Bounded filesystem walk that enumerates each tool's declared `home_dir_layout`: location, size, file count, last-modified. Backs `sessionguard inventory`; read-only lead-in to `migrate`.
 - **`migrate/`** (`mod.rs` + `tests.rs`) — The v0.4 migration engine: a nine-stage state machine (Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite → Resume → Validate → Retain, then Done) with trait-DI backends (`Quiescer`/`EnvWriter` + `Fake*` test doubles), `undo_migration`, and `cleanup_migration`. Returns a `MigrationResult`; `main.rs` persists it to the event log. Driven by `home_dir_layout` on `ToolDefinition`.
-- **`sessions.rs`** — Per-project session census across the tools' home-dir stores (Claude Code encoded-dir DFS decoding, Codex JSONL `cwd`, OpenCode SQLite read-only). Backs `sessionguard sessions` (+ `--orphans`); the dashboard's Activity tab consumes its `--format json`.
+- **`sessions.rs`** — Per-project session census across the tools' home-dir stores. As of v0.8, **declaration-driven**: it no longer hardcodes the three store paths but dispatches on each loaded tool's `[tool.session_store]` binding (`SessionStore::EncodedDir`/`JsonlField`/`SqliteColumn` in `tools/mod.rs`) — Claude Code encoded-dir DFS decoding (now with three-state `DecodeConfidence`: `exact`/`inferred`/`unresolved`, so a deleted project can decode as an orphan instead of vanishing), Codex JSONL field lookup, OpenCode SQLite read-only. `census(home, stores)` also backs `--home <path>` (an arbitrary root, e.g. a mounted remote home). Backs `sessionguard sessions` (+ `--orphans`); the dashboard's Activity tab consumes its `--format json`.
+- **`fleet.rs`** (v0.8) — Fleet-wide session census: runs the *remote* `sessionguard --version` + `sessions --format json` over ssh per `[[hosts]]` config and merges the result, stamping `host` provenance without re-deriving `orphaned` (that verdict always comes from the origin host). Backs `sessionguard sessions --host <name>` / `--all-hosts`. Read-only by construction — no other remote command is ever run — and upgrades a pre-`confidence` 0.7.0 payload on the fly. Refuses an ssh destination starting with `-` before spawning any process (argv-injection guard). Carries its own `FleetError`.
 - **`update.rs`** — Self-update for `sessionguard update` (v0.5): install-method detection (defer to brew/cargo, refuse dev builds), version compare, a curl-backed `ReleaseClient` trait (faked in tests), and SHA256SUMS-verified download → atomic swap with `.bak-<ver>` rollback → daemon restart. Carries its own `UpdateError`.
-- **`error.rs`** — `thiserror` error enum used across the daemon/reconciler core (`migrate.rs` and `update.rs` carry their own domain errors).
+- **`error.rs`** — `thiserror` error enum used across the daemon/reconciler core (`migrate.rs`, `update.rs`, and `fleet.rs` carry their own domain errors).
 
 ### Runtime Tool Pattern System
 
@@ -122,7 +123,8 @@ Tags follow `v0.1.0` format. Pushing a tag triggers: build → GitHub release �
 ```
 src/                    # Library + binary source (cli, daemon, watcher, detector,
                         #   reconciler, registry, event_log, tools/, health,
-                        #   inventory, migrate, config, error, main, lib)
+                        #   inventory, migrate, sessions, fleet, config, error,
+                        #   main, lib)
 tests/
   cli_smoke.rs          # Basic CLI invocation tests
   sandbox.rs            # Full integration tests with real project fixtures

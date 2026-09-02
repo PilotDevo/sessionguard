@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.7.0** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.8.0** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.8 makes session storage **data, not code**: a `[tool.session_store]` TOML schema declares where each tool's sessions live and how they're keyed, `sessions.rs` reads from those declarations instead of hardcoded paths, decode confidence (`exact`/`inferred`/`unresolved`) makes deleted Claude Code projects detectable as orphans for the first time, and `sessions --home/--host/--all-hosts` extends the census to another root or across an ssh fleet. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`; v0.7 added the per-project `sessions` census. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -42,23 +42,30 @@ SessionGuard is a lightweight filesystem daemon that:
 
 Tool support is defined via runtime-loaded TOML patterns — add new tools without recompiling.
 
-Three support levels today:
-- **Reconcile** — when a project moves, SessionGuard rewrites the tool's in-project session files (e.g. `.claude/settings.json`) to point at the new path, atomically and surgically.
+Four support levels today:
+- **Reconcile** — when a project moves, SessionGuard rewrites the tool's in-project session files (e.g. a text-based chat log) to point at the new path, atomically and surgically. **Verified against a real tool's file layout only for the synthetic tool the `dogfood.sh` smoke test declares** — no shipped built-in currently has a proven in-project path field (see below).
+- **Census** — the tool's sessions live in a home-dir store (not inside the project) that SessionGuard knows how to read via a declared `[tool.session_store]` binding (one of three data-bound layouts — `encoded_dir`, `jsonl_field`, `sqlite_column` — see [`docs/design/session-store-model.md`](docs/design/session-store-model.md)); `sessionguard sessions` groups and reports on them, including orphan detection.
 - **Migrate** — the tool stores session data in the user's home directory; SessionGuard can relocate that home-dir store to a new disk/path and repoint the tool (symlink, config edit, or env override), reversibly. This is the v0.4 `migrate` capability — see [Migrate](#migrate-relocate-a-tools-home-dir-data) below.
-- **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite or migrate it yet.
+- **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite, census, or migrate it yet.
 
 | Tool | Session Artifacts | Support |
 |------|------------------|---------|
-| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` | ✅ Reconcile |
-| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | ✅ Reconcile |
-| **Windsurf** | `.windsurf/`, `.windsurfrules`, `.windsurfignore` | ✅ Reconcile |
-| **Gemini CLI** | `.gemini/`, `GEMINI.md`, `.geminiignore` | ✅ Reconcile |
-| **Aider** | `.aider.chat.history.md`, `.aider.conf.yml` | ✅ Reconcile *(text adapter)* |
-| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` (home: `~/.codex`, `CODEX_HOME`) | ✅ Reconcile + Migrate |
-| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` (home: `~/.local/share/opencode`) | ✅ Reconcile + Migrate |
+| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` (home store: `~/.claude/projects`) | ✅ Census + Migrate *(reconcile is [Wave 2](docs/design/session-store-model.md#waves) store re-keying, not yet shipped — Claude Code embeds the project path in no in-project file)* |
+| **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | 🔍 Detect *(a `path_fields` reconcile target is declared but its file was not found on a real install — unverified)* |
+| **Windsurf** | `.windsurf/`, `.windsurfrules`, `.windsurfignore` | 🔍 Detect *(reconcile target unverified — same caveat as Cursor)* |
+| **Gemini CLI** | `.gemini/`, `GEMINI.md`, `.geminiignore` | 🔍 Detect *(a previously declared reconcile field was confirmed not to exist on real installs and was removed; no home-dir store declared)* |
+| **Aider** | `.aider.chat.history.md`, `.aider.conf.yml` | 🔍 Detect *(text-adapter reconcile target is a real filename but unverified end-to-end)* |
+| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` (home: `~/.codex`, `CODEX_HOME`; sessions: `~/.codex/sessions/**/*.jsonl`) | ✅ Census + Migrate |
+| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` (home: `~/.local/share/opencode/opencode.db`) | ✅ Census + Migrate |
 | **GitHub Copilot** | `.github/copilot-instructions.md` | 🔜 Planned |
 | **Continue.dev** | `.continue/`, `config.json` | 🔜 Planned |
 | **Custom / Other** | User-defined patterns via config TOML | ✅ Supported |
+
+None of the built-ins above currently ship a *verified* in-project reconcile
+target — see [`docs/design/session-store-model.md`](docs/design/session-store-model.md)
+for the audit that found this and the honesty patch that followed (fictional
+`path_fields` on `claude_code` and `gemini_cli` removed rather than left as a
+silent no-op).
 
 > **Tool authors:** We'd love your help defining the canonical session artifact list for your tool. See [Contributing](#contributing).
 
@@ -151,6 +158,18 @@ sessionguard scan ~/work --depth 6
 sessionguard sessions                    # grouped by project; flags ORPHANED groups
 sessionguard sessions --orphans          # only sessions whose project dir is gone
 sessionguard sessions --format json      # what the dashboard's Activity tab consumes
+sessionguard sessions --tool codex       # only groups with sessions for one tool
+sessionguard sessions --project ~/work/x # only the group for one project dir
+
+# Census an arbitrary root instead of $HOME — e.g. a mounted or rsync'd home
+sessionguard sessions --home /mnt/old-mac-home
+
+# Census one or every configured fleet host over ssh (see [[hosts]] below).
+# Read-only: the only remote commands run are `--version` and
+# `sessions --format json`. Orphan status always comes from the host the
+# sessions live on — it is never re-derived against this machine's filesystem.
+sessionguard sessions --host fedora
+sessionguard sessions --all-hosts        # this machine + every configured host
 
 # Check status of tracked projects + daemon state
 sessionguard status
@@ -268,6 +287,19 @@ on_move = "rewrite_paths"
 file = "mytool.config.json"
 field = "project_root"
 format = "json"
+
+# Fleet hosts this machine can census over ssh (`sessionguard sessions
+# --host <name>` / `--all-hosts`). Each host must be reachable with
+# key-based, non-interactive ssh (BatchMode) and run sessionguard 0.7.0+.
+# Read-only: the only commands ever run there are `--version` and
+# `sessions --format json` — never anything that mutates.
+[[hosts]]
+name = "fedora"
+ssh = "devo@192.168.10.90"
+
+[[hosts]]
+name = "doloamd"
+ssh = "devo@doloamd.local"
 ```
 
 Tool patterns can also be placed as individual TOML files in `~/.config/sessionguard/tools/`.
@@ -352,6 +384,18 @@ See [ROADMAP.md](ROADMAP.md) for the full living document. Short form:
 - Homebrew tap + crates.io publishing, both automated on release
   (see [`docs/ops/homebrew-tap-token.md`](docs/ops/homebrew-tap-token.md)
   for the one-time `HOMEBREW_TAP_TOKEN` setup that activates the tap update)
+- **v0.7 "Sessions"** — `sessionguard sessions`: a per-project census across
+  the home-dir stores with orphan detection, now the source behind the
+  dashboard's Activity tab
+- **v0.8 "Session-store model, wave 1"** — session storage becomes data: a
+  `[tool.session_store]` schema (three layout kinds — `encoded_dir`,
+  `jsonl_field`, `sqlite_column`) drives `sessions.rs` instead of hardcoded
+  paths; three-state decode confidence (`exact`/`inferred`/`unresolved`)
+  makes deleted Claude Code projects detectable as orphans for the first
+  time; `sessions --home <path>` census an arbitrary root; `sessions --host
+  <name>` / `--all-hosts` census a fleet over ssh with origin-host orphan
+  verdicts; an honesty patch removed `claude_code`/`gemini_cli`
+  `path_fields` that named fields absent from real installs
 
 **Next**
 Cross-machine session **handoff** — resume the same session on another machine
@@ -420,7 +464,11 @@ Negligible in `balanced` mode. Filesystem event APIs are interrupt-driven, not p
 Tool pattern definitions are versioned TOML files. If a tool updates its format, submit an updated pattern — no code changes needed.
 
 **Q: Can I use this with remote dev environments?**
-Not yet. v1.0 focuses on local development. Remote/container support is on the long-term roadmap.
+The daemon itself still runs per-machine — there's no remote agent. But
+`sessionguard sessions --host <name>` / `--all-hosts` can *census* other
+machines over ssh (read-only, via `[[hosts]]` config), so you can see what
+session state exists on a remote box without logging in. Watching, reconciling,
+and migrating remain local-only; that's the long-term roadmap.
 
 **Q: What if two tools conflict on session data?**
 SessionGuard treats each tool's session artifacts independently. It never merges data between tools.

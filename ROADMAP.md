@@ -6,7 +6,27 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.7.0 (current)** — `sessionguard sessions`: a per-project session census
+**v0.8.0 (current)** — Session-store model, wave 1 (read-only): where a
+tool's sessions live and how they're keyed to a project is now a
+`[tool.session_store]` TOML declaration (three data-bound layout kinds —
+`encoded_dir`, `jsonl_field`, `sqlite_column`) instead of three hardcoded
+Rust readers, so `sessions.rs` drives itself from those declarations. An
+honesty patch removed `path_fields` on `claude_code` and `gemini_cli` that
+named fields confirmed absent from real installs — their reconcile support
+was a silent no-op while detection still reported them as supported.
+Three-state decode confidence (`exact`/`inferred`/`unresolved`) replaces a
+boolean, which for the first time makes a **deleted** Claude Code project
+detectable as an orphan (the decoder validates against the live filesystem,
+so a gone project previously could never decode). `sessions --home <path>`
+census an arbitrary root (a mounted or rsync'd home), and a new `fleet.rs`
+adds `sessions --host <name>` / `--all-hosts` with `[[hosts]]` config to
+census other machines read-only over ssh, merging their JSON with
+provenance — orphan status always comes from the origin host. Wave 2 (store
+re-keying — the actual "reconcile" for these home-dir stores) and wave 3
+(A2A live-session detection, `sessions archive`) are deliberately not in
+this wave. See [`docs/design/session-store-model.md`](docs/design/session-store-model.md).
+
+**v0.7.0** — `sessionguard sessions`: a per-project session census
 across the home-dir stores (Claude Code / Codex / OpenCode) with orphan
 detection, now the single source of truth behind the dashboard's Activity
 tab (red `orphaned` pills included) — and the discovery groundwork for the
