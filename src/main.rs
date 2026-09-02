@@ -923,7 +923,12 @@ async fn main() -> Result<()> {
             let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_owned()) else {
                 anyhow::bail!("cannot determine your home directory");
             };
-            let mut groups = sessionguard::sessions::census(&home);
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let stores: Vec<(String, sessionguard::tools::SessionStore)> = tool_registry
+                .all()
+                .filter_map(|t| t.session_store.clone().map(|s| (t.name.clone(), s)))
+                .collect();
+            let mut groups = sessionguard::sessions::census(&home, &stores);
 
             if orphans {
                 groups.retain(|g| g.orphaned);
