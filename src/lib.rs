@@ -13,6 +13,7 @@ pub mod daemon;
 pub mod detector;
 pub mod error;
 pub mod event_log;
+pub mod fleet;
 pub mod health;
 pub mod inventory;
 pub mod migrate;

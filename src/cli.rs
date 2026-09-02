@@ -194,6 +194,12 @@ pub enum Command {
         /// mounted or rsync'd home from another machine).
         #[arg(long)]
         home: Option<PathBuf>,
+        /// Census a configured host instead of this machine.
+        #[arg(long, conflicts_with = "home")]
+        host: Option<String>,
+        /// Census every configured host plus this machine.
+        #[arg(long, conflicts_with_all = ["home", "host"])]
+        all_hosts: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,

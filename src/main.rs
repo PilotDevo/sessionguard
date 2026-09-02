@@ -919,6 +919,8 @@ async fn main() -> Result<()> {
             tool,
             project,
             home,
+            host,
+            all_hosts,
             format,
         } => {
             let home = match home {
@@ -933,7 +935,26 @@ async fn main() -> Result<()> {
                 .all()
                 .filter_map(|t| t.session_store.clone().map(|s| (t.name.clone(), s)))
                 .collect();
-            let mut groups = sessionguard::sessions::census(&home, &stores);
+
+            let mut groups = if all_hosts {
+                let mut all = sessionguard::sessions::census(&home, &stores);
+                for h in &config.hosts {
+                    match sessionguard::fleet::remote_census(h) {
+                        Ok(mut g) => all.append(&mut g),
+                        Err(e) => eprintln!("warning: {e}"),
+                    }
+                }
+                all
+            } else if let Some(name) = &host {
+                let h = config
+                    .hosts
+                    .iter()
+                    .find(|h| &h.name == name)
+                    .ok_or_else(|| anyhow::anyhow!("no host named `{name}` in config"))?;
+                sessionguard::fleet::remote_census(h)?
+            } else {
+                sessionguard::sessions::census(&home, &stores)
+            };
 
             if orphans {
                 groups.retain(|g| g.orphaned);
@@ -973,7 +994,12 @@ async fn main() -> Result<()> {
                             }
                             _ => {}
                         }
-                        println!("{}{}", g.project_path, markers);
+                        let host_prefix = if g.host != "local" {
+                            format!("[{}] ", g.host)
+                        } else {
+                            String::new()
+                        };
+                        println!("{}{}{}", host_prefix, g.project_path, markers);
                         for (tool_name, s) in &g.tools {
                             println!(
                                 "    {:<12} {:>4} session(s)  {:>9}  last active {}",

@@ -27,7 +27,7 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::tools::{SessionStore, TimeUnit};
 
@@ -36,7 +36,7 @@ const SESSION_WALK_CAP: usize = 50_000;
 
 /// How confidently a store entry was resolved to a real project path.
 /// Ordered most-confident first so `min` keeps the best decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeConfidence {
     Exact,
@@ -45,7 +45,7 @@ pub enum DecodeConfidence {
 }
 
 /// One tool's sessions for one project.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolSessions {
     /// Number of session files (Claude/Codex) or session rows (OpenCode).
     pub count: usize,
@@ -57,7 +57,7 @@ pub struct ToolSessions {
 }
 
 /// All known sessions for one project directory, across tools.
-#[derive(Debug, Clone, Serialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SessionGroup {
     /// The project directory the sessions belong to. At `Inferred`
     /// confidence this is a best-effort naive decode rather than a
