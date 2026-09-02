@@ -4,9 +4,15 @@
 #
 # scripts/dogfood.sh — End-to-end reconciliation smoke test.
 #
-# Creates a synthetic Claude Code project with an isolated SessionGuard
-# config and data directory, starts the daemon, moves the project, and
-# verifies that `.claude/settings.json` was rewritten to the new path.
+# Declares a SYNTHETIC tool ("dogfood_json") in a throwaway config, creates
+# a project with that tool's own JSON settings file, starts the daemon,
+# moves the project, and verifies that the file's declared `project_path`
+# field was rewritten to the new path. This proves the watcher → daemon →
+# reconciler → JSON-adapter pipeline end to end using a tool built for the
+# purpose — it is not exercising any shipped tool's real layout. Claude
+# Code deliberately declares no path_fields of its own (it has no
+# in-project file that names its path; see the honesty patch in
+# docs/design/session-store-model.md).
 #
 # The script is self-contained and cleans up after itself — safe to run
 # anywhere. It never touches the operator's real registry or config.
@@ -49,12 +55,9 @@ if [[ -z "$SG" ]]; then
 fi
 
 # ── fixture ──────────────────────────────────────────────────────────────
-mkdir -p "$OLD_PATH/.claude"
+mkdir -p "$OLD_PATH/.dogfood"
 printf '{"project_path": "%s", "model": "opus", "notes": "cloned from %s"}' \
-    "$OLD_PATH" "$OLD_PATH" > "$OLD_PATH/.claude/settings.json"
-cat > "$OLD_PATH/CLAUDE.md" <<'EOF'
-# Dogfood test project
-EOF
+    "$OLD_PATH" "$OLD_PATH" > "$OLD_PATH/.dogfood/settings.json"
 
 # Isolated config + data dirs — never touch the operator's real state
 DATA_DIR="$WORKDIR/sg-data"
@@ -65,6 +68,20 @@ cat > "$CONFIG_FILE" <<EOF
 watch_roots = ["$WORKDIR"]
 watch_mode = "balanced"
 EOF
+
+# Declare a SYNTHETIC tool for this smoke: it validates the JSON adapter's
+# surgical single-field rewrite, not any shipped tool's real layout. Claude
+# Code deliberately declares no path_fields (it has no in-project path state).
+cat >> "$CONFIG_FILE" <<'TOML'
+[[tools]]
+name = "dogfood_json"
+display_name = "Dogfood JSON Tool"
+session_patterns = [".dogfood/"]
+[[tools.path_fields]]
+file = ".dogfood/settings.json"
+field = "project_path"
+format = "json"
+TOML
 
 # ── banner ───────────────────────────────────────────────────────────────
 echo "╭─ sessionguard dogfood ───────────────────────────────────────────"
@@ -106,7 +123,7 @@ mv "$OLD_PATH" "$NEW_PATH"
 sleep 3
 
 # ── verify ───────────────────────────────────────────────────────────────
-SETTINGS_FILE="$NEW_PATH/.claude/settings.json"
+SETTINGS_FILE="$NEW_PATH/.dogfood/settings.json"
 if [[ ! -f "$SETTINGS_FILE" ]]; then
     echo "✗ settings.json missing at new location"
     exit 1
@@ -139,7 +156,9 @@ with open('$SETTINGS_FILE') as f:
     print(json.load(f).get('notes', ''))
 " 2>/dev/null)
     if [[ "$NOTES" == *"$OLD_PATH"* ]]; then
-        echo "✅ PASS — project_path rewritten, sibling 'notes' field left intact"
+        echo "✅ PASS — dogfood_json's declared project_path field was rewritten;"
+        echo "          sibling 'notes' field in the same file was left intact"
+        echo "          (proves the JSON adapter's surgical single-field rewrite)"
     else
         echo "⚠  PARTIAL — project_path rewritten but sibling 'notes' was also modified"
         echo "             notes = $NOTES"

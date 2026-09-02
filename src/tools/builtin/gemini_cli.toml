@@ -10,8 +10,3 @@ session_patterns = [
   ".geminiignore",
   "GEMINI.md",
 ]
-
-[[tool.path_fields]]
-file = ".gemini/settings.json"
-field = "project_root"
-format = "json"

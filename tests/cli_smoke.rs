@@ -272,3 +272,37 @@ fn cli_tools_list_json_carries_binary_status() {
         );
     }
 }
+
+#[test]
+fn cli_tools_json_declares_real_session_stores_and_no_fictional_fields() {
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
+        .args(["tools", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let tools: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let by = |n: &str| -> serde_json::Value {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == n)
+            .expect("tool present")
+            .clone()
+    };
+
+    // Verified stores are declared.
+    assert_eq!(by("claude_code")["session_store"]["layout"], "encoded_dir");
+    assert_eq!(by("codex")["session_store"]["layout"], "jsonl_field");
+    assert_eq!(by("opencode")["session_store"]["layout"], "sqlite_column");
+
+    // Verified-fictional path_fields are gone (the field named does not exist
+    // in any real install; see docs/design/session-store-model.md).
+    for t in ["claude_code", "gemini_cli"] {
+        let pf = by(t)["path_fields"].as_array().cloned().unwrap_or_default();
+        assert!(pf.is_empty(), "{t} must not declare unverified path_fields");
+    }
+}
