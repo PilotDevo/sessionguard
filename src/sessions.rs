@@ -59,9 +59,11 @@ pub struct ToolSessions {
 /// All known sessions for one project directory, across tools.
 #[derive(Debug, Clone, Serialize)]
 pub struct SessionGroup {
-    /// The project directory the sessions belong to. When `decoded` is false
-    /// this is the raw encoded store name (best effort — still listed rather
-    /// than hidden).
+    /// The project directory the sessions belong to. At `Inferred`
+    /// confidence this is a best-effort naive decode rather than a
+    /// filesystem-validated path; at `Unresolved` it is the raw encoded
+    /// store name (still listed rather than hidden). See
+    /// [`DecodeConfidence`].
     pub project_path: String,
     /// Whether `project_path` was confidently resolved to a real path form.
     pub decoded: bool,
@@ -179,12 +181,20 @@ pub fn census(home: &Path, stores: &[(String, SessionStore)]) -> Vec<SessionGrou
 /// filesystem. Segments can legitimately contain the separator, so naive
 /// `separator` → `/` replacement breaks; we bias toward MORE path separators
 /// (shorter segments) and only collapse the separator into a segment when no
-/// split alternative exists on disk. Returns `(path, decoded_ok)`; on failure
-/// the encoded name is returned unchanged so callers can still display the
-/// entry.
-pub fn decode_claude_project_dir(name: &str, separator: &str) -> (String, bool) {
+/// split alternative exists on disk.
+///
+/// Returns `(path, confidence)`:
+/// - `Exact` — DFS validated a real directory chain.
+/// - `Inferred` — DFS found no valid split (every candidate hit a missing
+///   directory, e.g. because the project was deleted), so the naive
+///   `separator` → `/` decode is proposed instead. This is what lets a
+///   deleted project still surface as one row with a usable path, rather
+///   than an opaque encoded name.
+/// - `Unresolved` — `name` doesn't even start with `separator`, so there is
+///   nothing path-shaped to propose; the raw name is returned unchanged.
+pub fn decode_claude_project_dir(name: &str, separator: &str) -> (String, DecodeConfidence) {
     let Some(rest) = name.strip_prefix(separator) else {
-        return (name.to_string(), false);
+        return (name.to_string(), DecodeConfidence::Unresolved);
     };
     let parts: Vec<&str> = rest.split(separator).collect();
 
@@ -205,8 +215,8 @@ pub fn decode_claude_project_dir(name: &str, separator: &str) -> (String, bool) 
     }
 
     match walk(Path::new("/"), &parts, separator) {
-        Some(p) => (p.display().to_string(), true),
-        None => (name.to_string(), false),
+        Some(p) => (p.display().to_string(), DecodeConfidence::Exact),
+        None => (format!("/{}", parts.join("/")), DecodeConfidence::Inferred),
     }
 }
 
@@ -227,12 +237,7 @@ fn read_encoded_dir(
             continue;
         }
         let name = entry.file_name().to_string_lossy().into_owned();
-        let (path, ok) = decode_claude_project_dir(&name, separator);
-        let confidence = if ok {
-            DecodeConfidence::Exact
-        } else {
-            DecodeConfidence::Unresolved
-        };
+        let (path, confidence) = decode_claude_project_dir(&name, separator);
 
         let mut count = 0usize;
         let mut bytes = 0u64;
@@ -464,16 +469,28 @@ mod tests {
         std::fs::create_dir_all(&project).unwrap();
 
         let encoded = project.display().to_string().replace('/', "-");
-        let (decoded, ok) = decode_claude_project_dir(&encoded, "-");
-        assert!(ok, "should decode against the real filesystem");
+        let (decoded, confidence) = decode_claude_project_dir(&encoded, "-");
+        assert_eq!(confidence, DecodeConfidence::Exact);
         assert_eq!(decoded, project.display().to_string());
     }
 
     #[test]
-    fn decode_returns_encoded_name_when_unresolvable() {
-        let (out, ok) = decode_claude_project_dir("-no-such-root-anywhere-zzz", "-");
-        assert!(!ok);
-        assert_eq!(out, "-no-such-root-anywhere-zzz");
+    fn decode_falls_back_to_naive_decode_when_dfs_fails() {
+        // No such root exists anywhere, so DFS can't validate any split — the
+        // naive `separator` -> `/` decode is proposed instead, at `Inferred`
+        // confidence, rather than the opaque encoded name.
+        let (out, confidence) = decode_claude_project_dir("-no-such-root-anywhere-zzz", "-");
+        assert_eq!(confidence, DecodeConfidence::Inferred);
+        assert_eq!(out, "/no/such/root/anywhere/zzz");
+    }
+
+    #[test]
+    fn decode_is_unresolved_when_name_has_no_leading_separator() {
+        // Nothing path-shaped to propose at all: the raw name is returned
+        // unchanged, at `Unresolved` confidence.
+        let (out, confidence) = decode_claude_project_dir("not-even-path-shaped", "_");
+        assert_eq!(confidence, DecodeConfidence::Unresolved);
+        assert_eq!(out, "not-even-path-shaped");
     }
 
     #[test]
@@ -666,5 +683,54 @@ mod tests {
             live.tools["opencode"].last_active_unix, 0,
             "unsafe updated_column must fall back to the NULL substitution, not the real column"
         );
+    }
+
+    #[test]
+    fn deleted_claude_project_is_inferred_and_orphaned() {
+        // Today this is impossible: decode DFS-validates against the live
+        // filesystem, so a DELETED project never decodes and therefore never
+        // reports as orphaned. Inferred confidence is what makes Claude Code
+        // orphan detection work at all.
+        //
+        // Deviation from the task brief's literal fixture: the brief used
+        // "deleted-app" as the leaf segment. The naive fallback (full
+        // `separator` -> `/` split-then-join) can't distinguish a literal
+        // hyphen inside a segment from a path-separator hyphen — the same
+        // ambiguity `decode_claude_project_dir`'s doc comment calls out for
+        // the DFS path. "deleted-app" round-trips to "deleted/app", not
+        // "deleted-app", so it can never satisfy this test's own assertion.
+        // "deleted_app" (underscore) carries the same intent without hitting
+        // that inherent ambiguity.
+        let home = TempDir::new().unwrap();
+        let gone = home.path().join("work/deleted_app");
+        let enc = gone.display().to_string().replace('/', "-");
+        let store = home.path().join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
+
+        let groups = census(home.path(), &test_stores());
+        let g = groups
+            .iter()
+            .find(|g| g.project_path == gone.display().to_string())
+            .expect("naive decode should propose the deleted path");
+        assert_eq!(g.confidence, DecodeConfidence::Inferred);
+        assert!(g.orphaned, "a deleted project must report as orphaned");
+        assert!(!g.decoded, "compat field: only Exact counts as decoded");
+    }
+
+    #[test]
+    fn live_project_decodes_exact() {
+        let home = TempDir::new().unwrap();
+        let live = home.path().join("work/app");
+        std::fs::create_dir_all(&live).unwrap();
+        let enc = live.display().to_string().replace('/', "-");
+        let store = home.path().join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
+
+        let groups = census(home.path(), &test_stores());
+        assert_eq!(groups[0].confidence, DecodeConfidence::Exact);
+        assert!(groups[0].decoded);
+        assert!(!groups[0].orphaned);
     }
 }

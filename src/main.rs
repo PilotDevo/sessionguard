@@ -954,11 +954,19 @@ async fn main() -> Result<()> {
                     let orphan_count = groups.iter().filter(|g| g.orphaned).count();
                     for g in &groups {
                         let mut markers = String::new();
-                        if g.orphaned {
+                        if g.orphaned
+                            && g.confidence == sessionguard::sessions::DecodeConfidence::Exact
+                        {
                             markers.push_str("  [ORPHANED]");
                         }
-                        if !g.decoded {
-                            markers.push_str("  [ENCODED NAME]");
+                        match g.confidence {
+                            sessionguard::sessions::DecodeConfidence::Inferred if g.orphaned => {
+                                markers.push_str("  [ORPHANED?]")
+                            }
+                            sessionguard::sessions::DecodeConfidence::Unresolved => {
+                                markers.push_str("  [ENCODED NAME]")
+                            }
+                            _ => {}
                         }
                         println!("{}{}", g.project_path, markers);
                         for (tool_name, s) in &g.tools {
