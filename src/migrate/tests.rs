@@ -29,6 +29,7 @@ fn tool(discovery: HomeDirDiscovery, env_var: Option<&str>, unit: Option<&str>) 
             },
             validate: HomeDirValidate::default(),
         }),
+        session_store: None,
     }
 }
 
@@ -982,6 +983,7 @@ fn config_tool_json(config_path: &Path, field: &str, data_dir: &str) -> ToolDefi
             quiesce: HomeDirQuiesce::default(),
             validate: HomeDirValidate::default(),
         }),
+        session_store: None,
     }
 }
 
@@ -1269,6 +1271,7 @@ fn migrate_config_discovery_refuses_when_no_config_files_declared() {
             quiesce: HomeDirQuiesce::default(),
             validate: HomeDirValidate::default(),
         }),
+        session_store: None,
     };
 
     let err = migrate_with(&t, &src, &dst, false, &FakeQuiescer::default()).unwrap_err();

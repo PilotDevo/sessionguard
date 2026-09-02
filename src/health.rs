@@ -103,6 +103,7 @@ mod tests {
             version: None,
             binary: binary.map(|s| s.to_string()),
             home_dir_layout: None,
+            session_store: None,
         }
     }
 

@@ -151,6 +151,63 @@ fn is_default_validate(v: &HomeDirValidate) -> bool {
     v.command.is_empty() && v.timeout_seconds.is_none()
 }
 
+/// Unit of a store's "last updated" column.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TimeUnit {
+    /// Unix seconds.
+    #[default]
+    S,
+    /// Unix milliseconds.
+    Ms,
+}
+
+/// Where a tool's session store lives and how its entries are keyed to
+/// projects. Layout *kinds* are implemented in Rust; their bindings are data,
+/// so a tool with a known storage shape is a TOML file rather than a recompile.
+/// Deliberately separate from [`HomeDirLayout`]: that says how to *repoint* a
+/// tool at a relocated store, this says what the store is and how it is keyed.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "layout", rename_all = "snake_case")]
+pub enum SessionStore {
+    /// One directory per project; the directory name is the project path with
+    /// each path separator replaced by `separator` (Claude Code).
+    EncodedDir {
+        path: String,
+        #[serde(default = "default_separator")]
+        separator: String,
+    },
+    /// A tree of JSONL files; the project path is a field on the first line.
+    JsonlField {
+        path: String,
+        #[serde(default = "default_jsonl_glob")]
+        glob: String,
+        key_field: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        fallback_field: Option<String>,
+    },
+    /// Rows in a SQLite table; the project path is a column.
+    SqliteColumn {
+        path: String,
+        table: String,
+        path_column: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        updated_column: Option<String>,
+        #[serde(default)]
+        updated_unit: TimeUnit,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        archived_column: Option<String>,
+    },
+}
+
+fn default_separator() -> String {
+    "-".to_string()
+}
+
+fn default_jsonl_glob() -> String {
+    "**/*.jsonl".to_string()
+}
+
 /// A tool definition describing one AI coding tool's session artifacts.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ToolDefinition {
@@ -184,6 +241,10 @@ pub struct ToolDefinition {
     /// v0.3.x. See `docs/history/migrate.md` for the full schema rationale.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub home_dir_layout: Option<HomeDirLayout>,
+    /// Where this tool's sessions live and how they are keyed to projects.
+    /// Tools without this block contribute nothing to `sessionguard sessions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_store: Option<SessionStore>,
 }
 
 /// TOML wrapper for a file containing a single tool definition.
@@ -463,6 +524,7 @@ session_patterns = [".foo/"]
             version: Some("99.0".to_string()),
             binary: None,
             home_dir_layout: None,
+            session_store: None,
         };
         registry.register(custom);
         assert_eq!(
@@ -549,6 +611,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 version: Some("1.0".to_string()),
                 binary: None,
                 home_dir_layout: None,
+                session_store: None,
             }],
             ..Default::default()
         };
@@ -575,6 +638,7 @@ session_patterns = [".cursor/", ".cursor-custom/"]
                 version: Some("99.0".to_string()),
                 binary: None,
                 home_dir_layout: None,
+                session_store: None,
             }],
             ..Default::default()
         };
@@ -600,5 +664,77 @@ session_patterns = [".cursor/", ".cursor-custom/"]
         // Only builtins present, no errors from non-TOML files.
         // Counts all compiled-in built-in tool TOML files.
         assert_eq!(registry.tools.len(), 7);
+    }
+
+    #[test]
+    fn session_store_encoded_dir_parses_with_default_separator() {
+        let s: SessionStore = toml::from_str(
+            r#"
+            layout = "encoded_dir"
+            path = "~/.claude/projects"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(
+            s,
+            SessionStore::EncodedDir {
+                path: "~/.claude/projects".into(),
+                separator: "-".into()
+            }
+        );
+    }
+
+    #[test]
+    fn session_store_jsonl_and_sqlite_parse() {
+        let j: SessionStore = toml::from_str(
+            r#"
+            layout = "jsonl_field"
+            path = "~/.codex/sessions"
+            key_field = "cwd"
+            fallback_field = "payload.cwd"
+            "#,
+        )
+        .unwrap();
+        match j {
+            SessionStore::JsonlField {
+                ref glob,
+                ref key_field,
+                ..
+            } => {
+                assert_eq!(glob, "**/*.jsonl");
+                assert_eq!(key_field, "cwd");
+            }
+            _ => panic!("wrong variant"),
+        }
+
+        let q: SessionStore = toml::from_str(
+            r#"
+            layout = "sqlite_column"
+            path = "~/.local/share/opencode/opencode.db"
+            table = "session"
+            path_column = "directory"
+            updated_column = "time_updated"
+            updated_unit = "ms"
+            archived_column = "time_archived"
+            "#,
+        )
+        .unwrap();
+        match q {
+            SessionStore::SqliteColumn { updated_unit, .. } => {
+                assert_eq!(updated_unit, TimeUnit::Ms);
+            }
+            _ => panic!("wrong variant"),
+        }
+    }
+
+    #[test]
+    fn session_store_rejects_unknown_layout() {
+        assert!(toml::from_str::<SessionStore>(
+            r#"
+            layout = "telepathy"
+            path = "/x"
+            "#
+        )
+        .is_err());
     }
 }
