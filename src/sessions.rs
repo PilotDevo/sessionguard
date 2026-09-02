@@ -72,8 +72,9 @@ pub struct SessionGroup {
     /// True when the project directory no longer exists on disk — the
     /// sessions are orphaned (candidates for archive/cleanup).
     pub orphaned: bool,
-    /// The host this census was taken on. Always `"local"` for now — a
-    /// future fleet census will populate this from remote sources.
+    /// The host this census was taken on: `"local"` for this machine, or a
+    /// configured [`crate::config::HostSpec`] name when populated by
+    /// [`crate::fleet::remote_census`].
     pub host: String,
     /// Per-tool session summaries, keyed by tool name.
     pub tools: BTreeMap<String, ToolSessions>,

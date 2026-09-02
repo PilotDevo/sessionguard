@@ -23,6 +23,12 @@ pub enum FleetError {
     TooOld { host: String, found: String },
     #[error("host `{host}`: could not parse remote output ({detail})")]
     BadOutput { host: String, detail: String },
+    #[error(
+        "host `{host}`: ssh destination `{ssh}` starts with `-`, which ssh would parse as an \
+         option rather than a hostname (refusing to avoid local command execution via argv \
+         injection)"
+    )]
+    InvalidDestination { host: String, ssh: String },
 }
 
 /// Verify a remote `sessionguard --version` string meets the floor.
@@ -96,6 +102,24 @@ fn parse_remote_groups(json: &str, host: &str) -> Result<Vec<SessionGroup>, Flee
     })
 }
 
+/// Reject an `ssh` destination that begins with `-`. Such a value (e.g.
+/// `-oProxyCommand=...`) is placed on `ssh`'s argv with no `--` terminator,
+/// so ssh would consume it as an OPTION rather than a hostname — the one
+/// shape of a configured `HostSpec` that can cause command execution on
+/// THIS machine rather than the remote one. Checked before any process is
+/// spawned; an explicit check is used rather than relying on a `--`
+/// terminator, since ssh's getopt handling of `--` is undocumented in
+/// `ssh(1)` and varies across versions.
+fn check_destination(host: &HostSpec) -> Result<(), FleetError> {
+    if host.ssh.starts_with('-') {
+        return Err(FleetError::InvalidDestination {
+            host: host.name.clone(),
+            ssh: host.ssh.clone(),
+        });
+    }
+    Ok(())
+}
+
 fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
     let out = std::process::Command::new("ssh")
         .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host.ssh])
@@ -117,6 +141,7 @@ fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
 /// Census one remote host. Read-only: the only commands run there are
 /// `sessionguard --version` and `sessionguard sessions --format json`.
 pub fn remote_census(host: &HostSpec) -> Result<Vec<SessionGroup>, FleetError> {
+    check_destination(host)?;
     let version = ssh(host, &["sessionguard", "--version"])?;
     check_remote_version(&host.name, &version)?;
     let json = ssh(host, &["sessionguard", "sessions", "--format", "json"])?;
@@ -162,6 +187,32 @@ mod tests {
     #[test]
     fn remote_version_at_minimum_is_accepted() {
         assert!(check_remote_version("fedora", "sessionguard 0.7.0").is_ok());
+    }
+
+    #[test]
+    fn remote_census_refuses_ssh_destination_that_looks_like_an_option() {
+        // A destination beginning with `-` (e.g. `-oProxyCommand=...`) is
+        // consumed by ssh as an OPTION, not a hostname — argv injection that
+        // executes arbitrary commands on THIS machine, never the remote one.
+        // remote_census must refuse it before ever invoking `ssh`, so no
+        // process is spawned at all: prove that with a marker file a real
+        // ProxyCommand invocation would have created.
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("pwned");
+        let host = HostSpec {
+            name: "evil".into(),
+            ssh: format!("-oProxyCommand=touch {}", marker.display()),
+        };
+
+        let e = remote_census(&host).unwrap_err();
+
+        assert!(matches!(e, FleetError::InvalidDestination { .. }));
+        assert!(e.to_string().contains("evil"));
+        assert!(e.to_string().contains(&host.ssh));
+        assert!(
+            !marker.exists(),
+            "no process must be spawned for a rejected destination"
+        );
     }
 
     #[test]
