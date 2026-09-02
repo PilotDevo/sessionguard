@@ -306,3 +306,22 @@ fn cli_tools_json_declares_real_session_stores_and_no_fictional_fields() {
         assert!(pf.is_empty(), "{t} must not declare unverified path_fields");
     }
 }
+
+#[test]
+fn cli_sessions_honors_explicit_home_root() {
+    // A census root other than $HOME — the mounted/rsync'd-home case.
+    let real = TempDir::new().unwrap(); // process HOME: empty
+    let other = TempDir::new().unwrap(); // the root we actually census
+    let live = other.path().join("p/app");
+    std::fs::create_dir_all(&live).unwrap();
+    let enc = live.display().to_string().replace('/', "-");
+    let store = other.path().join(".claude/projects").join(&enc);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("s.jsonl"), "{}").unwrap();
+
+    sg(&real)
+        .args(["sessions", "--home", &other.path().display().to_string()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 project(s) with sessions"));
+}

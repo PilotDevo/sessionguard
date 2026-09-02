@@ -190,6 +190,10 @@ pub enum Command {
         /// Only show the group for this project directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Census this directory as the home root instead of $HOME (e.g. a
+        /// mounted or rsync'd home from another machine).
+        #[arg(long)]
+        home: Option<PathBuf>,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,

@@ -918,10 +918,15 @@ async fn main() -> Result<()> {
             orphans,
             tool,
             project,
+            home,
             format,
         } => {
-            let Some(home) = directories::BaseDirs::new().map(|d| d.home_dir().to_owned()) else {
-                anyhow::bail!("cannot determine your home directory");
+            let home = match home {
+                Some(h) => h,
+                None => match directories::BaseDirs::new() {
+                    Some(d) => d.home_dir().to_owned(),
+                    None => anyhow::bail!("cannot determine your home directory"),
+                },
             };
             let tool_registry = ToolRegistry::new_with_config(&config)?;
             let stores: Vec<(String, sessionguard::tools::SessionStore)> = tool_registry
