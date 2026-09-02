@@ -565,4 +565,106 @@ mod tests {
         assert_eq!(groups.len(), 1, "declared custom path must be read");
         assert_eq!(groups[0].tools["claude_code"].count, 1);
     }
+
+    #[test]
+    fn sqlite_column_skips_whole_store_when_table_or_path_column_is_unsafe() {
+        // `table`/`path_column` have no safe fallback to substitute — an
+        // unsafe identifier there means there is no safe query to run at
+        // all, so the whole store is skipped rather than ever interpolating
+        // it into SQL.
+        let home = TempDir::new().unwrap();
+        let dbdir = home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dbdir).unwrap();
+        let conn = rusqlite::Connection::open(dbdir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (directory TEXT, time_updated INTEGER, time_archived INTEGER);
+             INSERT INTO session VALUES ('/tmp/oc-proj', 1752600000000, NULL);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let unsafe_table = vec![(
+            "opencode".to_string(),
+            SessionStore::SqliteColumn {
+                path: "~/.local/share/opencode/opencode.db".into(),
+                table: "session; DROP TABLE session;--".into(),
+                path_column: "directory".into(),
+                updated_column: Some("time_updated".into()),
+                updated_unit: TimeUnit::Ms,
+                archived_column: Some("time_archived".into()),
+            },
+        )];
+        assert!(
+            census(home.path(), &unsafe_table).is_empty(),
+            "unsafe table identifier must skip the whole store without building a query"
+        );
+
+        let unsafe_path_column = vec![(
+            "opencode".to_string(),
+            SessionStore::SqliteColumn {
+                path: "~/.local/share/opencode/opencode.db".into(),
+                table: "session".into(),
+                path_column: "directory, (SELECT 1)".into(),
+                updated_column: Some("time_updated".into()),
+                updated_unit: TimeUnit::Ms,
+                archived_column: Some("time_archived".into()),
+            },
+        )];
+        assert!(
+            census(home.path(), &unsafe_path_column).is_empty(),
+            "unsafe path_column identifier must skip the whole store without building a query"
+        );
+    }
+
+    #[test]
+    fn sqlite_column_degrades_gracefully_when_optional_columns_are_unsafe() {
+        // Unlike `table`/`path_column`, the optional `updated_column` and
+        // `archived_column` DO have a safe fallback: they are simply never
+        // interpolated (substituted with `NULL` / the `WHERE` clause is
+        // dropped) rather than aborting the whole store. Prove the store
+        // still reads — including the row that would have been excluded had
+        // the archived-column filter actually applied.
+        let home = TempDir::new().unwrap();
+        let dbdir = home.path().join(".local/share/opencode");
+        std::fs::create_dir_all(&dbdir).unwrap();
+        let conn = rusqlite::Connection::open(dbdir.join("opencode.db")).unwrap();
+        conn.execute_batch(
+            "CREATE TABLE session (directory TEXT, time_updated INTEGER, time_archived INTEGER);
+             INSERT INTO session VALUES ('/tmp/oc-proj', 1752600000000, NULL);
+             INSERT INTO session VALUES ('/tmp/archived', 1752600000000, 1752600000001);",
+        )
+        .unwrap();
+        drop(conn);
+
+        let stores = vec![(
+            "opencode".to_string(),
+            SessionStore::SqliteColumn {
+                path: "~/.local/share/opencode/opencode.db".into(),
+                table: "session".into(),
+                path_column: "directory".into(),
+                updated_column: Some("time_updated; --".into()),
+                updated_unit: TimeUnit::Ms,
+                archived_column: Some("time_archived OR 1=1".into()),
+            },
+        )];
+
+        let groups = census(home.path(), &stores);
+        assert!(
+            groups.iter().any(|g| g.project_path == "/tmp/oc-proj"),
+            "safe rows must still be read when only optional columns are unsafe"
+        );
+        assert!(
+            groups.iter().any(|g| g.project_path == "/tmp/archived"),
+            "unsafe archived_column must degrade to 'no filter', not skip the store \
+             (the row that would have been excluded must still surface)"
+        );
+        let live = groups
+            .iter()
+            .find(|g| g.project_path == "/tmp/oc-proj")
+            .unwrap();
+        assert_eq!(
+            live.tools["opencode"].last_active_unix, 0,
+            "unsafe updated_column must fall back to the NULL substitution, not the real column"
+        );
+    }
 }
