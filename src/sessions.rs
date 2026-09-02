@@ -177,21 +177,34 @@ pub fn census(home: &Path, stores: &[(String, SessionStore)]) -> Vec<SessionGrou
 
 /// Decode an encoded project directory name (e.g.
 /// `-Users-devo-Droco-side-projects-ai-session-track`) into a real filesystem
-/// path by DFS-validating each candidate segment split against the actual
-/// filesystem. Segments can legitimately contain the separator, so naive
-/// `separator` → `/` replacement breaks; we bias toward MORE path separators
-/// (shorter segments) and only collapse the separator into a segment when no
-/// split alternative exists on disk.
+/// path. Segments can legitimately contain the separator, so naive
+/// `separator` → `/` replacement is ambiguous on its own; three-step
+/// algorithm:
 ///
-/// Returns `(path, confidence)`:
-/// - `Exact` — DFS validated a real directory chain.
-/// - `Inferred` — DFS found no valid split (every candidate hit a missing
-///   directory, e.g. because the project was deleted), so the naive
-///   `separator` → `/` decode is proposed instead. This is what lets a
-///   deleted project still surface as one row with a usable path, rather
-///   than an opaque encoded name.
-/// - `Unresolved` — `name` doesn't even start with `separator`, so there is
-///   nothing path-shaped to propose; the raw name is returned unchanged.
+/// 1. DFS-validate candidate splits against the real filesystem, biasing
+///    toward MORE path separators (shorter segments) and only collapsing the
+///    separator into a segment when no split alternative exists on disk. If
+///    this consumes the whole name, the path is `Exact`.
+/// 2. Otherwise the project directory itself is most likely gone. Find the
+///    *deepest ancestor* the DFS above DID validate, then fold everything
+///    after it into ONE final segment (rejoined with `separator`) rather
+///    than guessing further internal structure — e.g. ancestor
+///    `/home/devo/projects` with leftover parts `["amarillo", "project"]`
+///    becomes `/home/devo/projects/amarillo-project`. This gets the common
+///    shape exactly right (one deleted leaf under a surviving parent,
+///    regardless of hyphens in the leaf's own name) and is reported
+///    `Inferred`. It is still a best guess, not a validated fact: if an
+///    ancestor directory is *also* gone (a deeper, multi-segment deletion),
+///    more than the true leaf gets folded into that one segment, and the
+///    proposed path can be wrong — `Inferred` means "best guess," not
+///    "confirmed."
+/// 3. If not even the first segment matches a real directory, there is
+///    nothing on disk to anchor a guess to; fall back to the fully naive
+///    `separator` → `/` decode, still `Inferred` — better than an opaque
+///    encoded name.
+/// 4. `name` not starting with `separator` at all stays `Unresolved`: there
+///    is nothing path-shaped to propose, so the raw name is returned
+///    unchanged.
 pub fn decode_claude_project_dir(name: &str, separator: &str) -> (String, DecodeConfidence) {
     let Some(rest) = name.strip_prefix(separator) else {
         return (name.to_string(), DecodeConfidence::Unresolved);
@@ -214,10 +227,40 @@ pub fn decode_claude_project_dir(name: &str, separator: &str) -> (String, Decode
         None
     }
 
-    match walk(Path::new("/"), &parts, separator) {
-        Some(p) => (p.display().to_string(), DecodeConfidence::Exact),
-        None => (format!("/{}", parts.join("/")), DecodeConfidence::Inferred),
+    if let Some(found) = walk(Path::new("/"), &parts, separator) {
+        return (found.display().to_string(), DecodeConfidence::Exact);
     }
+
+    // Full DFS failed. Find the deepest ancestor it DID validate along any
+    // explored branch (same split candidates as `walk`, but tracking the
+    // best partial match instead of requiring full consumption).
+    fn deepest_match(base: &Path, remaining: &[&str], separator: &str) -> (PathBuf, usize) {
+        let mut best = (base.to_path_buf(), 0usize);
+        for k in 1..=remaining.len() {
+            let segment = remaining[..k].join(separator);
+            let candidate = base.join(&segment);
+            if candidate.is_dir() {
+                let (deeper_base, deeper_count) =
+                    deepest_match(&candidate, &remaining[k..], separator);
+                let total = k + deeper_count;
+                if total > best.1 {
+                    best = (deeper_base, total);
+                }
+            }
+        }
+        best
+    }
+
+    let (ancestor, consumed) = deepest_match(Path::new("/"), &parts, separator);
+    if consumed == 0 {
+        // Not even the first segment matched a real directory.
+        return (format!("/{}", parts.join("/")), DecodeConfidence::Inferred);
+    }
+    let leaf = parts[consumed..].join(separator);
+    (
+        ancestor.join(leaf).display().to_string(),
+        DecodeConfidence::Inferred,
+    )
 }
 
 /// `encoded_dir` layout: one subdir per project under `base`; each file
@@ -494,6 +537,27 @@ mod tests {
     }
 
     #[test]
+    fn decode_folds_hyphenated_leaf_onto_deepest_surviving_ancestor() {
+        // Fix round 1: the naive full-substitution fallback got this wrong
+        // — it can't tell a literal hyphen inside a directory name from a
+        // separator hyphen, so it would split a deleted "amarillo-project"
+        // leaf into "amarillo/project". The corrected fallback instead runs
+        // DFS as far as the filesystem allows (here: all the way through
+        // the surviving "projects" parent), then folds whatever's left
+        // ("amarillo", "project") into ONE final segment rejoined with the
+        // separator — recovering the hyphenated leaf name exactly.
+        let root = TempDir::new().unwrap();
+        let parent = root.path().join("home/devo/projects");
+        std::fs::create_dir_all(&parent).unwrap();
+        let gone = parent.join("amarillo-project"); // deleted: never created
+
+        let encoded = gone.display().to_string().replace('/', "-");
+        let (decoded, confidence) = decode_claude_project_dir(&encoded, "-");
+        assert_eq!(confidence, DecodeConfidence::Inferred);
+        assert_eq!(decoded, gone.display().to_string());
+    }
+
+    #[test]
     fn census_groups_claude_and_codex_by_project_and_flags_orphans() {
         let home = TempDir::new().unwrap();
         // A live project (exists on disk) with a Claude store dir.
@@ -692,17 +756,20 @@ mod tests {
         // reports as orphaned. Inferred confidence is what makes Claude Code
         // orphan detection work at all.
         //
-        // Deviation from the task brief's literal fixture: the brief used
-        // "deleted-app" as the leaf segment. The naive fallback (full
-        // `separator` -> `/` split-then-join) can't distinguish a literal
-        // hyphen inside a segment from a path-separator hyphen — the same
-        // ambiguity `decode_claude_project_dir`'s doc comment calls out for
-        // the DFS path. "deleted-app" round-trips to "deleted/app", not
-        // "deleted-app", so it can never satisfy this test's own assertion.
-        // "deleted_app" (underscore) carries the same intent without hitting
-        // that inherent ambiguity.
+        // Fix round 1: the task brief's literal fixture used "deleted-app"
+        // as the leaf segment, but its own naive-fallback algorithm
+        // (`separator` -> `/` split-then-join over the WHOLE name) can't
+        // distinguish that leaf's literal hyphen from a path-separator
+        // hyphen — "deleted-app" round-trips to "deleted/app", not
+        // "deleted-app". The corrected algorithm fixes this generally by
+        // running DFS as far as the filesystem allows and folding only the
+        // truly-unvalidated tail into one segment — which requires a real
+        // surviving ancestor to anchor to. So unlike the brief's literal
+        // fixture, this test creates `work/` (the project's parent) without
+        // creating `work/deleted-app` (the project itself, which is gone).
         let home = TempDir::new().unwrap();
-        let gone = home.path().join("work/deleted_app");
+        std::fs::create_dir_all(home.path().join("work")).unwrap();
+        let gone = home.path().join("work/deleted-app");
         let enc = gone.display().to_string().replace('/', "-");
         let store = home.path().join(".claude/projects").join(&enc);
         std::fs::create_dir_all(&store).unwrap();
@@ -712,7 +779,30 @@ mod tests {
         let g = groups
             .iter()
             .find(|g| g.project_path == gone.display().to_string())
-            .expect("naive decode should propose the deleted path");
+            .expect("DFS-plus-fold decode should propose the deleted path");
+        assert_eq!(g.confidence, DecodeConfidence::Inferred);
+        assert!(g.orphaned, "a deleted project must report as orphaned");
+        assert!(!g.decoded, "compat field: only Exact counts as decoded");
+    }
+
+    #[test]
+    fn deleted_claude_project_directly_under_home_is_inferred_and_orphaned() {
+        // Simpler coverage alongside the hyphenated-leaf case above: no
+        // intermediate parent to fold across, so this also exercises the
+        // "no ancestor beyond the trivial root chain" shape without any
+        // separator ambiguity in play.
+        let home = TempDir::new().unwrap();
+        let gone = home.path().join("deleted_project");
+        let enc = gone.display().to_string().replace('/', "-");
+        let store = home.path().join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
+
+        let groups = census(home.path(), &test_stores());
+        let g = groups
+            .iter()
+            .find(|g| g.project_path == gone.display().to_string())
+            .expect("decode should propose the deleted path");
         assert_eq!(g.confidence, DecodeConfidence::Inferred);
         assert!(g.orphaned, "a deleted project must report as orphaned");
         assert!(!g.decoded, "compat field: only Exact counts as decoded");
