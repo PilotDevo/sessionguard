@@ -168,7 +168,7 @@ sessionguard sessions --home /mnt/old-mac-home
 # Read-only: the only remote commands run are `--version` and
 # `sessions --format json`. Orphan status always comes from the host the
 # sessions live on — it is never re-derived against this machine's filesystem.
-sessionguard sessions --host fedora
+sessionguard sessions --host build-server
 sessionguard sessions --all-hosts        # this machine + every configured host
 
 # Check status of tracked projects + daemon state
@@ -294,12 +294,12 @@ format = "json"
 # Read-only: the only commands ever run there are `--version` and
 # `sessions --format json` — never anything that mutates.
 [[hosts]]
-name = "fedora"
-ssh = "devo@192.168.10.90"
+name = "build-server"
+ssh = "me@192.0.2.10"
 
 [[hosts]]
-name = "doloamd"
-ssh = "devo@doloamd.local"
+name = "workstation"
+ssh = "me@workstation.local"
 ```
 
 Tool patterns can also be placed as individual TOML files in `~/.config/sessionguard/tools/`.

@@ -18,7 +18,7 @@ Three-state decode confidence (`exact`/`inferred`/`unresolved`) replaces a
 boolean, which for the first time makes a **deleted** Claude Code project
 detectable as an orphan (the decoder validates against the live filesystem,
 so a gone project previously could never decode). `sessions --home <path>`
-census an arbitrary root (a mounted or rsync'd home), and a new `fleet.rs`
+censuses an arbitrary root (a mounted or rsync'd home), and a new `fleet.rs`
 adds `sessions --host <name>` / `--all-hosts` with `[[hosts]]` config to
 census other machines read-only over ssh, merging their JSON with
 provenance — orphan status always comes from the origin host. Wave 2 (store
