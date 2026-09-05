@@ -201,11 +201,14 @@ fn cli_undo_no_events_prints_message() {
 
 #[test]
 fn cli_sessions_census_groups_and_flags_orphans() {
-    // One live Claude project (store dir decodes against the real fs) and one
-    // Codex session whose cwd no longer exists (orphan). Orphan detection is
-    // exact for Codex/OpenCode (they store literal paths); an undecodable
-    // Claude store shows [ENCODED NAME] instead, because its sanitization is
-    // lossy and "gone" can't be proven from the name alone.
+    // Three shapes: one live Claude project (store dir decodes against the
+    // real fs); one Codex session whose cwd no longer exists (Exact-confidence
+    // orphan — Codex/OpenCode store literal paths, so "gone" is a direct
+    // filesystem check); and one Claude Code project whose directory was
+    // deleted but whose parent survives (an Inferred-confidence orphan via
+    // the DFS-plus-fold decode — this branch's decode CAN prove "gone" from
+    // an encoded name when a real ancestor anchors the guess, unlike a name
+    // with no living ancestor at all, which instead shows [ENCODED NAME]).
     let home = TempDir::new().unwrap();
     let live = home.path().join("work/app");
     std::fs::create_dir_all(&live).unwrap();
@@ -223,6 +226,15 @@ fn cli_sessions_census_groups_and_flags_orphans() {
     )
     .unwrap();
 
+    // "work" already exists (created above for the live project), but
+    // "work/deleted-app" itself is never created — DFS validates down to
+    // "work" and folds the unvalidated leaf, at Inferred confidence.
+    let inferred_gone = home.path().join("work/deleted-app");
+    let enc_inferred = inferred_gone.display().to_string().replace('/', "-");
+    let inferred_store = home.path().join(".claude/projects").join(&enc_inferred);
+    std::fs::create_dir_all(&inferred_store).unwrap();
+    std::fs::write(inferred_store.join("s.jsonl"), "{}").unwrap();
+
     let out = sg(&home)
         .args(["sessions", "--format", "json"])
         .assert()
@@ -232,25 +244,56 @@ fn cli_sessions_census_groups_and_flags_orphans() {
         .clone();
     let groups: serde_json::Value = serde_json::from_slice(&out).expect("sessions JSON parses");
     let arr = groups.as_array().expect("array of groups");
-    assert_eq!(arr.len(), 2, "two projects with sessions");
+    assert_eq!(arr.len(), 3, "three projects with sessions");
+
+    // Consumer contract (design doc Testing section): the dashboard's
+    // Activity adapter (tools/dashboard/app.py reads `confidence`) and any
+    // downstream script depend on every group carrying `confidence`,
+    // `decoded`, and `host` — a rename or a stray skip_serializing_if must
+    // fail loudly here, not silently in the dashboard.
+    for g in arr {
+        assert!(
+            g.get("confidence").is_some(),
+            "group missing confidence: {g}"
+        );
+        assert!(g.get("decoded").is_some(), "group missing decoded: {g}");
+        assert!(g.get("host").is_some(), "group missing host: {g}");
+    }
+
     let live_g = arr
         .iter()
         .find(|g| g["project_path"] == live.display().to_string())
         .expect("live group");
     assert_eq!(live_g["orphaned"], false);
+    assert_eq!(live_g["confidence"], "exact");
+    assert_eq!(live_g["host"], "local");
     assert_eq!(live_g["tools"]["claude_code"]["count"], 1);
-    assert!(
-        arr.iter().any(|g| g["orphaned"] == true),
-        "deleted project must be flagged orphaned"
-    );
 
-    // --orphans filters to just the orphan.
+    let codex_orphan = arr
+        .iter()
+        .find(|g| g["project_path"] == gone.display().to_string())
+        .expect("codex orphan group");
+    assert_eq!(codex_orphan["orphaned"], true);
+    assert_eq!(codex_orphan["confidence"], "exact");
+
+    let inferred_g = arr
+        .iter()
+        .find(|g| g["project_path"] == inferred_gone.display().to_string())
+        .expect("inferred orphan group");
+    assert_eq!(inferred_g["orphaned"], true);
+    assert_eq!(inferred_g["confidence"], "inferred");
+
+    // --orphans filters to just the two orphans; the text renderer marks the
+    // Exact orphan [ORPHANED] and the Inferred orphan [ORPHANED?] — the
+    // distinction the dashboard and operators use to tell a confirmed
+    // deletion from a best-guess one.
     sg(&home)
         .args(["sessions", "--orphans"])
         .assert()
         .success()
         .stdout(predicate::str::contains("[ORPHANED]"))
-        .stdout(predicate::str::contains("1 project(s) with sessions"));
+        .stdout(predicate::str::contains("[ORPHANED?]"))
+        .stdout(predicate::str::contains("2 project(s) with sessions"));
 }
 
 #[test]
@@ -271,4 +314,57 @@ fn cli_tools_list_json_carries_binary_status() {
             "each tool entry should carry binary_status"
         );
     }
+}
+
+#[test]
+fn cli_tools_json_declares_real_session_stores_and_no_fictional_fields() {
+    let home = TempDir::new().unwrap();
+    let out = sg(&home)
+        .args(["tools", "list", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let tools: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let by = |n: &str| -> serde_json::Value {
+        tools
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == n)
+            .expect("tool present")
+            .clone()
+    };
+
+    // Verified stores are declared.
+    assert_eq!(by("claude_code")["session_store"]["layout"], "encoded_dir");
+    assert_eq!(by("codex")["session_store"]["layout"], "jsonl_field");
+    assert_eq!(by("opencode")["session_store"]["layout"], "sqlite_column");
+
+    // Verified-fictional path_fields are gone (the field named does not exist
+    // in any real install; see docs/design/session-store-model.md).
+    for t in ["claude_code", "gemini_cli"] {
+        let pf = by(t)["path_fields"].as_array().cloned().unwrap_or_default();
+        assert!(pf.is_empty(), "{t} must not declare unverified path_fields");
+    }
+}
+
+#[test]
+fn cli_sessions_honors_explicit_home_root() {
+    // A census root other than $HOME — the mounted/rsync'd-home case.
+    let real = TempDir::new().unwrap(); // process HOME: empty
+    let other = TempDir::new().unwrap(); // the root we actually census
+    let live = other.path().join("p/app");
+    std::fs::create_dir_all(&live).unwrap();
+    let enc = live.display().to_string().replace('/', "-");
+    let store = other.path().join(".claude/projects").join(&enc);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(store.join("s.jsonl"), "{}").unwrap();
+
+    sg(&real)
+        .args(["sessions", "--home", &other.path().display().to_string()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 project(s) with sessions"));
 }

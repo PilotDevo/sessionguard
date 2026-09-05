@@ -886,19 +886,45 @@ mod tests {
 
     // ── End-to-end proof tests ───────────────────────────────────────────
 
-    /// End-to-end proof: moving a Claude Code project rewrites .claude/settings.json
+    /// A synthetic tool declaring a real `path_fields` rewrite target.
+    ///
+    /// `claude_code` no longer declares one — the field it used to name,
+    /// `.claude/settings.json` → `project_path`, was verified not to exist
+    /// in any real install (see the honesty patch and
+    /// `docs/design/session-store-model.md`). These end-to-end tests still
+    /// need *some* tool with a rewritable JSON field to exercise the
+    /// reconciler pipeline, so they declare their own rather than leaning
+    /// on a builtin's fictional one.
+    fn synthetic_json_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "test_json_tool".to_string(),
+            display_name: "Test JSON Tool".to_string(),
+            session_patterns: vec![".testtool/".to_string()],
+            path_fields: vec![PathFieldSpec {
+                file: ".testtool/settings.json".to_string(),
+                field: "project_path".to_string(),
+                format: "json".to_string(),
+            }],
+            on_move: ReconcileStrategy::RewritePaths,
+            version: None,
+            binary: None,
+            home_dir_layout: None,
+            session_store: None,
+        }
+    }
+
+    /// End-to-end proof: moving a project rewrites its JSON settings file's
+    /// path field via a synthetic tool (see `synthetic_json_tool`).
     #[test]
-    fn reconcile_claude_code_end_to_end() {
+    fn reconcile_json_path_field_end_to_end() {
         let sandbox = TempDir::new().unwrap();
         let old_path = sandbox.path().join("alpha-project");
         let new_path = sandbox.path().join("beta-project");
 
-        // Create a realistic Claude Code project at old_path
-        fs::create_dir_all(old_path.join(".claude")).unwrap();
-        fs::write(old_path.join("CLAUDE.md"), "# Project").unwrap();
-        fs::write(old_path.join(".claudeignore"), "target/\n").unwrap();
+        // Create a synthetic project matching synthetic_json_tool's layout
+        fs::create_dir_all(old_path.join(".testtool")).unwrap();
         fs::write(
-            old_path.join(".claude/settings.json"),
+            old_path.join(".testtool/settings.json"),
             format!(
                 r#"{{"project_path": "{}","model": "opus","context": "full"}}"#,
                 old_path.display()
@@ -909,13 +935,11 @@ mod tests {
         // Physically move the directory (simulates `mv`)
         fs::rename(&old_path, &new_path).unwrap();
 
-        // Get the Claude Code tool definition
-        let registry = ToolRegistry::new().unwrap();
-        let tool = registry.get("claude_code").unwrap();
+        let tool = synthetic_json_tool();
         let event_log = EventLog::open_in_memory().unwrap();
 
         // Reconcile
-        let result = reconcile(tool, &old_path, &new_path, &event_log);
+        let result = reconcile(&tool, &old_path, &new_path, &event_log);
 
         // Assertions
         assert!(result.success, "reconciliation should succeed");
@@ -923,7 +947,7 @@ mod tests {
         assert_eq!(result.actions_taken[0].field, "project_path");
 
         // Verify the file was actually rewritten — parse as JSON to check field-level
-        let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let content = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             v["project_path"].as_str().unwrap(),
@@ -936,7 +960,7 @@ mod tests {
         // Verify event log recorded the action
         let entries = event_log.recent(10).unwrap();
         assert_eq!(entries.len(), 1);
-        assert_eq!(entries[0].tool_name, "claude_code");
+        assert_eq!(entries[0].tool_name, "test_json_tool");
     }
 
     /// End-to-end proof: moving a Cursor project rewrites .cursor/state.json
@@ -1001,10 +1025,11 @@ mod tests {
         let old_path = sandbox.path().join("original-multi");
         let new_path = sandbox.path().join("relocated-multi");
 
-        // Create a project with both Claude and Cursor artifacts
-        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        // Create a project with both a synthetic JSON-field tool's and
+        // Cursor's artifacts
+        fs::create_dir_all(old_path.join(".testtool")).unwrap();
         fs::write(
-            old_path.join(".claude/settings.json"),
+            old_path.join(".testtool/settings.json"),
             format!(r#"{{"project_path": "{}"}}"#, old_path.display()),
         )
         .unwrap();
@@ -1022,18 +1047,22 @@ mod tests {
         let event_log = EventLog::open_in_memory().unwrap();
 
         // Reconcile both tools
-        for tool_name in ["claude_code", "cursor"] {
-            let tool = registry.get(tool_name).unwrap();
-            let result = reconcile(tool, &old_path, &new_path, &event_log);
-            assert!(result.success, "{tool_name} reconciliation should succeed");
+        for tool in [
+            synthetic_json_tool(),
+            registry.get("cursor").unwrap().clone(),
+        ] {
+            let name = tool.name.clone();
+            let result = reconcile(&tool, &old_path, &new_path, &event_log);
+            assert!(result.success, "{name} reconciliation should succeed");
             assert_eq!(result.actions_taken.len(), 1);
         }
 
         // Verify both files rewritten
-        let claude_content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let testtool_content =
+            fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         let cursor_content = fs::read_to_string(new_path.join(".cursor/state.json")).unwrap();
 
-        assert!(claude_content.contains(&new_path.to_string_lossy().to_string()));
+        assert!(testtool_content.contains(&new_path.to_string_lossy().to_string()));
         assert!(cursor_content.contains(&new_path.to_string_lossy().to_string()));
 
         // Event log should have 2 entries
@@ -1047,10 +1076,10 @@ mod tests {
         let old_path = sandbox.path().join("orig-project");
         let new_path = sandbox.path().join("dest-project");
 
-        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        fs::create_dir_all(old_path.join(".testtool")).unwrap();
         // Both fields contain the old path — only project_path should be rewritten
         fs::write(
-            old_path.join(".claude/settings.json"),
+            old_path.join(".testtool/settings.json"),
             format!(
                 r#"{{"project_path": "{0}","notes": "project was cloned from {0}"}}"#,
                 old_path.display()
@@ -1060,14 +1089,13 @@ mod tests {
 
         fs::rename(&old_path, &new_path).unwrap();
 
-        let registry = ToolRegistry::new().unwrap();
-        let tool = registry.get("claude_code").unwrap();
+        let tool = synthetic_json_tool();
         let event_log = EventLog::open_in_memory().unwrap();
 
-        let result = reconcile(tool, &old_path, &new_path, &event_log);
+        let result = reconcile(&tool, &old_path, &new_path, &event_log);
         assert!(result.success);
 
-        let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let content = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
 
         // Target field rewritten
@@ -1093,8 +1121,8 @@ mod tests {
         let sandbox = TempDir::new().unwrap();
         let old_path = sandbox.path().join("orig");
         let new_path = sandbox.path().join("dest");
-        fs::create_dir_all(old_path.join(".claude")).unwrap();
-        let settings = old_path.join(".claude/settings.json");
+        fs::create_dir_all(old_path.join(".testtool")).unwrap();
+        let settings = old_path.join(".testtool/settings.json");
         let original = format!(
             r#"{{"project_path": "{}","model": "opus"}}"#,
             old_path.display()
@@ -1102,10 +1130,9 @@ mod tests {
         fs::write(&settings, &original).unwrap();
         fs::rename(&old_path, &new_path).unwrap();
 
-        let registry = ToolRegistry::new().unwrap();
-        let tool = registry.get("claude_code").unwrap();
+        let tool = synthetic_json_tool();
         let event_log = EventLog::open_in_memory().unwrap();
-        let r = reconcile(tool, &old_path, &new_path, &event_log);
+        let r = reconcile(&tool, &old_path, &new_path, &event_log);
         assert!(r.success);
 
         // Grab the logged entry and run undo
@@ -1114,7 +1141,7 @@ mod tests {
         assert!(changed, "undo should modify the file");
 
         // File now contains the OLD path again
-        let content = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let content = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
         assert_eq!(
             v["project_path"].as_str().unwrap(),
@@ -1129,29 +1156,24 @@ mod tests {
         let sandbox = TempDir::new().unwrap();
         let old_path = sandbox.path().join("dry-orig");
         let new_path = sandbox.path().join("dry-dest");
-        fs::create_dir_all(old_path.join(".claude")).unwrap();
+        fs::create_dir_all(old_path.join(".testtool")).unwrap();
         fs::write(
-            old_path.join(".claude/settings.json"),
+            old_path.join(".testtool/settings.json"),
             format!(r#"{{"project_path": "{}"}}"#, old_path.display()),
         )
         .unwrap();
         fs::rename(&old_path, &new_path).unwrap();
 
-        let registry = ToolRegistry::new().unwrap();
+        let tool = synthetic_json_tool();
         let event_log = EventLog::open_in_memory().unwrap();
-        let _ = reconcile(
-            registry.get("claude_code").unwrap(),
-            &old_path,
-            &new_path,
-            &event_log,
-        );
-        let after_reconcile = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let _ = reconcile(&tool, &old_path, &new_path, &event_log);
+        let after_reconcile = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
 
         let entry = &event_log.recent(1).unwrap()[0];
         let would_undo = undo_event(entry, true).unwrap();
         assert!(would_undo, "dry run should report it would undo");
 
-        let after_dry_run = fs::read_to_string(new_path.join(".claude/settings.json")).unwrap();
+        let after_dry_run = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         assert_eq!(
             after_reconcile, after_dry_run,
             "dry run must not modify the file"

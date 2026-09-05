@@ -11,7 +11,19 @@ session_patterns = [
   ".claudeignore",
 ]
 
-[[tool.path_fields]]
-file = ".claude/settings.json"
-field = "project_path"
-format = "json"
+# Claude Code embeds the project path in NO in-project file (verified against
+# real installs). Its path-bearing state is this home-dir store, whose
+# directory names encode the project path. Reconciling a move therefore means
+# re-keying this store — Wave 2 — not rewriting anything inside the project.
+[tool.session_store]
+path = "~/.claude/projects"
+layout = "encoded_dir"
+
+# Only `projects/` is migratable. The parent `~/.claude` holds live runtime
+# state (sessions/, daemon/, sockets) and credential material that must never
+# be relocated or symlinked. No quiesce unit is declared: Claude Code is an
+# interactive desktop app with no service unit, so migrate's existing
+# "no quiesce hook declared" warning is the correct behavior.
+[tool.home_dir_layout]
+default_path = "~/.claude/projects"
+discovery = "symlink"

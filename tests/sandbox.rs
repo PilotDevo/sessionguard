@@ -135,8 +135,13 @@ fn sandbox_status_shows_watched() {
 
 #[test]
 fn sandbox_simulate_shows_affected_artifacts() {
+    // A multi-tool fixture: Claude Code declares no path_fields (see the
+    // honesty patch — it names no in-project file that actually holds its
+    // path), so it contributes matched-pattern lines but no rewrite plan.
+    // Cursor still declares a real path_fields target, so it is the one
+    // that proves "would rewrite" lines appear when a tool has one.
     let sandbox = TempDir::new().unwrap();
-    let project = create_claude_project(sandbox.path(), "sim-project");
+    let project = create_multi_tool_project(sandbox.path(), "sim-project");
     let dest = sandbox.path().join("sim-project-renamed");
 
     cmd(sandbox.path())
@@ -328,9 +333,13 @@ fn sandbox_export_import_round_trip() {
 fn sandbox_export_import_preserves_artifact_mappings() {
     // The v2 export carries the artifact graph — importing into a FRESH data
     // dir must restore the tool associations, not just bare project paths
-    // (the v1 format silently dropped them; audit M2).
+    // (the v1 format silently dropped them; audit M2). A multi-tool fixture
+    // is used because Claude Code alone declares no path_fields (see the
+    // honesty patch), and registry artifact rows come from a tool's
+    // path_fields targets; Cursor's still-real project_root field is what
+    // gives this project an artifact row to carry across the export.
     let sandbox = TempDir::new().unwrap();
-    let project = create_claude_project(sandbox.path(), "graph-test");
+    let project = create_multi_tool_project(sandbox.path(), "graph-test");
     let export_file = sandbox.path().join("export.json");
 
     cmd(sandbox.path())

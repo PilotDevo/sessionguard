@@ -2,6 +2,82 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.8.0] - 2026-09-01
+
+### Added — session-store model, wave 1: stores as data, fleet census, decode confidence
+
+Three problems traced to one root cause (`docs/design/session-store-model.md`):
+the reconcile layer targeted fields that don't exist on real installs, the
+session stores that *do* work were hardcoded Rust rather than data, and the
+census was single-host. The census and fleet paths this release adds are
+read-only — no session data is mutated by `sessions`, `--host`, or
+`--all-hosts` anywhere in this wave. But the wave is not read-only end to
+end: `claude_code` gains a `[tool.home_dir_layout]` below, making
+`sessionguard migrate claude_code` a real, opt-in mutating operation against
+a store the tool may be actively writing to, with no quiesce hook declared
+for it — non-deleting and undoable, but capable of leaving split-brain
+history until Claude Code restarts. Store re-keying on a project move
+(rewriting a session's *contents* to follow it) is still Wave 2.
+
+- **`[tool.session_store]` schema.** A new block on `ToolDefinition` declares
+  where a tool's sessions live and how they're keyed to a project, as one of
+  three layout kinds implemented in Rust but bound entirely by TOML data:
+  `encoded_dir` (one directory per project, path separators collapsed —
+  Claude Code), `jsonl_field` (project path is a field, optionally dotted,
+  on a JSONL file's first line — Codex), and `sqlite_column` (project path is
+  a column in a SQLite table, opened read-only — OpenCode). A tool with a
+  known storage shape is now a config file away from being censused, not a
+  recompile.
+- **`sessions.rs` is declaration-driven.** It no longer hardcodes three
+  reader paths; it dispatches to the matching reader for whatever
+  `session_store` bindings the loaded tool registry declares.
+- **Verified store bindings** shipped for `claude_code`
+  (`~/.claude/projects`), `codex` (`~/.codex/sessions`), and `opencode`
+  (`opencode.db`).
+- **Honesty patch.** `claude_code`'s and `gemini_cli`'s previously declared
+  `path_fields` named fields (`.claude/settings.json` → `project_path`,
+  `.gemini/settings.json` → `project_root`) that do not exist on real
+  installs — reconciliation for both was a silent no-op while `tools list`
+  and detection kept reporting them as supported. Both declarations are
+  removed. `claude_code` also gained a `home_dir_layout`, so its `projects/`
+  store (and only that directory — never the parent `~/.claude`, which holds
+  live runtime state and credentials) is migratable via `sessionguard
+  migrate`. The README's support table no longer claims unqualified
+  "Reconcile" for any built-in tool; see the table for the honest per-tool
+  breakdown (Cursor/Windsurf/Aider's reconcile targets are plausible but
+  unverified against real installs).
+- **Three-state decode confidence** (`exact` / `inferred` / `unresolved`)
+  replaces a boolean for how confidently a Claude Code store entry resolves
+  to a real project path. This is what makes a **deleted** Claude Code
+  project detectable as an orphan for the first time — the decoder validates
+  candidate splits against the live filesystem, so previously a project that
+  no longer existed could never decode and was invisible to `sessions
+  --orphans` instead of flagged by it.
+- **`sessionguard sessions --home <path>`** censuses an arbitrary root
+  instead of `$HOME` — e.g. a mounted or rsync'd home directory from another
+  machine.
+- **`sessionguard sessions --host <name>` / `--all-hosts`** with a new
+  `[[hosts]]` config block censuses one or every configured machine over
+  ssh, merging each host's JSON with provenance (a new `fleet.rs`). Read-only
+  by construction — the only remote commands ever run are `--version` and
+  `sessions --format json` — and **orphan status always comes from the
+  origin host**, never re-derived against the local filesystem (a remote
+  path that doesn't exist locally must not be reported as orphaned just
+  because this machine can't see it). A remote running 0.7.0 (pre-`confidence`)
+  is supported via a compatibility shim that synthesizes `confidence` from
+  its `decoded` boolean; a remote older than 0.7.0 is refused with a named
+  error pointing at `sessionguard update`. An ssh destination beginning with
+  `-` is refused before any process is spawned, closing an argv-injection
+  path into a locally-executed command.
+
+### Changed — JSON shape
+
+`sessions --format json` (and the fleet/`--home` variants) now includes a
+`confidence` field (`"exact" | "inferred" | "unresolved"`) on every group.
+The old `decoded` boolean is **retained for one release** for compatibility
+with the dashboard and any scripts already consuming it, and will be removed
+in a future release — consumers should migrate to `confidence`.
+
 ## [0.7.0] - 2026-07-16
 
 ### Added — per-project session census (`sessionguard sessions`)

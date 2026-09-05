@@ -1,8 +1,11 @@
 # Design: session-store model — stores as data, fleet-aware census, store re-keying
 
-> **Status**: Design draft. No code yet. Land this doc, review, then plan and
-> implement in waves — same cadence that preceded v0.4 `migrate` and v0.5
-> `update`. Drafted 2026-09-01 against a v0.7.0 baseline.
+> **Status**: Wave 1 (this doc's `[tool.session_store]` schema, the
+> declaration-driven census, the `path_fields` honesty patch, three-state
+> decode confidence, `sessions --home`, and the read-only fleet census) is
+> implemented and released in 0.8.0. Waves 2-3 — store re-keying and A2A
+> detection plus `sessions archive` — remain design-only. Drafted 2026-09-01
+> against a v0.7.0 baseline.
 
 ## Why this exists
 
@@ -164,7 +167,7 @@ hook declared" warning is the correct and honest behavior.
 ```toml
 [[hosts]]
 name = "fedora"
-ssh  = "devo@192.168.10.90"
+ssh  = "devo@192.0.2.10"
 ```
 
 ### Interface
@@ -325,3 +328,42 @@ their own plans written against this same model once wave 1 has soaked.
   change without notice. Mitigated by keeping bindings in data (a drift becomes
   a TOML edit, not a release) and by degrading to "unresolved" rather than
   guessing.
+
+## Deferred from Wave 1 (review findings, triaged ship-as-is)
+
+Every item below was raised by a task or whole-branch review during Wave 1,
+judged non-blocking, and deliberately shipped as-is. They are the natural
+first candidates for Wave 2, which touches much of the same code.
+
+- **T1**: src/tools/mod.rs:244 doc comment describes end-state
+- **T2**: TimeUnit::S passthrough untested (only Ms exercised).
+- **T2**: glob pattern built from base path doesn't escape glob
+- **T3**: synthetic_json_tool() duplicated in reconciler.rs and
+- **T3**: sandbox_simulate_shows_affected_artifacts asserts
+- **T4**: walk() and deepest_match() are near-duplicate
+- **T4**: a DECOY SIBLING dir (real .../amarillo alongside
+- **T4**: main.rs Inferred arm's `if g.orphaned` guard is
+- **T5**: third copy of the BaseDirs::new() home-resolution
+- **T6**: --host resolves local $HOME and builds the tool
+- **T6**: --all-hosts with zero configured hosts is silently
+- **T6**: total remote failure still exits 0; with --format json
+- **T6**: compat-shim coverage gaps — decoded:true->Exact
+- **T6**: adopt_host orphan test is near-structural; a merge-level
+- **T6**: FleetError::Unreachable conflates transport failure
+- **T6**: census(&home,&stores) duplicated at main.rs:940,956.
+- **T7**: CLAUDE.md Repository Layout parenthetical omits
+
+Also outstanding, from the whole-branch review's own findings:
+
+- `read_jsonl_field` now recurses the whole tree regardless of the declared
+  `glob` pattern's specificity, then match-filters per file. Bounded by
+  `SESSION_WALK_CAP`, but less efficient than letting a glob prune by directory.
+- Symlinked *session files* are now skipped outright (the deliberate cost of
+  closing the symlink-cycle walk); revisit if a real store uses them.
+- `tools list --verbose` does not show `session_store`, so a user adding a
+  binding can only confirm it loaded via `--format json`.
+- The dashboard has no fallback for a pre-0.8 binary (missing `confidence`
+  defaults to `exact`, dropping the encoded pill) and renders `Inferred`
+  orphans with the same certainty as `Exact` ones.
+- `on_move = "rewrite_paths"` is now a no-op declaration on the two tools
+  whose `path_fields` were removed.

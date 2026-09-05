@@ -38,3 +38,12 @@ discovery = "symlink"
 # tool config if your unit differs.
 [tool.home_dir_layout.quiesce]
 systemd_user_unit = "opencode.service"
+
+[tool.session_store]
+path = "~/.local/share/opencode/opencode.db"
+layout = "sqlite_column"
+table = "session"
+path_column = "directory"
+updated_column = "time_updated"
+updated_unit = "ms"
+archived_column = "time_archived"

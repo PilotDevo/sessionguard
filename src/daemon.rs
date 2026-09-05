@@ -398,7 +398,7 @@ mod tests {
     use super::handle_session_event;
     use crate::event_log::EventLog;
     use crate::registry::Registry;
-    use crate::tools::ToolRegistry;
+    use crate::tools::{PathFieldSpec, ReconcileStrategy, ToolDefinition, ToolRegistry};
     use crate::watcher::SessionEvent;
     use std::path::{Path, PathBuf};
     use tempfile::TempDir;
@@ -417,12 +417,33 @@ mod tests {
         assert!(!super::is_sessionguard_process(4_000_000_000));
     }
 
-    fn claude_project(root: &Path, name: &str) -> PathBuf {
+    // `claude_code` declares no `path_fields` (see the honesty patch — it
+    // names no in-project file that actually holds its path). This pipeline
+    // test needs a tool with a real rewritable field, so it registers its
+    // own synthetic one rather than leaning on a builtin's fictional one.
+    fn synthetic_json_tool() -> ToolDefinition {
+        ToolDefinition {
+            name: "test_json_tool".to_string(),
+            display_name: "Test JSON Tool".to_string(),
+            session_patterns: vec![".testtool/".to_string()],
+            path_fields: vec![PathFieldSpec {
+                file: ".testtool/settings.json".to_string(),
+                field: "project_path".to_string(),
+                format: "json".to_string(),
+            }],
+            on_move: ReconcileStrategy::RewritePaths,
+            version: None,
+            binary: None,
+            home_dir_layout: None,
+            session_store: None,
+        }
+    }
+
+    fn synthetic_project(root: &Path, name: &str) -> PathBuf {
         let p = root.join(name);
-        std::fs::create_dir_all(p.join(".claude")).unwrap();
-        std::fs::write(p.join("CLAUDE.md"), "# test").unwrap();
+        std::fs::create_dir_all(p.join(".testtool")).unwrap();
         std::fs::write(
-            p.join(".claude/settings.json"),
+            p.join(".testtool/settings.json"),
             format!(r#"{{"project_path": "{}","model": "opus"}}"#, p.display()),
         )
         .unwrap();
@@ -434,12 +455,13 @@ mod tests {
     #[test]
     fn handle_session_event_moved_reconciles_and_reregisters() {
         let dir = TempDir::new().unwrap();
-        let old = claude_project(dir.path(), "alpha");
+        let old = synthetic_project(dir.path(), "alpha");
         let new = dir.path().join("beta");
         std::fs::rename(&old, &new).unwrap(); // settings.json still names `old`
 
         let registry = Registry::open_in_memory().unwrap();
-        let tools = ToolRegistry::new().unwrap();
+        let mut tools = ToolRegistry::new().unwrap();
+        tools.register(synthetic_json_tool());
         let log = EventLog::open_in_memory().unwrap();
 
         handle_session_event(
@@ -452,7 +474,7 @@ mod tests {
             &log,
         );
 
-        let settings = std::fs::read_to_string(new.join(".claude/settings.json")).unwrap();
+        let settings = std::fs::read_to_string(new.join(".testtool/settings.json")).unwrap();
         assert!(
             settings.contains(&new.display().to_string()),
             "project_path should be rewritten to the new path"

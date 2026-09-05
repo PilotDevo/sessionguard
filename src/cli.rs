@@ -190,6 +190,19 @@ pub enum Command {
         /// Only show the group for this project directory.
         #[arg(long)]
         project: Option<PathBuf>,
+        /// Census this directory as the home root instead of $HOME (e.g. a
+        /// mounted or rsync'd home from another machine). Note: orphan status
+        /// is not evaluated for a foreign root, since orphan detection requires
+        /// the filesystem where sessions actually live. Use `--host` or
+        /// `--all-hosts` for cross-machine orphan detection.
+        #[arg(long)]
+        home: Option<PathBuf>,
+        /// Census a configured host instead of this machine.
+        #[arg(long, conflicts_with = "home")]
+        host: Option<String>,
+        /// Census every configured host plus this machine.
+        #[arg(long, conflicts_with_all = ["home", "host"])]
+        all_hosts: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,

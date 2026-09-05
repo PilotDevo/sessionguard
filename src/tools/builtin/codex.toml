@@ -39,3 +39,9 @@ env_var = "CODEX_HOME"
 # CODEX_HOME in your shell rc instead.
 [tool.home_dir_layout.quiesce]
 systemd_user_unit = "codex.service"
+
+[tool.session_store]
+path = "~/.codex/sessions"
+layout = "jsonl_field"
+key_field = "cwd"
+fallback_field = "payload.cwd"

@@ -221,6 +221,7 @@ mod tests {
                 quiesce: HomeDirQuiesce::default(),
                 validate: HomeDirValidate::default(),
             }),
+            session_store: None,
         }
     }
 
@@ -235,6 +236,7 @@ mod tests {
             version: None,
             binary: None,
             home_dir_layout: None,
+            session_store: None,
         };
         let inv = inventory_tools_impl([&t]);
         assert!(inv.is_empty());

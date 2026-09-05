@@ -933,7 +933,7 @@ fn config_parses_hosts() {
         watch_roots = []
         [[hosts]]
         name = "fedora"
-        ssh = "devo@192.168.10.90"
+        ssh = "devo@192.0.2.10"
         "#,
     )
     .unwrap();
@@ -1088,7 +1088,7 @@ pub fn remote_census(host: &HostSpec) -> Result<Vec<SessionGroup>, FleetError> {
 pub struct HostSpec {
     /// Short name used with `--host`.
     pub name: String,
-    /// ssh destination, e.g. `devo@192.168.10.90`.
+    /// ssh destination, e.g. `devo@192.0.2.10`.
     pub ssh: String,
 }
 ```

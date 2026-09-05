@@ -27,6 +27,15 @@ pub enum WatchMode {
     Passive,
 }
 
+/// A machine in the fleet that can be censused over ssh.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct HostSpec {
+    /// Short name used with `--host`.
+    pub name: String,
+    /// ssh destination, e.g. `devo@192.0.2.10`.
+    pub ssh: String,
+}
+
 /// Top-level SessionGuard configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -41,6 +50,10 @@ pub struct Config {
     /// Additional tool definitions from the project config.
     #[serde(default)]
     pub tools: Vec<ToolDefinition>,
+
+    /// Fleet hosts this machine can census over ssh (`--host`/`--all-hosts`).
+    #[serde(default)]
+    pub hosts: Vec<HostSpec>,
 }
 
 impl Default for Config {
@@ -49,6 +62,7 @@ impl Default for Config {
             watch_roots: default_watch_roots(),
             watch_mode: WatchMode::default(),
             tools: Vec::new(),
+            hosts: Vec::new(),
         }
     }
 }
@@ -147,5 +161,20 @@ mod tests {
         let config = Config::default();
         let toml_str = toml::to_string_pretty(&config).unwrap();
         let _parsed: Config = toml::from_str(&toml_str).unwrap();
+    }
+
+    #[test]
+    fn config_parses_hosts() {
+        let c: Config = toml::from_str(
+            r#"
+            watch_roots = []
+            [[hosts]]
+            name = "fedora"
+            ssh = "devo@192.0.2.10"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.hosts.len(), 1);
+        assert_eq!(c.hosts[0].name, "fedora");
     }
 }

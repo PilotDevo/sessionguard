@@ -498,8 +498,9 @@ def _activity_from_cli() -> list[dict[str, Any]] | None:
         rows.append(
             {
                 "project_path": g.get("project_path", ""),
-                "encoded": not g.get("decoded", False),
+                "encoded": g.get("confidence", "exact") == "unresolved",
                 "orphaned": bool(g.get("orphaned", False)),
+                "confidence": g.get("confidence", "exact"),
                 "tools": tools,
             }
         )
