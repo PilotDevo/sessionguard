@@ -26,7 +26,14 @@ async fn main() -> Result<()> {
         tracing_subscriber::EnvFilter::try_from_default_env()
             .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
     };
-    tracing_subscriber::fmt().with_env_filter(env_filter).init();
+    // Write log lines to stderr, never stdout: several subcommands emit
+    // machine-readable stdout (e.g. `--format json`), and a stray `WARN`
+    // ahead of the JSON would corrupt local consumers and the fleet ssh
+    // payload alike.
+    tracing_subscriber::fmt()
+        .with_env_filter(env_filter)
+        .with_writer(std::io::stderr)
+        .init();
 
     let config = match &cli.config {
         // A `--config` path that doesn't exist yet is fine — `init` creates it,
