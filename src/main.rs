@@ -923,25 +923,23 @@ async fn main() -> Result<()> {
             all_hosts,
             format,
         } => {
-            let home = match home {
-                Some(h) => h,
-                None => match directories::BaseDirs::new() {
-                    Some(d) => d.home_dir().to_owned(),
-                    None => anyhow::bail!("cannot determine your home directory"),
-                },
-            };
-            let tool_registry = ToolRegistry::new_with_config(&config)?;
-            let stores: Vec<(String, sessionguard::tools::SessionStore)> = tool_registry
-                .all()
-                .filter_map(|t| t.session_store.clone().map(|s| (t.name.clone(), s)))
-                .collect();
-
+            // Local `$HOME` resolution and building the tool registry are
+            // deliberately NOT hoisted above this branch: a purely remote
+            // census (`--host`) reads no local store, and must not die on
+            // unrelated local breakage (an unreadable `~/.config`, a broken
+            // user tool TOML, an unresolvable home dir).
+            let mut foreign_root = false;
+            let mut host_failures = 0usize;
             let mut groups = if all_hosts {
-                let mut all = sessionguard::sessions::census(&home, &stores);
+                let (mut all, f) = local_census(&config, home)?;
+                foreign_root = f;
                 for h in &config.hosts {
                     match sessionguard::fleet::remote_census(h) {
                         Ok(mut g) => all.append(&mut g),
-                        Err(e) => eprintln!("warning: {e}"),
+                        Err(e) => {
+                            host_failures += 1;
+                            eprintln!("warning: {e}");
+                        }
                     }
                 }
                 all
@@ -953,8 +951,19 @@ async fn main() -> Result<()> {
                     .ok_or_else(|| anyhow::anyhow!("no host named `{name}` in config"))?;
                 sessionguard::fleet::remote_census(h)?
             } else {
-                sessionguard::sessions::census(&home, &stores)
+                let (g, f) = local_census(&config, home)?;
+                foreign_root = f;
+                g
             };
+
+            // Note goes to stderr so it can never land in `--format json`.
+            if foreign_root {
+                eprintln!(
+                    "note: --home is a foreign root, so orphan status is not evaluable here \
+                     (project dirs belong to that machine's filesystem); no group is reported \
+                     orphaned. Use `--host` for a fleet census with real orphan verdicts."
+                );
+            }
 
             if orphans {
                 groups.retain(|g| g.orphaned);
@@ -972,11 +981,10 @@ async fn main() -> Result<()> {
                 sessionguard::cli::Format::Json => {
                     println!("{}", serde_json::to_string_pretty(&groups)?);
                 }
+                sessionguard::cli::Format::Text if groups.is_empty() => {
+                    println!("no sessions found.");
+                }
                 sessionguard::cli::Format::Text => {
-                    if groups.is_empty() {
-                        println!("no sessions found.");
-                        return Ok(());
-                    }
                     let orphan_count = groups.iter().filter(|g| g.orphaned).count();
                     for g in &groups {
                         let mut markers = String::new();
@@ -1026,6 +1034,19 @@ async fn main() -> Result<()> {
                         );
                     }
                 }
+            }
+
+            // A host that failed contributes NO groups, which is
+            // indistinguishable from "that host has no sessions" to an
+            // automated `--all-hosts --format json` consumer. The warnings
+            // above are for humans; the exit code is the machine-readable
+            // signal that the census is incomplete. Reported after the
+            // output so partial results are still usable.
+            if host_failures > 0 {
+                anyhow::bail!(
+                    "{host_failures} host(s) failed (see warnings above); \
+                     this census is incomplete"
+                );
             }
         }
 
@@ -1356,6 +1377,43 @@ fn spawn_background_daemon(config_path: Option<&std::path::Path>) -> Result<()> 
         log_path.display()
     );
     Ok(())
+}
+
+/// Census this machine. Resolves the census root (`--home` if given, else
+/// `$HOME`) and builds the tool registry — both LOCAL concerns, which is why
+/// this is a function the remote-only `--host` path never calls.
+///
+/// Returns the groups plus whether the root is FOREIGN: a `--home` that isn't
+/// this machine's real `$HOME` (a mounted or rsync'd home from another
+/// machine). Orphan status is not evaluable against the local filesystem for
+/// such a root, so `census` asserts no verdict there — see its docs.
+fn local_census(
+    config: &Config,
+    home: Option<std::path::PathBuf>,
+) -> Result<(Vec<sessionguard::sessions::SessionGroup>, bool)> {
+    let real_home = directories::BaseDirs::new().map(|d| d.home_dir().to_owned());
+    let (root, foreign_root) = match home {
+        Some(h) => {
+            // Compare canonicalized where possible so `--home ~` (or a path
+            // through a symlink) is correctly recognized as the real home.
+            let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or(p.to_path_buf());
+            let same = real_home.as_deref().map(canon) == Some(canon(&h));
+            (h, !same)
+        }
+        None => match real_home {
+            Some(h) => (h, false),
+            None => anyhow::bail!("cannot determine your home directory"),
+        },
+    };
+    let tool_registry = ToolRegistry::new_with_config(config)?;
+    let stores: Vec<(String, sessionguard::tools::SessionStore)> = tool_registry
+        .all()
+        .filter_map(|t| t.session_store.clone().map(|s| (t.name.clone(), s)))
+        .collect();
+    Ok((
+        sessionguard::sessions::census(&root, &stores, foreign_root),
+        foreign_root,
+    ))
 }
 
 /// Render a byte count in a compact human-friendly form for the

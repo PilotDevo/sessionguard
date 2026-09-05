@@ -74,7 +74,7 @@ fn parse_remote_groups(json: &str, host: &str) -> Result<Vec<SessionGroup>, Flee
     let mut value: serde_json::Value =
         serde_json::from_str(json).map_err(|e| FleetError::BadOutput {
             host: host.to_string(),
-            detail: e.to_string(),
+            detail: format!("{e}; received: {}", snippet(json)),
         })?;
     if let Some(groups) = value.as_array_mut() {
         for group in groups.iter_mut() {
@@ -98,8 +98,26 @@ fn parse_remote_groups(json: &str, host: &str) -> Result<Vec<SessionGroup>, Flee
     }
     serde_json::from_value(value).map_err(|e| FleetError::BadOutput {
         host: host.to_string(),
-        detail: e.to_string(),
+        detail: format!("{e}; received: {}", snippet(json)),
     })
+}
+
+/// A short, quoted prefix of what the remote actually sent. Without it a
+/// `BadOutput` reads as a bare serde message ("expected value at line 1
+/// column 1") with no hint that the real cause was, say, a log line or an
+/// MOTD ahead of the JSON. Truncated on a char boundary so a UTF-8 payload
+/// can't panic the error path.
+fn snippet(raw: &str) -> String {
+    const MAX: usize = 200;
+    let trimmed = raw.trim();
+    if trimmed.len() <= MAX {
+        return format!("{trimmed:?}");
+    }
+    let mut end = MAX;
+    while end > 0 && !trimmed.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{:?}...", &trimmed[..end])
 }
 
 /// Reject an `ssh` destination that begins with `-`. Such a value (e.g.
@@ -120,9 +138,24 @@ fn check_destination(host: &HostSpec) -> Result<(), FleetError> {
     Ok(())
 }
 
+/// Run one read-only command on a host. `ConnectTimeout` bounds only the
+/// *handshake*; `ServerAliveInterval`/`ServerAliveCountMax` bound the session
+/// after it, so a host that accepts the connection and then wedges (hung
+/// filesystem, suspended laptop, dropped route) tears down in ~30s instead of
+/// blocking `--all-hosts` indefinitely on one member of the fleet.
 fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
     let out = std::process::Command::new("ssh")
-        .args(["-o", "BatchMode=yes", "-o", "ConnectTimeout=10", &host.ssh])
+        .args([
+            "-o",
+            "BatchMode=yes",
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "ServerAliveInterval=10",
+            "-o",
+            "ServerAliveCountMax=3",
+            &host.ssh,
+        ])
         .args(remote_args)
         .output()
         .map_err(|e| FleetError::Unreachable {
@@ -236,5 +269,61 @@ mod tests {
             "decoded: false must synthesize confidence: unresolved (0.7.0 had no Inferred state)"
         );
         assert!(groups[0].orphaned, "orphaned must pass through unchanged");
+    }
+
+    #[test]
+    fn remote_census_json_leaves_a_new_shape_payload_confidence_alone() {
+        // The other direction of the shim: a payload that ALREADY carries
+        // `confidence` must keep it verbatim — synthesizing from `decoded`
+        // here would downgrade every `inferred` group to `unresolved`.
+        let json = r#"[
+            {
+                "project_path": "/home/devo/work/app",
+                "decoded": false,
+                "confidence": "inferred",
+                "orphaned": true,
+                "host": "local",
+                "tools": {}
+            }
+        ]"#;
+        let groups = parse_remote_groups(json, "fedora").expect("new-shape payload must parse");
+        assert_eq!(
+            groups[0].confidence,
+            DecodeConfidence::Inferred,
+            "an existing confidence must survive the compat shim unmodified"
+        );
+    }
+
+    #[test]
+    fn remote_census_json_parses_a_future_payload_that_dropped_decoded() {
+        // `decoded` is scheduled for removal. `#[serde(default)]` is what
+        // keeps an older local binary able to read a newer remote host once
+        // that lands — the shim only upgrades in the older-remote direction.
+        let json = r#"[
+            {
+                "project_path": "/home/devo/work/app",
+                "confidence": "exact",
+                "orphaned": false,
+                "host": "local",
+                "tools": {}
+            }
+        ]"#;
+        let groups =
+            parse_remote_groups(json, "fedora").expect("payload without `decoded` must parse");
+        assert_eq!(groups[0].confidence, DecodeConfidence::Exact);
+        assert!(!groups[0].decoded, "missing `decoded` defaults to false");
+    }
+
+    #[test]
+    fn bad_output_error_quotes_what_the_remote_actually_sent() {
+        // The realistic failure: a `WARN` line (or an MOTD) ahead of the JSON.
+        // A bare serde message can't be acted on; the received bytes can.
+        let e = parse_remote_groups("WARN session_store declares…\n[]", "fedora").unwrap_err();
+        let msg = e.to_string();
+        assert!(matches!(e, FleetError::BadOutput { .. }));
+        assert!(
+            msg.contains("WARN"),
+            "error must quote the received bytes, got: {msg}"
+        );
     }
 }

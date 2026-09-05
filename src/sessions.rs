@@ -31,16 +31,22 @@ use serde::{Deserialize, Serialize};
 
 use crate::tools::{SessionStore, TimeUnit};
 
-/// Cap on files visited per store walk, so a pathological store can't spin.
+/// Cap on directory entries visited per store walk, so a pathological store
+/// can't spin. Counted against entries *visited*, not matches *yielded* — a
+/// cap on matches bounds nothing when the walk itself is what runs away.
 const SESSION_WALK_CAP: usize = 50_000;
 
 /// How confidently a store entry was resolved to a real project path.
 /// Ordered most-confident first so `min` keeps the best decode.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DecodeConfidence {
     Exact,
     Inferred,
+    /// Also the `Default`: a payload that omits `confidence` entirely has told
+    /// us nothing about how it resolved the path, and "unknown" must not
+    /// masquerade as `Exact`.
+    #[default]
     Unresolved,
 }
 
@@ -66,15 +72,27 @@ pub struct SessionGroup {
     /// [`DecodeConfidence`].
     pub project_path: String,
     /// Whether `project_path` was confidently resolved to a real path form.
+    ///
+    /// Retained for one release for pre-`confidence` consumers and scheduled
+    /// for removal; `#[serde(default)]` (like `confidence` and `host`) so an
+    /// OLDER local binary can still deserialize a NEWER remote host's payload
+    /// once the field is dropped — the fleet compat shim only upgrades
+    /// payloads in the older-remote direction.
+    #[serde(default)]
     pub decoded: bool,
     /// How confidently `project_path` was resolved (see [`DecodeConfidence`]).
+    #[serde(default)]
     pub confidence: DecodeConfidence,
     /// True when the project directory no longer exists on disk — the
-    /// sessions are orphaned (candidates for archive/cleanup).
+    /// sessions are orphaned (candidates for archive/cleanup). Always `false`
+    /// for a census of a foreign root (see [`census`]): the project
+    /// directories belong to another machine's filesystem, so their existence
+    /// is not decidable here.
     pub orphaned: bool,
     /// The host this census was taken on: `"local"` for this machine, or a
     /// configured [`crate::config::HostSpec`] name when populated by
     /// [`crate::fleet::remote_census`].
+    #[serde(default)]
     pub host: String,
     /// Per-tool session summaries, keyed by tool name.
     pub tools: BTreeMap<String, ToolSessions>,
@@ -101,7 +119,25 @@ fn safe_ident(s: &str) -> bool {
 /// directory. Read-only. `stores` pairs each tool name with the store
 /// declaration to read it with (typically `ToolRegistry::all()` filtered to
 /// tools that declare `session_store`).
-pub fn census(home: &Path, stores: &[(String, SessionStore)]) -> Vec<SessionGroup> {
+///
+/// `foreign_root` says whether `home` is something OTHER than this machine's
+/// real `$HOME` — a mounted or rsync'd home from another machine
+/// (`sessions --home`). Orphan detection asks "does this project directory
+/// exist?", and the only filesystem available to answer that is the local
+/// one, which is the wrong filesystem for a foreign root: every path would
+/// look gone (false orphans), and a path that happens to exist locally under
+/// the same name would look live while actually being a *different* project
+/// on this machine (a false negative that silently attributes the other
+/// machine's history to a local directory). So for a foreign root no orphan
+/// verdict is asserted at all: `orphaned` is `false` everywhere and callers
+/// are expected to say so (see `main.rs`). Cross-machine orphan status is
+/// what `sessions --host` / `--all-hosts` exist for — there the verdict is
+/// computed on the host the sessions actually live on.
+pub fn census(
+    home: &Path,
+    stores: &[(String, SessionStore)],
+    foreign_root: bool,
+) -> Vec<SessionGroup> {
     let mut groups: BTreeMap<String, (DecodeConfidence, BTreeMap<String, ToolSessions>)> =
         BTreeMap::new();
 
@@ -160,7 +196,10 @@ pub fn census(home: &Path, stores: &[(String, SessionStore)]) -> Vec<SessionGrou
     groups
         .into_iter()
         .map(|(project_path, (confidence, tools))| {
-            let exists = Path::new(&project_path).exists();
+            // Only meaningful for a census of the local machine's own home:
+            // for a foreign root the local filesystem cannot answer the
+            // question, so no verdict is asserted.
+            let exists = foreign_root || Path::new(&project_path).exists();
             SessionGroup {
                 orphaned: matches!(
                     confidence,
@@ -194,11 +233,21 @@ pub fn census(home: &Path, stores: &[(String, SessionStore)]) -> Vec<SessionGrou
 ///    becomes `/home/devo/projects/amarillo-project`. This gets the common
 ///    shape exactly right (one deleted leaf under a surviving parent,
 ///    regardless of hyphens in the leaf's own name) and is reported
-///    `Inferred`. It is still a best guess, not a validated fact: if an
-///    ancestor directory is *also* gone (a deeper, multi-segment deletion),
-///    more than the true leaf gets folded into that one segment, and the
-///    proposed path can be wrong — `Inferred` means "best guess," not
-///    "confirmed."
+///    `Inferred`. It is still a best guess, not a validated fact, in two
+///    known shapes:
+///    - **Deeper deletion.** If an ancestor directory is *also* gone (a
+///      multi-segment deletion), more than the true leaf gets folded into
+///      that one segment, and the proposed path can be wrong.
+///    - **Decoy sibling.** `deepest_match` maximizes consumed parts, so a
+///      *live* directory whose name is a prefix of the deleted one's wins
+///      over the shorter, correct ancestor: with `…/amarillo` present beside
+///      a deleted `…/amarillo-project`, the decoy consumes `amarillo` and
+///      the result is `…/amarillo/project` rather than
+///      `…/amarillo-project`. Such a path also fails to merge with the
+///      Codex/OpenCode row for the true project, so that project can show up
+///      as two rows.
+///
+///    In both shapes `Inferred` means "best guess," not "confirmed."
 /// 3. If not even the first segment matches a real directory, there is
 ///    nothing on disk to anchor a guess to; fall back to the fully naive
 ///    `separator` → `/` decode, still `Inferred` — better than an opaque
@@ -317,6 +366,18 @@ fn read_encoded_dir(
 /// `pattern`; `key_field` (optionally dotted, e.g. `payload.cwd`) on the
 /// first line of each file carries the project path, with `fallback_field`
 /// tried when `key_field` is absent (older/newer schema variants).
+///
+/// The tree is walked here rather than by `glob::glob` — `glob`'s own
+/// recursion stats candidate directories with `fs::metadata`, which FOLLOWS
+/// symlinks, so a symlink cycle under a store recurses without bound. This
+/// walk uses [`std::fs::DirEntry::metadata`], which does NOT follow symlinks:
+/// a symlinked entry is neither `is_dir` nor `is_file`, so it is skipped and
+/// a cycle is structurally impossible. `pattern` is then applied to each
+/// visited file as a [`glob::Pattern`], preserving the declaration's glob
+/// semantics. Entries visited are counted against [`SESSION_WALK_CAP`] — the
+/// bound has to be on the walk, since a runaway walk yields no matches to
+/// count. Both properties matter more since `--home` and user-declared
+/// `jsonl_field` stores can point the walk at an arbitrary tree.
 fn read_jsonl_field(
     base: &Path,
     pattern: &str,
@@ -329,33 +390,45 @@ fn read_jsonl_field(
         return;
     }
     let full = format!("{}/{}", base.display(), pattern);
-    let Ok(paths) = glob::glob(&full) else {
+    let Ok(matcher) = glob::Pattern::new(&full) else {
         return;
     };
-    for (visited, entry) in paths.enumerate() {
-        if visited > SESSION_WALK_CAP {
-            return;
-        }
-        let Ok(p) = entry else { continue };
-        let Ok(meta) = std::fs::metadata(&p) else {
+
+    let mut visited = 0usize;
+    let mut stack = vec![base.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
-        if !meta.is_file() {
-            continue;
+        for entry in entries.flatten() {
+            visited += 1;
+            if visited > SESSION_WALK_CAP {
+                return;
+            }
+            // Does not follow symlinks — see the note above.
+            let Ok(meta) = entry.metadata() else { continue };
+            let p = entry.path();
+            if meta.is_dir() {
+                stack.push(p);
+                continue;
+            }
+            if !meta.is_file() || !matcher.matches_path(&p) {
+                continue;
+            }
+            let Some(cwd) = jsonl_key(&p, key_field, fallback_field) else {
+                continue;
+            };
+            absorb(
+                cwd,
+                DecodeConfidence::Exact,
+                tool,
+                ToolSessions {
+                    count: 1,
+                    bytes: meta.len(),
+                    last_active_unix: unix_mtime(&meta),
+                },
+            );
         }
-        let Some(cwd) = jsonl_key(&p, key_field, fallback_field) else {
-            continue;
-        };
-        absorb(
-            cwd,
-            DecodeConfidence::Exact,
-            tool,
-            ToolSessions {
-                count: 1,
-                bytes: meta.len(),
-                last_active_unix: unix_mtime(&meta),
-            },
-        );
     }
 }
 
@@ -580,7 +653,7 @@ mod tests {
         )
         .unwrap();
 
-        let groups = census(home.path(), &test_stores());
+        let groups = census(home.path(), &test_stores(), false);
         let live_group = groups
             .iter()
             .find(|g| g.project_path == live.display().to_string())
@@ -615,7 +688,7 @@ mod tests {
         .unwrap();
         drop(conn);
 
-        let groups = census(home.path(), &test_stores());
+        let groups = census(home.path(), &test_stores(), false);
         let g = groups
             .iter()
             .find(|g| g.project_path == "/tmp/oc-proj")
@@ -643,7 +716,7 @@ mod tests {
                 separator: "-".into(),
             },
         )];
-        let groups = census(home.path(), &stores);
+        let groups = census(home.path(), &stores, false);
         assert_eq!(groups.len(), 1, "declared custom path must be read");
         assert_eq!(groups[0].tools["claude_code"].count, 1);
     }
@@ -677,7 +750,7 @@ mod tests {
             },
         )];
         assert!(
-            census(home.path(), &unsafe_table).is_empty(),
+            census(home.path(), &unsafe_table, false).is_empty(),
             "unsafe table identifier must skip the whole store without building a query"
         );
 
@@ -693,7 +766,7 @@ mod tests {
             },
         )];
         assert!(
-            census(home.path(), &unsafe_path_column).is_empty(),
+            census(home.path(), &unsafe_path_column, false).is_empty(),
             "unsafe path_column identifier must skip the whole store without building a query"
         );
     }
@@ -730,7 +803,7 @@ mod tests {
             },
         )];
 
-        let groups = census(home.path(), &stores);
+        let groups = census(home.path(), &stores, false);
         assert!(
             groups.iter().any(|g| g.project_path == "/tmp/oc-proj"),
             "safe rows must still be read when only optional columns are unsafe"
@@ -776,7 +849,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
 
-        let groups = census(home.path(), &test_stores());
+        let groups = census(home.path(), &test_stores(), false);
         let g = groups
             .iter()
             .find(|g| g.project_path == gone.display().to_string())
@@ -799,7 +872,7 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
 
-        let groups = census(home.path(), &test_stores());
+        let groups = census(home.path(), &test_stores(), false);
         let g = groups
             .iter()
             .find(|g| g.project_path == gone.display().to_string())
@@ -819,9 +892,72 @@ mod tests {
         std::fs::create_dir_all(&store).unwrap();
         std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
 
-        let groups = census(home.path(), &test_stores());
+        let groups = census(home.path(), &test_stores(), false);
         assert_eq!(groups[0].confidence, DecodeConfidence::Exact);
         assert!(groups[0].decoded);
         assert!(!groups[0].orphaned);
+    }
+
+    #[test]
+    fn foreign_root_census_asserts_no_orphan_verdict() {
+        // `sessions --home /mnt/other-machine-home`: the project dirs live on
+        // ANOTHER machine's filesystem, so "does it exist?" is not decidable
+        // here. Asserting it anyway flags essentially everything orphaned.
+        // The same fixture read as a local home DOES flag the orphan, which
+        // is what proves the flag (not the fixture) is doing the work.
+        let home = TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join("work")).unwrap();
+        let gone = home.path().join("work/deleted-app"); // never created
+        let enc = gone.display().to_string().replace('/', "-");
+        let store = home.path().join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(store.join("s.jsonl"), b"{}").unwrap();
+
+        let codex = home.path().join(".codex/sessions/2026/07");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("rollout-1.jsonl"),
+            b"{\"cwd\": \"/no/such/project/anywhere\"}\n",
+        )
+        .unwrap();
+
+        let local = census(home.path(), &test_stores(), false);
+        assert!(
+            local.iter().any(|g| g.orphaned),
+            "a local census must still flag gone project dirs"
+        );
+
+        let foreign = census(home.path(), &test_stores(), true);
+        assert!(!foreign.is_empty(), "groups are still reported");
+        assert!(
+            foreign.iter().all(|g| !g.orphaned),
+            "a foreign root must not assert an orphan verdict for any group"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn jsonl_walk_terminates_on_a_symlink_cycle() {
+        // `glob`'s own recursion stats directories with `fs::metadata`, which
+        // FOLLOWS symlinks — a cycle under a store recursed without bound, and
+        // the cap (counting yielded matches) never fired because a runaway
+        // walk yields nothing. The hand-rolled walk uses `DirEntry::metadata`,
+        // which does not follow symlinks, so this terminates.
+        let home = TempDir::new().unwrap();
+        let sessions = home.path().join(".codex/sessions/2026");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("rollout.jsonl"),
+            b"{\"cwd\": \"/tmp/cycle-proj\"}\n",
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(home.path().join(".codex/sessions"), sessions.join("loop"))
+            .unwrap();
+
+        let groups = census(home.path(), &test_stores(), false);
+        assert!(
+            groups.iter().any(|g| g.project_path == "/tmp/cycle-proj"),
+            "the real session must still be read past the cycle"
+        );
     }
 }
