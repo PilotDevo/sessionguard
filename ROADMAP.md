@@ -6,7 +6,7 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.8.0 (current)** — Session-store model, wave 1 (read-only): where a
+**v0.8.0 (current)** — Session-store model, wave 1: where a
 tool's sessions live and how they're keyed to a project is now a
 `[tool.session_store]` TOML declaration (three data-bound layout kinds —
 `encoded_dir`, `jsonl_field`, `sqlite_column`) instead of three hardcoded
@@ -14,6 +14,12 @@ Rust readers, so `sessions.rs` drives itself from those declarations. An
 honesty patch removed `path_fields` on `claude_code` and `gemini_cli` that
 named fields confirmed absent from real installs — their reconcile support
 was a silent no-op while detection still reported them as supported.
+`claude_code` also gained a `[tool.home_dir_layout]`, so its `projects/`
+store is migratable via `sessionguard migrate` — an opt-in, non-deleting,
+undoable operation, but a real mutation against a large live store with no
+quiesce hook declared for it; migrating a store Claude Code is actively
+writing can leave split-brain history until the tool restarts. The census
+and fleet paths added in this wave, by contrast, are read-only.
 Three-state decode confidence (`exact`/`inferred`/`unresolved`) replaces a
 boolean, which for the first time makes a **deleted** Claude Code project
 detectable as an orphan (the decoder validates against the live filesystem,

@@ -1,8 +1,11 @@
 # Design: session-store model — stores as data, fleet-aware census, store re-keying
 
-> **Status**: Design draft. No code yet. Land this doc, review, then plan and
-> implement in waves — same cadence that preceded v0.4 `migrate` and v0.5
-> `update`. Drafted 2026-09-01 against a v0.7.0 baseline.
+> **Status**: Wave 1 (this doc's `[tool.session_store]` schema, the
+> declaration-driven census, the `path_fields` honesty patch, three-state
+> decode confidence, `sessions --home`, and the read-only fleet census) is
+> implemented and released in 0.8.0. Waves 2-3 — store re-keying and A2A
+> detection plus `sessions archive` — remain design-only. Drafted 2026-09-01
+> against a v0.7.0 baseline.
 
 ## Why this exists
 
@@ -164,7 +167,7 @@ hook declared" warning is the correct and honest behavior.
 ```toml
 [[hosts]]
 name = "fedora"
-ssh  = "devo@192.168.10.90"
+ssh  = "devo@192.0.2.10"
 ```
 
 ### Interface

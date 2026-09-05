@@ -9,9 +9,15 @@ All notable changes to SessionGuard will be documented in this file.
 Three problems traced to one root cause (`docs/design/session-store-model.md`):
 the reconcile layer targeted fields that don't exist on real installs, the
 session stores that *do* work were hardcoded Rust rather than data, and the
-census was single-host. This release fixes all three, read-only — no session
-data is mutated anywhere in this wave; re-keying a home-dir store on move is
-Wave 2.
+census was single-host. The census and fleet paths this release adds are
+read-only — no session data is mutated by `sessions`, `--host`, or
+`--all-hosts` anywhere in this wave. But the wave is not read-only end to
+end: `claude_code` gains a `[tool.home_dir_layout]` below, making
+`sessionguard migrate claude_code` a real, opt-in mutating operation against
+a store the tool may be actively writing to, with no quiesce hook declared
+for it — non-deleting and undoable, but capable of leaving split-brain
+history until Claude Code restarts. Store re-keying on a project move
+(rewriting a session's *contents* to follow it) is still Wave 2.
 
 - **`[tool.session_store]` schema.** A new block on `ToolDefinition` declares
   where a tool's sessions live and how they're keyed to a project, as one of
