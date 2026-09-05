@@ -367,3 +367,60 @@ Also outstanding, from the whole-branch review's own findings:
   orphans with the same certainty as `Exact` ones.
 - `on_move = "rewrite_paths"` is now a no-op declaration on the two tools
   whose `path_fields` were removed.
+
+### Resolved in v0.8.1 (post-merge review patch)
+
+A ten-angle review of the merged v0.8.0 patch found that the Wave 1 decoder
+had a *regression* hiding behind the deferred list: Claude Code's encoding
+replaces every non-alphanumeric character with `-` (verified in the
+installed binary), not just `/`, so any live project with a `_`, `.` or
+space in its path could never be filesystem-validated and was folded onto
+its parent as an `Inferred` orphan. The review also found that Claude Code
+transcripts record the literal `cwd` on a leading line (9 of 10 sampled),
+which made the right fix a *model* change rather than a better heuristic:
+
+- **`encoded_dir` gained a key hint** (`key_glob` + `key_field`; builtin
+  `*.jsonl` / `cwd`). A store directory with a transcript is keyed by the
+  path the tool wrote down, cross-checked against the directory name;
+  decoding the name is now the fallback, not the method. This also makes
+  `--home` decoding exact for hinted directories without touching the local
+  filesystem.
+- **Encoding-aware DFS** for hint-less directories (`my_app` → `my-app` is
+  matched by encoding the real child), ambiguity (`my_app` beside `my-app`)
+  reported `Inferred`, foreign roots never validated locally, `[INFERRED]`
+  marker + legend in text output.
+- Closed from the list above: T2 glob escaping (now matched relative to the
+  store root), T4 `if g.orphaned` guard (exhaustive `(confidence, orphaned)`
+  match), T6 `Unreachable` conflation (`RemoteFailed` with exit status, 127
+  hint, per-host `binary`), T7 CLAUDE.md layout list, the dashboard's
+  pre-0.8 fallback and `Inferred`-orphan pill, and the `on_move` no-op
+  declarations. Plus: load-time `SessionStore::validate`, `[[hosts]]`
+  validation (`local` reserved), override inheritance of the home-dir
+  blocks, env-discovered store re-rooting, `--home` must exist,
+  `--all-hosts` survives a local failure, `--project` accepts the recorded
+  spelling, SQLite epoch coercion + ms-magnitude guard, bounded JSONL reads,
+  walk-cap warning.
+
+### Wave 2 backlog (still open)
+
+- **Verdict, not two booleans.** `(confidence, orphaned)` is a product type
+  with states the local census never produces (`Unresolved && orphaned`),
+  so every consumer re-derives the same six-way match. A single
+  `Verdict { Live, Gone, ProbablyGone, Undecodable, NotEvaluated }` (the last
+  for foreign roots, today conflated with `Live`) would carry the meaning
+  once. Schema change — pair it with the scheduled removal of `decoded`.
+- **`host` as a type.** `"local"` is a magic string compared in three
+  places; a `Host::Local | Host::Named(String)` (or the reserved-name check
+  now in `Config::validate`) belongs in the payload type.
+- **`--home` anchoring.** A foreign root's encoded names could be anchored
+  by dropping the foreign home prefix (`/home/other` ≙ the mounted root) and
+  validating the remainder under `--home` — a real filesystem to check
+  against, unlike today's naive decode.
+- **T4 near-duplication**: `walk` and `deepest_match` share
+  `children_matching` now but are still two traversals; a single DFS that
+  records both the full decodes and the deepest partial would halve the
+  filesystem work.
+- `read_jsonl_field` recursion vs. glob pruning; symlinked session files
+  skipped; `tools list --verbose` not showing `session_store`; the remaining
+  T3/T5/T6 items above.
+- Store re-keying itself (the reason Wave 2 exists) — see "Store re-keying".

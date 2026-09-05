@@ -2,7 +2,9 @@
 name = "claude_code"
 display_name = "Claude Code"
 version = "1.0"
-on_move = "rewrite_paths"
+# No in-project path fields exist to rewrite (see below), so a move can only
+# be noted, not reconciled, until Wave 2 re-keys the home-dir store.
+on_move = "notify"
 binary = "claude"
 
 session_patterns = [
@@ -15,9 +17,17 @@ session_patterns = [
 # real installs). Its path-bearing state is this home-dir store, whose
 # directory names encode the project path. Reconciling a move therefore means
 # re-keying this store — Wave 2 — not rewriting anything inside the project.
+#
+# The directory name is the project path with every non-alphanumeric
+# character replaced by `-` — lossy (`my_app` and `my-app` collide). But each
+# session transcript inside records the literal `cwd` on one of its leading
+# lines, so the key hint below reads the true path from there and decodes the
+# directory name only for a directory that has no transcript to ask.
 [tool.session_store]
 path = "~/.claude/projects"
 layout = "encoded_dir"
+key_glob = "*.jsonl"
+key_field = "cwd"
 
 # Only `projects/` is migratable. The parent `~/.claude` holds live runtime
 # state (sessions/, daemon/, sockets) and credential material that must never

@@ -11,7 +11,7 @@
 
 ## Thesis
 
-SessionGuard runs on a fleet — Mac, `DOLOAMD`, `fedora` — and keeping every
+SessionGuard runs on a fleet — Mac, `desk-linux`, `fedora` — and keeping every
 box on the same version is currently manual and error-prone. Concrete proof:
 on 2026-06-25 the `fedora` hub was found running **0.3.12** while the rest of
 the fleet was on **0.4.3** — four minor versions and the entire v4 `migrate`

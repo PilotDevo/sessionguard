@@ -362,9 +362,71 @@ fn cli_sessions_honors_explicit_home_root() {
     std::fs::create_dir_all(&store).unwrap();
     std::fs::write(store.join("s.jsonl"), "{}").unwrap();
 
+    // A foreign root is never validated against the local filesystem, so a
+    // hint-less directory name is a best-guess decode: [INFERRED], not an
+    // orphan verdict either way — and the note about that goes to stderr.
     sg(&real)
         .args(["sessions", "--home", &other.path().display().to_string()])
         .assert()
         .success()
-        .stdout(predicate::str::contains("1 project(s) with sessions"));
+        .stdout(predicate::str::contains("1 project(s) with sessions"))
+        .stdout(predicate::str::contains(format!(
+            "{}  [INFERRED]",
+            live.display()
+        )))
+        .stdout(predicate::str::contains("orphaned (project dir gone)").not())
+        .stderr(predicate::str::contains("foreign root"));
+}
+
+#[test]
+fn cli_sessions_rejects_a_home_that_does_not_exist() {
+    // A mistyped or unmounted `--home` used to be censused as an EMPTY foreign
+    // home — `no sessions found.`, exit 0 — indistinguishable from a machine
+    // with no sessions. It is an error now.
+    let home = TempDir::new().unwrap();
+    let missing = home.path().join("not-mounted");
+    sg(&home)
+        .args(["sessions", "--home", &missing.display().to_string()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a directory"))
+        .stdout(predicate::str::contains("no sessions found").not());
+}
+
+#[test]
+fn cli_sessions_project_filter_accepts_the_spelling_the_tool_recorded() {
+    // Stores hold the path the TOOL saw. On macOS that is `/var/...` for a
+    // temp dir whose canonical form is `/private/var/...`, and anywhere it can
+    // be a path through a symlink. `--project` used to canonicalize the
+    // operator's argument and compare it with the raw stored string, so the
+    // very path printed by `sessions` matched nothing when passed back in.
+    let home = TempDir::new().unwrap();
+    let real = home.path().join("real/app");
+    std::fs::create_dir_all(&real).unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(home.path().join("real"), home.path().join("link")).unwrap();
+    let recorded = home.path().join("link/app"); // what a tool run from the symlink records
+    let codex = home.path().join(".codex/sessions/2026/07");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("rollout-1.jsonl"),
+        format!("{{\"cwd\": \"{}\"}}\n", recorded.display()),
+    )
+    .unwrap();
+
+    // As recorded (through the symlink), as printed, and canonical — all hit.
+    for spelling in [
+        recorded.display().to_string(),
+        format!("{}/", recorded.display()),
+        std::fs::canonicalize(&recorded)
+            .unwrap()
+            .display()
+            .to_string(),
+    ] {
+        sg(&home)
+            .args(["sessions", "--project", &spelling, "--format", "json"])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("\"codex\""));
+    }
 }

@@ -171,11 +171,27 @@ pub enum TimeUnit {
 #[serde(tag = "layout", rename_all = "snake_case")]
 pub enum SessionStore {
     /// One directory per project; the directory name is the project path with
-    /// each path separator replaced by `separator` (Claude Code).
+    /// EVERY character outside `[A-Za-z0-9]` replaced by `separator` (Claude
+    /// Code's encoding — not just `/`, so `my_app`, `app.v2` and `LARS Docs`
+    /// collapse into hyphens too; verified against the installed `claude`
+    /// binary's `replace(/[^a-zA-Z0-9]/g, "-")`).
+    ///
+    /// That collapse is lossy, so an optional *key hint* names a file inside
+    /// each project directory that carries the literal project path:
+    /// `key_glob` is matched against the direct children's file names and
+    /// `key_field` is a dotted JSON field looked up on the leading lines of
+    /// that JSONL file (Claude Code: `*.jsonl` / `cwd`). When the hint
+    /// resolves, the path is exact and the directory name is never decoded
+    /// at all; name decoding is the fallback for stores whose files carry no
+    /// path. Declare both or neither.
     EncodedDir {
         path: String,
         #[serde(default = "default_separator")]
         separator: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_glob: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        key_field: Option<String>,
     },
     /// A tree of JSONL files; the project path is a field on the first line.
     JsonlField {
@@ -206,6 +222,93 @@ fn default_separator() -> String {
 
 fn default_jsonl_glob() -> String {
     "**/*.jsonl".to_string()
+}
+
+/// SQLite identifiers come from a TOML file, so they are validated rather than
+/// interpolated blindly — a malicious or fat-fingered declaration must not be
+/// able to inject SQL.
+pub fn safe_ident(s: &str) -> bool {
+    !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+}
+
+impl SessionStore {
+    /// The declared store location (`~`-relative or absolute), before any
+    /// expansion.
+    pub fn path(&self) -> &str {
+        match self {
+            SessionStore::EncodedDir { path, .. }
+            | SessionStore::JsonlField { path, .. }
+            | SessionStore::SqliteColumn { path, .. } => path,
+        }
+    }
+
+    /// Replace the declared store location (used to re-root a store under a
+    /// tool's env-discovered home, see `sessions::resolve_stores`).
+    pub fn set_path(&mut self, new_path: String) {
+        match self {
+            SessionStore::EncodedDir { path, .. }
+            | SessionStore::JsonlField { path, .. }
+            | SessionStore::SqliteColumn { path, .. } => *path = new_path,
+        }
+    }
+
+    /// Reject a declaration that can never be read safely or meaningfully, at
+    /// LOAD time, so a bad tool TOML fails loudly instead of censusing zero
+    /// sessions with no warning: an empty `separator` makes every store
+    /// directory "path-shaped" and decodes it into garbage; an unparseable
+    /// glob would match nothing; a half-declared key hint is a typo; and
+    /// `table`/`path_column` have no safe fallback to substitute in SQL. The
+    /// optional SQLite columns are deliberately NOT checked here — they
+    /// degrade at read time (substituted with `NULL` / the filter dropped)
+    /// rather than aborting the store, and that behaviour is tested.
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        if self.path().trim().is_empty() {
+            return Err("`path` must not be empty".into());
+        }
+        match self {
+            SessionStore::EncodedDir {
+                separator,
+                key_glob,
+                key_field,
+                ..
+            } => {
+                if separator.is_empty() {
+                    return Err("`separator` must not be empty".into());
+                }
+                match (key_glob, key_field) {
+                    (None, None) => {}
+                    (Some(g), Some(f)) => {
+                        glob::Pattern::new(g).map_err(|e| format!("`key_glob` {g:?}: {e}"))?;
+                        if f.trim().is_empty() {
+                            return Err("`key_field` must not be empty".into());
+                        }
+                    }
+                    _ => return Err("`key_glob` and `key_field` must be declared together".into()),
+                }
+            }
+            SessionStore::JsonlField {
+                glob, key_field, ..
+            } => {
+                glob::Pattern::new(glob).map_err(|e| format!("`glob` {glob:?}: {e}"))?;
+                if key_field.trim().is_empty() {
+                    return Err("`key_field` must not be empty".into());
+                }
+            }
+            SessionStore::SqliteColumn {
+                table, path_column, ..
+            } => {
+                if !safe_ident(table) {
+                    return Err(format!("`table` {table:?} is not a safe SQL identifier"));
+                }
+                if !safe_ident(path_column) {
+                    return Err(format!(
+                        "`path_column` {path_column:?} is not a safe SQL identifier"
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A tool definition describing one AI coding tool's session artifacts.
@@ -289,7 +392,7 @@ impl ToolRegistry {
         let config_dir = crate::config::config_dir();
         registry.load_all(&config_dir)?;
         for tool in &config.tools {
-            registry.register(tool.clone());
+            registry.register(validated(tool.clone(), "config.toml [[tools]]")?);
         }
         Ok(registry)
     }
@@ -312,8 +415,30 @@ impl ToolRegistry {
         self.tools.values()
     }
 
-    /// Register a tool definition, overriding any existing one with the same name.
-    pub fn register(&mut self, tool: ToolDefinition) {
+    /// Register a tool definition, replacing any existing one with the same
+    /// name.
+    ///
+    /// The optional home-dir blocks — `binary`, `home_dir_layout`,
+    /// `session_store` — are INHERITED from the definition being replaced
+    /// when the override omits them. Each arrived in a later release than the
+    /// override mechanism, so a user/project TOML written to tweak
+    /// `session_patterns` in 0.3 says nothing about them; treating "omitted"
+    /// as "remove" would silently drop the tool out of `doctor`, `migrate`
+    /// and `sessions` the day the operator upgrades. To disable an inherited
+    /// store, override it explicitly (e.g. point `session_store.path` at an
+    /// empty directory).
+    pub fn register(&mut self, mut tool: ToolDefinition) {
+        if let Some(prev) = self.tools.get(&tool.name) {
+            if tool.binary.is_none() {
+                tool.binary = prev.binary.clone();
+            }
+            if tool.home_dir_layout.is_none() {
+                tool.home_dir_layout = prev.home_dir_layout.clone();
+            }
+            if tool.session_store.is_none() {
+                tool.session_store = prev.session_store.clone();
+            }
+        }
         self.tools.insert(tool.name.clone(), tool);
     }
 
@@ -330,7 +455,7 @@ impl ToolRegistry {
         ] {
             let tool_file: ToolFile = toml::from_str(toml_str)
                 .map_err(|e| Error::ToolDefinition(format!("invalid built-in tool TOML: {e}")))?;
-            self.register(tool_file.tool);
+            self.register(validated(tool_file.tool, "built-in")?);
         }
         Ok(())
     }
@@ -358,9 +483,24 @@ impl ToolRegistry {
             path: path.to_owned(),
             source: e,
         })?;
-        self.register(tool_file.tool);
+        self.register(validated(tool_file.tool, &path.display().to_string())?);
         Ok(())
     }
+}
+
+/// Run [`SessionStore::validate`] on a freshly parsed definition, naming the
+/// origin (built-in, a TOML path, or the config's `[[tools]]`) in the error so
+/// the operator knows which file to fix.
+fn validated(tool: ToolDefinition, origin: &str) -> Result<ToolDefinition> {
+    if let Some(store) = &tool.session_store {
+        store.validate().map_err(|msg| {
+            Error::ToolDefinition(format!(
+                "{origin}: tool `{}`: [tool.session_store] {msg}",
+                tool.name
+            ))
+        })?;
+    }
+    Ok(tool)
 }
 
 #[cfg(test)]
@@ -679,8 +819,176 @@ session_patterns = [".cursor/", ".cursor-custom/"]
             s,
             SessionStore::EncodedDir {
                 path: "~/.claude/projects".into(),
-                separator: "-".into()
+                separator: "-".into(),
+                key_glob: None,
+                key_field: None,
             }
+        );
+    }
+
+    #[test]
+    fn session_store_encoded_dir_parses_key_hint_and_builtin_claude_declares_it() {
+        let s: SessionStore = toml::from_str(
+            r#"
+            layout = "encoded_dir"
+            path = "~/.claude/projects"
+            key_glob = "*.jsonl"
+            key_field = "cwd"
+            "#,
+        )
+        .unwrap();
+        match s {
+            SessionStore::EncodedDir {
+                key_glob,
+                key_field,
+                ..
+            } => {
+                assert_eq!(key_glob.as_deref(), Some("*.jsonl"));
+                assert_eq!(key_field.as_deref(), Some("cwd"));
+            }
+            _ => panic!("wrong variant"),
+        }
+        // The builtin must declare the hint: it is what turns Claude Code
+        // decoding from a heuristic into a read of the recorded path.
+        let registry = ToolRegistry::new().unwrap();
+        match registry.get("claude_code").unwrap().session_store.as_ref() {
+            Some(SessionStore::EncodedDir {
+                key_glob: Some(g),
+                key_field: Some(f),
+                ..
+            }) => {
+                assert_eq!(g, "*.jsonl");
+                assert_eq!(f, "cwd");
+            }
+            other => panic!("claude_code builtin must declare key_glob/key_field, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_store_validate_rejects_degenerate_declarations() {
+        let bad = |toml_src: &str| {
+            toml::from_str::<SessionStore>(toml_src)
+                .unwrap()
+                .validate()
+                .expect_err("must be rejected")
+        };
+        assert!(bad(r#"layout = "encoded_dir"
+                      path = "~/x"
+                      separator = """#)
+        .contains("separator"));
+        assert!(bad(r#"layout = "encoded_dir"
+                      path = "~/x"
+                      key_glob = "*.jsonl""#)
+        .contains("together"));
+        assert!(bad(r#"layout = "jsonl_field"
+                      path = "~/x"
+                      glob = "[unclosed"
+                      key_field = "cwd""#)
+        .contains("glob"));
+        assert!(bad(r#"layout = "sqlite_column"
+                      path = "~/x.db"
+                      table = "session; DROP TABLE session;--"
+                      path_column = "directory""#)
+        .contains("table"));
+        assert!(bad(r#"layout = "sqlite_column"
+                      path = ""
+                      table = "session"
+                      path_column = "directory""#)
+        .contains("path"));
+
+        // And the builtins all pass their own gate.
+        for t in ToolRegistry::new().unwrap().all() {
+            if let Some(s) = &t.session_store {
+                s.validate()
+                    .unwrap_or_else(|e| panic!("builtin {}: {e}", t.name));
+            }
+        }
+    }
+
+    #[test]
+    fn load_from_directory_rejects_invalid_session_store_naming_the_file() {
+        let dir = TempDir::new().unwrap();
+        let tools_dir = dir.path().join("tools");
+        fs::create_dir_all(&tools_dir).unwrap();
+        fs::write(
+            tools_dir.join("broken.toml"),
+            r#"
+[tool]
+name = "broken"
+session_patterns = []
+
+[tool.session_store]
+layout = "encoded_dir"
+path = "~/broken"
+separator = ""
+"#,
+        )
+        .unwrap();
+        let mut registry = ToolRegistry::new().unwrap();
+        let err = registry.load_all(dir.path()).unwrap_err().to_string();
+        assert!(
+            err.contains("broken.toml"),
+            "error must name the file: {err}"
+        );
+        assert!(
+            err.contains("separator"),
+            "error must say what is wrong: {err}"
+        );
+    }
+
+    #[test]
+    fn register_inherits_home_dir_blocks_when_override_omits_them() {
+        // A pre-0.8 override file that only tweaks session_patterns must not
+        // strip the builtin's session_store / home_dir_layout / binary.
+        let mut registry = ToolRegistry::new().unwrap();
+        let builtin = registry.get("claude_code").unwrap().clone();
+        assert!(builtin.session_store.is_some());
+        assert!(builtin.home_dir_layout.is_some());
+        assert!(builtin.binary.is_some());
+
+        registry.register(ToolDefinition {
+            name: "claude_code".to_string(),
+            display_name: "Claude (override)".to_string(),
+            session_patterns: vec![".claude/".to_string(), "CLAUDE.local.md".to_string()],
+            path_fields: vec![],
+            on_move: ReconcileStrategy::Notify,
+            version: None,
+            binary: None,
+            home_dir_layout: None,
+            session_store: None,
+        });
+        let merged = registry.get("claude_code").unwrap();
+        assert_eq!(merged.display_name, "Claude (override)");
+        assert_eq!(merged.session_patterns.len(), 2, "override fields win");
+        assert_eq!(
+            merged.session_store, builtin.session_store,
+            "store inherited"
+        );
+        assert_eq!(
+            merged.home_dir_layout, builtin.home_dir_layout,
+            "layout inherited"
+        );
+        assert_eq!(merged.binary, builtin.binary, "binary inherited");
+
+        // An EXPLICIT override still replaces.
+        registry.register(ToolDefinition {
+            session_store: Some(SessionStore::EncodedDir {
+                path: "~/elsewhere".into(),
+                separator: "-".into(),
+                key_glob: None,
+                key_field: None,
+            }),
+            ..builtin.clone()
+        });
+        assert_eq!(
+            registry
+                .get("claude_code")
+                .unwrap()
+                .session_store
+                .as_ref()
+                .unwrap()
+                .path(),
+            "~/elsewhere"
         );
     }
 

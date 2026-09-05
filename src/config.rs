@@ -30,10 +30,29 @@ pub enum WatchMode {
 /// A machine in the fleet that can be censused over ssh.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct HostSpec {
-    /// Short name used with `--host`.
+    /// Short name used with `--host`. `local` is reserved for this machine.
     pub name: String,
     /// ssh destination, e.g. `devo@192.0.2.10`.
     pub ssh: String,
+    /// Path of the `sessionguard` binary on that host. Defaults to
+    /// `sessionguard`, which the remote NON-interactive shell resolves through
+    /// its own PATH — one that commonly lacks Homebrew's or cargo's bin dir,
+    /// so the remote reports `command not found` although the host was
+    /// reached fine. Set an absolute path (e.g.
+    /// `/opt/homebrew/bin/sessionguard`, `~/.cargo/bin/sessionguard`) then.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub binary: Option<String>,
+}
+
+impl HostSpec {
+    /// Name reserved for this machine's own census; a configured host may
+    /// not claim it, or its rows would be indistinguishable from local ones.
+    pub const LOCAL: &'static str = "local";
+
+    /// The remote binary to run (see the `binary` field).
+    pub fn binary(&self) -> &str {
+        self.binary.as_deref().unwrap_or("sessionguard")
+    }
 }
 
 /// Top-level SessionGuard configuration.
@@ -94,10 +113,43 @@ impl Config {
     /// Load config from a specific file path.
     pub fn load_from(path: &Path) -> Result<Self> {
         let content = std::fs::read_to_string(path)?;
-        toml::from_str(&content).map_err(|e| Error::ConfigParse {
+        let config: Self = toml::from_str(&content).map_err(|e| Error::ConfigParse {
             path: path.to_owned(),
             source: e,
-        })
+        })?;
+        config
+            .validate()
+            .map_err(|msg| Error::Config(format!("{}: {msg}", path.display())))?;
+        Ok(config)
+    }
+
+    /// Reject a config that parses but cannot mean what it says: a `[[hosts]]`
+    /// entry with no name or destination, two hosts sharing a name (`--host`
+    /// could only ever reach one), or a host named `local` (its rows would be
+    /// indistinguishable from this machine's own).
+    pub fn validate(&self) -> std::result::Result<(), String> {
+        let mut seen = std::collections::HashSet::new();
+        for h in &self.hosts {
+            if h.name.trim().is_empty() {
+                return Err("[[hosts]] entry has an empty `name`".into());
+            }
+            if h.name == HostSpec::LOCAL {
+                return Err(format!(
+                    "[[hosts]] name `{}` is reserved for this machine",
+                    HostSpec::LOCAL
+                ));
+            }
+            if h.ssh.trim().is_empty() {
+                return Err(format!(
+                    "[[hosts]] `{}` has an empty `ssh` destination",
+                    h.name
+                ));
+            }
+            if !seen.insert(h.name.as_str()) {
+                return Err(format!("[[hosts]] name `{}` is declared twice", h.name));
+            }
+        }
+        Ok(())
     }
 
     /// Default config file path: `~/.config/sessionguard/config.toml`.
@@ -176,5 +228,52 @@ mod tests {
         .unwrap();
         assert_eq!(c.hosts.len(), 1);
         assert_eq!(c.hosts[0].name, "fedora");
+        assert_eq!(c.hosts[0].binary(), "sessionguard", "default remote binary");
+        assert!(c.validate().is_ok());
+    }
+
+    #[test]
+    fn config_parses_per_host_binary() {
+        let c: Config = toml::from_str(
+            r#"
+            watch_roots = []
+            [[hosts]]
+            name = "mac"
+            ssh = "devo@macbook"
+            binary = "/opt/homebrew/bin/sessionguard"
+            "#,
+        )
+        .unwrap();
+        assert_eq!(c.hosts[0].binary(), "/opt/homebrew/bin/sessionguard");
+    }
+
+    #[test]
+    fn config_validation_rejects_reserved_duplicate_and_empty_host_names() {
+        let parse = |hosts: &str| -> Config {
+            toml::from_str(&format!("watch_roots = []\n{hosts}")).unwrap()
+        };
+        let reserved = parse("[[hosts]]\nname = \"local\"\nssh = \"x@y\"\n");
+        assert!(reserved.validate().unwrap_err().contains("reserved"));
+
+        let dup = parse(
+            "[[hosts]]\nname = \"a\"\nssh = \"x@y\"\n[[hosts]]\nname = \"a\"\nssh = \"x@z\"\n",
+        );
+        assert!(dup.validate().unwrap_err().contains("twice"));
+
+        let empty = parse("[[hosts]]\nname = \"\"\nssh = \"x@y\"\n");
+        assert!(empty.validate().unwrap_err().contains("empty `name`"));
+
+        let no_ssh = parse("[[hosts]]\nname = \"a\"\nssh = \"\"\n");
+        assert!(no_ssh.validate().unwrap_err().contains("ssh"));
+
+        // And load_from surfaces it as a config error naming the file.
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(&path, "[[hosts]]\nname = \"local\"\nssh = \"x@y\"\n").unwrap();
+        let err = Config::load_from(&path).unwrap_err().to_string();
+        assert!(
+            err.contains("config.toml") && err.contains("reserved"),
+            "{err}"
+        );
     }
 }

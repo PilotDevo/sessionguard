@@ -495,12 +495,17 @@ def _activity_from_cli() -> list[dict[str, Any]] | None:
             }
             for name, s in (g.get("tools") or {}).items()
         }
+        # `confidence` arrived in 0.8.0; a 0.7.x binary sends only `decoded`,
+        # whose semantics were exactly exact/unresolved. Defaulting a missing
+        # confidence to "exact" would paint every undecoded 0.7 row as resolved.
+        confidence = g.get("confidence") or ("exact" if g.get("decoded") else "unresolved")
         rows.append(
             {
                 "project_path": g.get("project_path", ""),
-                "encoded": g.get("confidence", "exact") == "unresolved",
+                "encoded": confidence == "unresolved",
                 "orphaned": bool(g.get("orphaned", False)),
-                "confidence": g.get("confidence", "exact"),
+                "confidence": confidence,
+                "host": g.get("host", "local"),
                 "tools": tools,
             }
         )
@@ -565,6 +570,10 @@ def list_activity(tracked_paths: set[str]) -> list[dict[str, Any]]:
             {
                 "project_path": path,
                 "encoded": info["encoded"],
+                # Same row contract as the CLI adapter, so the renderer has one
+                # shape to deal with. The Python walkers have no Inferred state.
+                "confidence": "unresolved" if info["encoded"] else "exact",
+                "host": "local",
                 # Orphan detection matches the CLI census: a confidently
                 # decoded project path that no longer exists on disk.
                 "orphaned": (not info["encoded"]) and not Path(path).exists(),
@@ -712,10 +721,11 @@ INDEX_HTML = r"""<!doctype html>
 
   const fmtTime = (t) => t ? String(t).replace("T", " ").replace("Z", "") : "-";
 
-  // Known assistant tools we surface. Order is the column order in the
-  // Activity table — keeping it stable means projects render consistently
-  // across polls. Display labels match the Tools tab.
-  const ACTIVITY_TOOLS = [
+  // Assistant tools with a builtin session store, in column order — keeping
+  // it stable means projects render consistently across polls. Any OTHER tool
+  // id the census reports (a user-declared `[tool.session_store]`) gets a
+  // column appended after these, labelled from the Tools tab when known.
+  const KNOWN_ACTIVITY_TOOLS = [
     { id: "claude_code", label: "Claude" },
     { id: "codex",       label: "Codex" },
     { id: "opencode",    label: "OpenCode" },
@@ -723,8 +733,8 @@ INDEX_HTML = r"""<!doctype html>
 
   const renderActivity = (activity, allTools) => {
     if (!activity.length) {
-      return `<div class="empty">no activity detected across known assistant stores<br>
-        <span class="muted">checked: <code>~/.claude/projects</code>, <code>~/.codex/sessions</code>, <code>~/.local/share/opencode</code></span></div>`;
+      return `<div class="empty">no activity detected across declared session stores<br>
+        <span class="muted">every tool with a <code>[tool.session_store]</code> was checked</span></div>`;
     }
     const now = Date.now() / 1000;
     const fmtAge = (t) => {
@@ -748,6 +758,13 @@ INDEX_HTML = r"""<!doctype html>
     // visibility layer of the launcher-health feature — at a glance you
     // see "Claude column has 14 sessions but the launcher is gone."
     const toolByName = Object.fromEntries((allTools || []).map(t => [t.name, t]));
+    const extraIds = [...new Set(activity.flatMap(p => Object.keys(p.tools || {})))]
+      .filter(id => !KNOWN_ACTIVITY_TOOLS.some(t => t.id === id))
+      .sort();
+    const columns = KNOWN_ACTIVITY_TOOLS.concat(extraIds.map(id => ({
+      id,
+      label: (toolByName[id] && toolByName[id].display_name) || id,
+    })));
     const launcherBadge = (toolId) => {
       const t = toolByName[toolId];
       if (!t || !t.binary_status) return "";
@@ -758,7 +775,7 @@ INDEX_HTML = r"""<!doctype html>
       return "";
     };
 
-    const headers = ACTIVITY_TOOLS
+    const headers = columns
       .map(t => `<th>${esc(t.label)}${launcherBadge(t.id)}</th>`)
       .join("");
 
@@ -766,11 +783,23 @@ INDEX_HTML = r"""<!doctype html>
       const tracked = p.tracked
         ? `<span class="tag good" title="registered with the SessionGuard daemon — auto-reconciled on move">tracked</span>`
         : `<span class="tag muted" title="not registered; SessionGuard sees the history but won't reconcile a move">untracked</span>`;
-      const orphaned = p.orphaned
-        ? ` <span class="tag bad" title="project directory no longer exists — sessions are orphaned (candidates for cleanup)">orphaned</span>`
-        : "";
-      const encoded = p.encoded
-        ? ` <span class="tag warn" title="Claude Code dir name could not be decoded to a real path">encoded</span>`
+      // One pill per (confidence, orphaned) state, mirroring the CLI's text
+      // markers: a best-guess path that looks gone is "orphaned?", never the
+      // confirmed "orphaned" — the difference between "clean this up" and
+      // "check this first".
+      const conf = p.confidence || (p.encoded ? "unresolved" : "exact");
+      const orphaned = !p.orphaned
+        ? ""
+        : conf === "exact"
+          ? ` <span class="tag bad" title="project directory no longer exists — sessions are orphaned (candidates for cleanup)">orphaned</span>`
+          : ` <span class="tag warn" title="project directory appears gone, but this path is a best-guess decode of the store name — verify before cleaning up">orphaned?</span>`;
+      const encoded = conf === "unresolved"
+        ? ` <span class="tag warn" title="store directory name could not be decoded to a real path; shown raw">encoded</span>`
+        : (conf === "inferred" && !p.orphaned)
+          ? ` <span class="tag muted" title="path is a best-guess decode of the store name">inferred</span>`
+          : "";
+      const host = p.host && p.host !== "local"
+        ? `<span class="tag muted" title="censused on this fleet host">${esc(p.host)}</span> `
         : "";
       const overall = cellTag(p.last_activity);
       const overallTag = overall === "live"
@@ -779,7 +808,7 @@ INDEX_HTML = r"""<!doctype html>
           ? `<span class="dot warn" title="touched in last hour"></span>`
           : "";
 
-      const cells = ACTIVITY_TOOLS.map(t => {
+      const cells = columns.map(t => {
         const v = p.tools[t.id];
         if (!v) return `<td class="muted">—</td>`;
         const mark = cellTag(v.last_activity);
@@ -791,7 +820,7 @@ INDEX_HTML = r"""<!doctype html>
 
       return `
         <tr>
-          <td>${overallTag}<code>${esc(p.project_path)}</code>${encoded}${orphaned}</td>
+          <td>${overallTag}${host}<code>${esc(p.project_path)}</code>${encoded}${orphaned}</td>
           <td>${tracked}</td>
           ${cells}
           <td class="muted">${esc(fmtAge(p.last_activity))} ago</td>
