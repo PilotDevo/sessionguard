@@ -22,7 +22,7 @@ migrate roadmap."* This is that phase 2, scoped on its own terms.
 
 The pitch: **"pick up the exact AI coding session you left on one box,
 on another box."** You're mid-conversation with Claude Code / Codex /
-OpenCode on the MacBook; you walk to `DOLOAMD`; you keep going — same
+OpenCode on the MacBook; you walk to `desk-linux`; you keep going — same
 history, same context — instead of starting cold.
 
 None of the tools we run do this. `claude --resume`, OpenCode's session
@@ -64,7 +64,7 @@ pair (see Commands).
 ## Concrete first target
 
 A real cross-machine pair on the fleet: **MacBook (`/Users/devo`,
-macOS) → `DOLOAMD` (`/home/devo`, Linux)**, tool **Claude Code**, this
+macOS) → `desk-linux` (`/home/devo`, Linux)**, tool **Claude Code**, this
 very repo.
 
 ```bash
@@ -75,7 +75,7 @@ sessionguard handoff pack claude_code \
 
 # Carry ait.sgbundle over the 10G NAS (or the fedora hub).
 
-# On DOLOAMD:
+# On desk-linux:
 sessionguard handoff apply ait.sgbundle \
   --to /home/devo/Droco/side-projects/ai-session-track
 # → then `claude --resume` opens the same session, history intact.
@@ -331,7 +331,7 @@ handoff v1 ships when:
 - [ ] `--dry-run` on `apply` makes zero FS/registry changes.
 - [ ] `handoff-dogfood.sh` passes in CI (Ubuntu + macOS) against a
       fake-tool fixture across two home/OS layouts.
-- [ ] README has a "Handoff" section with the Mac→DOLOAMD example.
+- [ ] README has a "Handoff" section with the Mac→desk-linux example.
 
 ---
 

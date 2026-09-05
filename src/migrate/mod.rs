@@ -881,12 +881,23 @@ fn rewrite_via_symlink(canonical: &Path, target: &Path) -> Result<RewriteOutcome
             moved_aside: Some(moved_aside),
         }),
         Err(e) => {
-            // Symlink failed — restore the original. Best-effort.
-            let _ = std::fs::rename(&moved_aside, canonical);
-            Err(MigrateError::StageFailed(
-                Stage::Rewrite,
-                format!("symlink install failed (original restored): {e}"),
-            ))
+            // Symlink failed — move the original back. Say what actually
+            // happened: claiming "restored" when the rename-back also failed
+            // (EEXIST because something re-created the path, a permissions
+            // change) would send the operator looking in the wrong place.
+            let detail = match std::fs::rename(&moved_aside, canonical) {
+                Ok(()) => format!(
+                    "symlink install at {} failed ({e}); original moved back into place",
+                    canonical.display()
+                ),
+                Err(restore_err) => format!(
+                    "symlink install at {} failed ({e}) AND the original could not be moved \
+                     back ({restore_err}); it is still at {} — restore it by hand",
+                    canonical.display(),
+                    moved_aside.display()
+                ),
+            };
+            Err(MigrateError::StageFailed(Stage::Rewrite, detail))
         }
     }
 }

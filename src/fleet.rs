@@ -17,8 +17,18 @@ const MIN_REMOTE_VERSION: (u64, u64, u64) = (0, 7, 0);
 
 #[derive(Debug, thiserror::Error)]
 pub enum FleetError {
+    /// ssh itself could not reach or authenticate to the host (spawn failure
+    /// or ssh's own exit status 255).
     #[error("host `{host}`: unreachable ({detail})")]
     Unreachable { host: String, detail: String },
+    /// The host was reached but the remote command exited non-zero — most
+    /// often 127, `sessionguard` not on the remote non-interactive PATH.
+    #[error("host `{host}`: remote command exited {status} ({detail})")]
+    RemoteFailed {
+        host: String,
+        status: i32,
+        detail: String,
+    },
     #[error("host `{host}`: sessionguard {found} is too old for `sessions` (needs 0.7.0+); run `sessionguard update` there")]
     TooOld { host: String, found: String },
     #[error("host `{host}`: could not parse remote output ({detail})")]
@@ -29,13 +39,26 @@ pub enum FleetError {
          injection)"
     )]
     InvalidDestination { host: String, ssh: String },
+    #[error(
+        "host `{host}`: `binary` {binary:?} is not a plain path (allowed: letters, digits, \
+         `_ - . / ~`, not starting with `-`); it is run through the remote shell, so nothing \
+         else is accepted"
+    )]
+    InvalidBinary { host: String, binary: String },
 }
 
-/// Verify a remote `sessionguard --version` string meets the floor.
+/// Verify a remote `sessionguard --version` output meets the floor.
+///
+/// Only a line of the form `sessionguard X.Y.Z` counts. The remote command
+/// runs through a login shell, so its stdout can carry an MOTD or shell-rc
+/// chatter ahead of the real line, and scanning every token for anything
+/// version-shaped would happily accept `Fedora 42.0.1` as the version.
 pub fn check_remote_version(host: &str, version_output: &str) -> Result<(), FleetError> {
-    let found = version_output
-        .split_whitespace()
-        .find_map(|w| crate::update::parse_version(w).map(|v| (w.to_string(), v)));
+    let found = version_output.lines().find_map(|line| {
+        let rest = line.trim().strip_prefix("sessionguard")?;
+        let token = rest.split_whitespace().next()?;
+        crate::update::parse_version(token).map(|v| (token.to_string(), v))
+    });
     match found {
         Some((_, v)) if v >= MIN_REMOTE_VERSION => Ok(()),
         Some((raw, _)) => Err(FleetError::TooOld {
@@ -44,7 +67,10 @@ pub fn check_remote_version(host: &str, version_output: &str) -> Result<(), Flee
         }),
         None => Err(FleetError::BadOutput {
             host: host.to_string(),
-            detail: format!("no version in {version_output:?}"),
+            detail: format!(
+                "no `sessionguard X.Y.Z` line in --version output; received: {}",
+                snippet(version_output)
+            ),
         }),
     }
 }
@@ -121,13 +147,13 @@ fn snippet(raw: &str) -> String {
 }
 
 /// Reject an `ssh` destination that begins with `-`. Such a value (e.g.
-/// `-oProxyCommand=...`) is placed on `ssh`'s argv with no `--` terminator,
-/// so ssh would consume it as an OPTION rather than a hostname — the one
-/// shape of a configured `HostSpec` that can cause command execution on
-/// THIS machine rather than the remote one. Checked before any process is
-/// spawned; an explicit check is used rather than relying on a `--`
-/// terminator, since ssh's getopt handling of `--` is undocumented in
-/// `ssh(1)` and varies across versions.
+/// `-oProxyCommand=...`) would be consumed by ssh as an OPTION rather than a
+/// hostname — the one shape of a configured `HostSpec` that can cause command
+/// execution on THIS machine rather than the remote one. Checked before any
+/// process is spawned. [`ssh`] additionally places a `--` terminator ahead of
+/// the destination (verified to end option parsing on OpenSSH); the explicit
+/// check stays because `ssh(1)` does not document `--`, so it is not relied
+/// on alone.
 fn check_destination(host: &HostSpec) -> Result<(), FleetError> {
     if host.ssh.starts_with('-') {
         return Err(FleetError::InvalidDestination {
@@ -138,11 +164,61 @@ fn check_destination(host: &HostSpec) -> Result<(), FleetError> {
     Ok(())
 }
 
+/// The remote `binary` is joined into a command line that the REMOTE shell
+/// parses, so it is restricted to a plain path: letters, digits, `_ - . / ~`
+/// (`~` so `~/.cargo/bin/sessionguard` expands there), never starting with
+/// `-`. Anything else — whitespace, `;`, `$`, quotes — could smuggle a second
+/// command onto the host, which would break the read-only guarantee of this
+/// module.
+fn check_binary(host: &HostSpec) -> Result<(), FleetError> {
+    let b = host.binary();
+    let plain = !b.is_empty()
+        && !b.starts_with('-')
+        && b.chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '-' | '.' | '/' | '~'));
+    if plain {
+        Ok(())
+    } else {
+        Err(FleetError::InvalidBinary {
+            host: host.name.clone(),
+            binary: b.to_string(),
+        })
+    }
+}
+
+/// Turn a non-zero exit into the error that says what actually happened.
+/// ssh reserves exit status 255 for its OWN failures (no route, refused key,
+/// timeout); any other status is the remote command's, and 127 in particular
+/// is the remote shell saying "command not found" — the host was reached,
+/// `sessionguard` just isn't on its non-interactive PATH.
+fn classify_failure(host: &str, code: Option<i32>, stderr: String) -> FleetError {
+    match code {
+        Some(255) | None => FleetError::Unreachable {
+            host: host.to_string(),
+            detail: stderr,
+        },
+        Some(127) => FleetError::RemoteFailed {
+            host: host.to_string(),
+            status: 127,
+            detail: format!(
+                "{stderr}; the remote login shell cannot find the binary — set \
+                 `binary = \"/absolute/path/to/sessionguard\"` for this host in config.toml"
+            ),
+        },
+        Some(c) => FleetError::RemoteFailed {
+            host: host.to_string(),
+            status: c,
+            detail: stderr,
+        },
+    }
+}
+
 /// Run one read-only command on a host. `ConnectTimeout` bounds only the
 /// *handshake*; `ServerAliveInterval`/`ServerAliveCountMax` bound the session
 /// after it, so a host that accepts the connection and then wedges (hung
 /// filesystem, suspended laptop, dropped route) tears down in ~30s instead of
-/// blocking `--all-hosts` indefinitely on one member of the fleet.
+/// blocking `--all-hosts` indefinitely on one member of the fleet. `--` ends
+/// ssh's option parsing before the destination.
 fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
     let out = std::process::Command::new("ssh")
         .args([
@@ -154,6 +230,7 @@ fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
             "ServerAliveInterval=10",
             "-o",
             "ServerAliveCountMax=3",
+            "--",
             &host.ssh,
         ])
         .args(remote_args)
@@ -163,21 +240,22 @@ fn ssh(host: &HostSpec, remote_args: &[&str]) -> Result<String, FleetError> {
             detail: e.to_string(),
         })?;
     if !out.status.success() {
-        return Err(FleetError::Unreachable {
-            host: host.name.clone(),
-            detail: String::from_utf8_lossy(&out.stderr).trim().to_string(),
-        });
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        return Err(classify_failure(&host.name, out.status.code(), stderr));
     }
     Ok(String::from_utf8_lossy(&out.stdout).to_string())
 }
 
 /// Census one remote host. Read-only: the only commands run there are
-/// `sessionguard --version` and `sessionguard sessions --format json`.
+/// `<binary> --version` and `<binary> sessions --format json`, where
+/// `<binary>` is the host's configured `sessionguard` path.
 pub fn remote_census(host: &HostSpec) -> Result<Vec<SessionGroup>, FleetError> {
     check_destination(host)?;
-    let version = ssh(host, &["sessionguard", "--version"])?;
+    check_binary(host)?;
+    let bin = host.binary();
+    let version = ssh(host, &[bin, "--version"])?;
     check_remote_version(&host.name, &version)?;
-    let json = ssh(host, &["sessionguard", "sessions", "--format", "json"])?;
+    let json = ssh(host, &[bin, "sessions", "--format", "json"])?;
     let mut groups = parse_remote_groups(&json, &host.name)?;
     adopt_host(&mut groups, &host.name);
     Ok(groups)
@@ -223,6 +301,93 @@ mod tests {
     }
 
     #[test]
+    fn remote_version_is_read_only_from_the_sessionguard_line() {
+        // A login shell's MOTD ahead of the real line must not be mistaken
+        // for the version — `Fedora 42.0.1` parses as a version triple.
+        assert!(check_remote_version(
+            "fedora",
+            "Welcome to Fedora 42.0.1\nLast login: today\nsessionguard 0.8.0\n"
+        )
+        .is_ok());
+        let e = check_remote_version("fedora", "Welcome to Fedora 42.0.1\n").unwrap_err();
+        assert!(matches!(e, FleetError::BadOutput { .. }), "{e}");
+        assert!(
+            e.to_string().contains("Fedora"),
+            "quotes what was received: {e}"
+        );
+        // ...and an old release on that same line is still TooOld, not lost.
+        let e = check_remote_version("fedora", "Fedora 42.0.1\nsessionguard 0.6.3").unwrap_err();
+        assert!(matches!(e, FleetError::TooOld { .. }), "{e}");
+    }
+
+    #[test]
+    fn remote_census_refuses_a_binary_that_is_not_a_plain_path() {
+        // The binary is parsed by the REMOTE shell; a value carrying a second
+        // command would break the module's read-only guarantee. Refused before
+        // ssh is ever spawned (marker file proves no local execution either).
+        let dir = tempfile::TempDir::new().unwrap();
+        let marker = dir.path().join("pwned");
+        for bad in [
+            format!("sessionguard; touch {}", marker.display()),
+            "$(id)".to_string(),
+            "-oProxyCommand=id".to_string(),
+            "".to_string(),
+        ] {
+            let host = HostSpec {
+                name: "h".into(),
+                ssh: "devo@192.0.2.10".into(),
+                binary: Some(bad.clone()),
+            };
+            let e = remote_census(&host).unwrap_err();
+            assert!(
+                matches!(e, FleetError::InvalidBinary { .. }),
+                "{bad:?}: {e}"
+            );
+        }
+        assert!(!marker.exists());
+        // Plain paths — including `~` — are accepted by the check itself.
+        for good in [
+            "sessionguard",
+            "/opt/homebrew/bin/sessionguard",
+            "~/.cargo/bin/sg-0.8",
+        ] {
+            let host = HostSpec {
+                name: "h".into(),
+                ssh: "devo@192.0.2.10".into(),
+                binary: Some(good.into()),
+            };
+            assert!(check_binary(&host).is_ok(), "{good}");
+        }
+    }
+
+    #[test]
+    fn exit_status_classification_separates_ssh_failures_from_remote_ones() {
+        let unreachable = classify_failure("h", Some(255), "Connection refused".into());
+        assert!(matches!(unreachable, FleetError::Unreachable { .. }));
+
+        let not_found = classify_failure("h", Some(127), "zsh:1: command not found".into());
+        match &not_found {
+            FleetError::RemoteFailed { status, detail, .. } => {
+                assert_eq!(*status, 127);
+                assert!(
+                    detail.contains("binary ="),
+                    "must point at the fix: {detail}"
+                );
+            }
+            other => panic!("expected RemoteFailed, got {other}"),
+        }
+        assert!(
+            !not_found.to_string().contains("unreachable"),
+            "a reached host must not be reported unreachable: {not_found}"
+        );
+
+        let other = classify_failure("h", Some(2), "usage error".into());
+        assert!(matches!(other, FleetError::RemoteFailed { status: 2, .. }));
+        let killed = classify_failure("h", None, "".into());
+        assert!(matches!(killed, FleetError::Unreachable { .. }));
+    }
+
+    #[test]
     fn remote_census_refuses_ssh_destination_that_looks_like_an_option() {
         // A destination beginning with `-` (e.g. `-oProxyCommand=...`) is
         // consumed by ssh as an OPTION, not a hostname — argv injection that
@@ -235,6 +400,7 @@ mod tests {
         let host = HostSpec {
             name: "evil".into(),
             ssh: format!("-oProxyCommand=touch {}", marker.display()),
+            binary: None,
         };
 
         let e = remote_census(&host).unwrap_err();

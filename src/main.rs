@@ -938,7 +938,18 @@ async fn main() -> Result<()> {
             let mut foreign_root = false;
             let mut host_failures = 0usize;
             let mut groups = if all_hosts {
-                let (mut all, f) = local_census(&config, home)?;
+                // The local census is one member of the fleet like any other:
+                // a broken user tool TOML here must not hide every remote
+                // host's rows. It is counted as a failed host, so the exit
+                // code still says the census is incomplete.
+                let (mut all, f) = match local_census(&config, home) {
+                    Ok(x) => x,
+                    Err(e) => {
+                        host_failures += 1;
+                        eprintln!("warning: local census failed: {e:#}");
+                        (Vec::new(), false)
+                    }
+                };
                 foreign_root = f;
                 for h in &config.hosts {
                     match sessionguard::fleet::remote_census(h) {
@@ -979,9 +990,27 @@ async fn main() -> Result<()> {
                 groups.retain(|g| g.tools.contains_key(t));
             }
             if let Some(p) = &project {
-                let canonical = std::fs::canonicalize(p).unwrap_or_else(|_| p.clone());
-                let want = canonical.display().to_string();
-                groups.retain(|g| g.project_path == want);
+                // Stores record the path the TOOL saw, which may be the
+                // non-canonical spelling (through a symlink, or `/var/...`
+                // rather than `/private/var/...` on macOS). Accept the
+                // operator's spelling as given (trailing slash aside), its
+                // canonical form, and the canonical form of what they typed.
+                let raw = p.display().to_string();
+                let trimmed = if raw.len() > 1 {
+                    raw.trim_end_matches('/').to_string()
+                } else {
+                    raw.clone()
+                };
+                let canonical = std::fs::canonicalize(p)
+                    .map(|c| c.display().to_string())
+                    .unwrap_or_else(|_| trimmed.clone());
+                groups.retain(|g| {
+                    g.project_path == trimmed
+                        || g.project_path == canonical
+                        || std::fs::canonicalize(&g.project_path)
+                            .map(|c| c.display().to_string() == canonical)
+                            .unwrap_or(false)
+                });
             }
 
             match format {
@@ -992,23 +1021,23 @@ async fn main() -> Result<()> {
                     println!("no sessions found.");
                 }
                 sessionguard::cli::Format::Text => {
+                    use sessionguard::sessions::DecodeConfidence as C;
                     let orphan_count = groups.iter().filter(|g| g.orphaned).count();
+                    let mut any_marker = false;
                     for g in &groups {
-                        let mut markers = String::new();
-                        if g.orphaned
-                            && g.confidence == sessionguard::sessions::DecodeConfidence::Exact
-                        {
-                            markers.push_str("  [ORPHANED]");
-                        }
-                        match g.confidence {
-                            sessionguard::sessions::DecodeConfidence::Inferred if g.orphaned => {
-                                markers.push_str("  [ORPHANED?]")
-                            }
-                            sessionguard::sessions::DecodeConfidence::Unresolved => {
-                                markers.push_str("  [ENCODED NAME]")
-                            }
-                            _ => {}
-                        }
+                        // Every (confidence, orphaned) state has a marker, so
+                        // a row's absence of one always means "resolved and
+                        // live" — including states this binary never produces
+                        // locally but a remote host's payload can carry.
+                        let markers = match (g.confidence, g.orphaned) {
+                            (C::Exact, false) => "",
+                            (C::Exact, true) => "  [ORPHANED]",
+                            (C::Inferred, false) => "  [INFERRED]",
+                            (C::Inferred, true) => "  [ORPHANED?]",
+                            (C::Unresolved, false) => "  [ENCODED NAME]",
+                            (C::Unresolved, true) => "  [ENCODED NAME] [ORPHANED?]",
+                        };
+                        any_marker |= !markers.is_empty();
                         let host_prefix = if g.host != "local" {
                             format!("[{}] ", g.host)
                         } else {
@@ -1038,6 +1067,13 @@ async fn main() -> Result<()> {
                         println!(
                             "{orphan_count} orphaned (project dir gone) — list with \
                              `sessionguard sessions --orphans`."
+                        );
+                    }
+                    if any_marker {
+                        println!(
+                            "markers: [ORPHANED] path confirmed, dir gone · [ORPHANED?] path \
+                             is a best guess, dir gone · [INFERRED] path is a best guess · \
+                             [ENCODED NAME] raw store name, undecodable"
                         );
                     }
                 }
@@ -1401,6 +1437,15 @@ fn local_census(
     let real_home = directories::BaseDirs::new().map(|d| d.home_dir().to_owned());
     let (root, foreign_root) = match home {
         Some(h) => {
+            // A root that isn't there (typo, volume not mounted) must not be
+            // censused as an empty foreign home: `no sessions found.` with
+            // exit 0 is exactly what a genuinely empty home prints.
+            if !h.is_dir() {
+                anyhow::bail!(
+                    "--home {}: not a directory (mistyped, or the volume is not mounted?)",
+                    h.display()
+                );
+            }
             // Compare canonicalized where possible so `--home ~` (or a path
             // through a symlink) is correctly recognized as the real home.
             let canon = |p: &std::path::Path| std::fs::canonicalize(p).unwrap_or(p.to_path_buf());
@@ -1413,10 +1458,24 @@ fn local_census(
         },
     };
     let tool_registry = ToolRegistry::new_with_config(config)?;
-    let stores: Vec<(String, sessionguard::tools::SessionStore)> = tool_registry
-        .all()
-        .filter_map(|t| t.session_store.clone().map(|s| (t.name.clone(), s)))
-        .collect();
+    // Env discovery (CODEX_HOME & co.) describes THIS machine's layout, so it
+    // is consulted only for a census of this machine's own home.
+    let env = |var: &str| std::env::var(var).ok();
+    let stores = sessionguard::sessions::resolve_stores(
+        tool_registry.all(),
+        if foreign_root { None } else { Some(&env) },
+    );
+    if foreign_root {
+        for (tool, store) in &stores {
+            if !store.path().starts_with('~') {
+                eprintln!(
+                    "warning: tool `{tool}` declares the absolute session_store path {}; it \
+                     is read as-is on this machine, not re-rooted under --home",
+                    store.path()
+                );
+            }
+        }
+    }
     Ok((
         sessionguard::sessions::census(&root, &stores, foreign_root),
         foreign_root,

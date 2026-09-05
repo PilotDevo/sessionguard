@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.8.0** — Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.8 makes session storage **data, not code**: a `[tool.session_store]` TOML schema declares where each tool's sessions live and how they're keyed, `sessions.rs` reads from those declarations instead of hardcoded paths, decode confidence (`exact`/`inferred`/`unresolved`) makes deleted Claude Code projects detectable as orphans for the first time, and `sessions --home/--host/--all-hosts` extends the census to another root or across an ssh fleet. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`; v0.7 added the per-project `sessions` census. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.8.1** — v0.8.1 is the post-merge review patch for the v0.8 census: live projects with `_`, `.` or spaces in their path no longer show as orphans (Claude Code transcripts record the real path, and the census now reads it), plus glob, `--home`, `--project`, OpenCode-timestamp and fleet-error fixes — see [CHANGELOG.md](CHANGELOG.md). Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.8 makes session storage **data, not code**: a `[tool.session_store]` TOML schema declares where each tool's sessions live and how they're keyed, `sessions.rs` reads from those declarations instead of hardcoded paths, decode confidence (`exact`/`inferred`/`unresolved`) makes deleted Claude Code projects detectable as orphans for the first time, and `sessions --home/--host/--all-hosts` extends the census to another root or across an ssh fleet. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`; v0.7 added the per-project `sessions` census. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -304,7 +304,16 @@ ssh = "me@192.0.2.10"
 [[hosts]]
 name = "workstation"
 ssh = "me@workstation.local"
+# The remote command runs through that host's NON-interactive shell, whose
+# PATH often lacks Homebrew's or cargo's bin dir. If `--host workstation`
+# reports `remote command exited 127`, name the binary explicitly:
+binary = "/opt/homebrew/bin/sessionguard"
 ```
+
+`name` is how you refer to the host (`local` is reserved for this machine);
+`ssh` is passed to `ssh` verbatim, so anything your `~/.ssh/config` resolves
+works. Hosts are censused in `BatchMode`, so key-based auth must already be
+set up — SessionGuard never prompts for or stores a password.
 
 Tool patterns can also be placed as individual TOML files in `~/.config/sessionguard/tools/`.
 
