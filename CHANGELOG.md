@@ -2,6 +2,82 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.8.1] - 2026-09-05
+
+### Fixed — post-merge review of the v0.8.0 patch
+
+A ten-angle code review of v0.7.0..v0.8.0 (line-by-line, removed behaviour,
+cross-file, adapters, efficiency, conventions, altitude, Rust pitfalls, …)
+converged on one regression and a set of silent-zero edge cases in the new
+census. Everything below is read-only census behaviour except where noted.
+
+- **Live projects with `_`, `.` or a space in their path were reported as
+  orphans** (the v0.8.0 regression: `…/work/my-app  [ORPHANED?]` for a live
+  `~/work/my_app`, and `--orphans` would have steered cleanup at it). Claude
+  Code encodes a store directory by replacing *every* non-alphanumeric
+  character with `-`, not just `/`, so the 0.8.0 decoder — literal joins
+  validated against the filesystem — could never match such a name and
+  folded it onto the parent as a best-guess orphan. Two fixes:
+  1. `encoded_dir` stores can declare a **key hint** (`key_glob` +
+     `key_field`). The Claude Code builtin declares `*.jsonl` / `cwd`: the
+     literal path each transcript records is read (bounded scan of the
+     leading lines, newest file first, cross-checked against the directory
+     name so a stray file cannot re-key a directory) and the directory name
+     is never decoded when a transcript is present. On real stores 9 of 10
+     transcripts carry it within the first 22 lines.
+  2. The name decoder is **encoding-aware**: at each level it also accepts a
+     real child directory whose *encoding* equals the next segment(s), so
+     hint-less directories for `my_app`, `app.v2`, `LARS Docs` and `.config`
+     decode `Exact`. A name that two live directories both encode to
+     (`my_app` beside `my-app`) is `Inferred`, not silently one of them.
+- **`--home` (a foreign root) validated names against the local
+  filesystem** — the wrong one. A key hint now yields the recorded path;
+  everything else is a naive decode shown as `[INFERRED]`. A `--home` that
+  does not exist is an error instead of an empty census exiting 0.
+- **Codex sessions silently missing** when `$HOME`/`--home`/a declared path
+  contained a glob metacharacter (`[`, `*`, `?`) or the declaration ended in
+  `/`: the glob is matched against each file's path relative to the store
+  root instead of being spliced together with the root.
+- **`--project` never matched the path `sessions` itself printed** on macOS
+  (`/var/…` vs `/private/var/…`) or through a symlink; it accepts the
+  recorded spelling, a trailing slash and the canonical form.
+- **OpenCode rows were dropped** when `time_updated` held a TEXT or REAL
+  value; a seconds-declared column whose values can only be milliseconds is
+  read as ms with one warning instead of every session showing `0s ago`.
+- **Fleet: a reachable host whose login shell could not find `sessionguard`
+  was reported "unreachable".** ssh's own failures (exit 255) are now told
+  apart from the remote command's status; exit 127 says so and points at the
+  new per-host `binary = "/absolute/path"` option. `--version` is parsed
+  only from a `sessionguard X.Y.Z` line (an MOTD's `Fedora 42.0.1` no longer
+  passes as the version). `--` precedes the ssh destination in addition to
+  the leading-`-` refusal, and `binary` is restricted to a plain path before
+  it reaches the remote shell.
+- **`--all-hosts` died on a local failure** (a broken user tool TOML) before
+  censusing any remote host; the local census is one member of the fleet —
+  its failure is a warning that counts toward the incomplete exit code.
+- **A user/project tool override written before 0.8 silently dropped the
+  builtin's `session_store`** (and `home_dir_layout`/`binary`):
+  `ToolRegistry::register` inherits those blocks when the override omits
+  them.
+- **Store declarations are validated at load** — empty `separator`,
+  unparseable glob, half-declared key hint, unsafe SQL `table`/`path_column`,
+  empty `path` — with the offending file named, instead of censusing zero
+  sessions silently. `[[hosts]]` is validated too: the name `local` is
+  reserved, duplicates and empty fields are rejected.
+- **Env-discovered stores are honoured**: after `sessionguard migrate codex`
+  sets `CODEX_HOME`, `sessions` reads `$CODEX_HOME/sessions` (local census
+  only; another machine's layout is not this machine's environment).
+- **Dashboard**: `confidence` is derived from `decoded` for 0.7.x binaries
+  instead of defaulting to `exact`; an Inferred orphan renders `orphaned?`,
+  never the confirmed `orphaned`; the Activity table grows a column for any
+  user-declared store and shows fleet host provenance.
+- Text output: every `(confidence, orphaned)` state has a marker
+  (`[INFERRED]` is new) and a legend explains them. JSONL first-line reads
+  are bounded (64 KiB); the store-walk cap warns when hit. `claude_code` and
+  `gemini_cli` declare `on_move = "notify"` — no in-project path field exists
+  to rewrite, so `rewrite_paths` was a no-op claim. A failed symlink install
+  during `migrate` now reports whether the original was actually moved back.
+
 ## [0.8.0] - 2026-09-01
 
 ### Added — session-store model, wave 1: stores as data, fleet census, decode confidence
