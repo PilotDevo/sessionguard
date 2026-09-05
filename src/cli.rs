@@ -191,7 +191,10 @@ pub enum Command {
         #[arg(long)]
         project: Option<PathBuf>,
         /// Census this directory as the home root instead of $HOME (e.g. a
-        /// mounted or rsync'd home from another machine).
+        /// mounted or rsync'd home from another machine). Note: orphan status
+        /// is not evaluated for a foreign root, since orphan detection requires
+        /// the filesystem where sessions actually live. Use `--host` or
+        /// `--all-hosts` for cross-machine orphan detection.
         #[arg(long)]
         home: Option<PathBuf>,
         /// Census a configured host instead of this machine.

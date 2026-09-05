@@ -161,7 +161,11 @@ sessionguard sessions --format json      # what the dashboard's Activity tab con
 sessionguard sessions --tool codex       # only groups with sessions for one tool
 sessionguard sessions --project ~/work/x # only the group for one project dir
 
-# Census an arbitrary root instead of $HOME — e.g. a mounted or rsync'd home
+# Census an arbitrary root instead of $HOME — e.g. a mounted or rsync'd home.
+# Note: orphan status is not evaluated for a foreign root, since orphan
+# detection requires knowing which projects still exist on the machine the
+# sessions came from. Use `--host` or `--all-hosts` for cross-machine orphan
+# detection (they compute the verdict on the host where sessions live).
 sessionguard sessions --home /mnt/old-mac-home
 
 # Census one or every configured fleet host over ssh (see [[hosts]] below).
