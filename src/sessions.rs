@@ -538,7 +538,7 @@ fn read_encoded_dir(
 
         let mut hinted = None;
         if let Some((_, field)) = &hint {
-            hint_files.sort_by(|a, b| b.0.cmp(&a.0));
+            hint_files.sort_by_key(|(mtime, _)| std::cmp::Reverse(*mtime));
             for (_, p) in hint_files.iter().take(HINT_FILES) {
                 if let Some(cwd) = jsonl_find_field(p, &[field], HINT_LINES, HINT_BYTES) {
                     if hint_consistent(&cwd, &name, separator) {
