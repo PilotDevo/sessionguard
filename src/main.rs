@@ -1097,9 +1097,26 @@ async fn main() -> Result<()> {
             last,
             id,
             migration,
+            rekey,
             dry_run,
         } => {
             let event_log = EventLog::open_default()?;
+
+            // Store re-keys, like migrations, are their own kind of undoable
+            // work; `--rekey <id>` targets one, and a bare `undo` falls back
+            // to the newest pending one after migrations.
+            let target_rekey = if let Some(rid) = rekey {
+                Some(
+                    event_log
+                        .get_rekey(rid)?
+                        .ok_or_else(|| anyhow::anyhow!("no re-key with id {rid}"))?,
+                )
+            } else {
+                None
+            };
+            if let Some(entry) = target_rekey {
+                return undo_one_rekey(&event_log, entry, dry_run);
+            }
 
             // Resolve which migration (if any) this invocation targets:
             //  --migration <id>  → that specific migration
@@ -1173,6 +1190,15 @@ async fn main() -> Result<()> {
                 return Ok(());
             }
 
+            // A bare `undo` with no in-project events pending should still
+            // reverse the last store re-key — for the store-bearing tools
+            // that IS the reconcile, so "undo the last thing" must mean it.
+            if id.is_none() {
+                if let Some(entry) = event_log.latest_pending_rekey()? {
+                    return undo_one_rekey(&event_log, entry, dry_run);
+                }
+            }
+
             let entries = match id {
                 Some(event_id) => vec![event_log
                     .get(event_id)?
@@ -1226,6 +1252,94 @@ async fn main() -> Result<()> {
                 if !dry_run {
                     println!("\n{undone} undone, {failed} failed");
                 }
+            }
+        }
+
+        Command::Rekey {
+            from,
+            to,
+            tool,
+            dry_run,
+        } => {
+            let home = sessionguard::config::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine your home directory"))?;
+            let tool_registry = ToolRegistry::new_with_config(&config)?;
+            let env = |var: &str| std::env::var(var).ok();
+            let mut stores =
+                sessionguard::sessions::resolve_stores(tool_registry.all(), Some(&env));
+            if let Some(t) = &tool {
+                stores.retain(|(name, _)| name == t);
+                if stores.is_empty() {
+                    anyhow::bail!(
+                        "tool `{t}` is not registered or declares no [tool.session_store]; \
+                         `sessionguard tools list` shows what is available"
+                    );
+                }
+            }
+
+            // Re-keying onto a path that isn't there just relocates the
+            // orphan. Warn rather than refuse: re-keying ahead of a move is
+            // legitimate, and `--dry-run` must stay explorable.
+            if !to.is_dir() {
+                eprintln!(
+                    "warning: {} is not a directory — re-keying onto a path that does not \
+                     exist will leave these sessions orphaned there",
+                    to.display()
+                );
+            }
+
+            let event_log = EventLog::open_default()?;
+            let reports = sessionguard::rekey::rekey_all(
+                &home,
+                &stores,
+                &from,
+                &to,
+                Some(&event_log),
+                dry_run,
+            );
+
+            let mut planned = 0usize;
+            let mut applied = 0usize;
+            let mut refused = 0usize;
+            for r in &reports {
+                if let Some(e) = &r.error {
+                    println!("{}: REFUSED\n  {e}", r.tool);
+                    refused += 1;
+                    continue;
+                }
+                if r.plan.is_empty() {
+                    continue;
+                }
+                planned += 1;
+                println!(
+                    "{}: {} action(s){}",
+                    r.tool,
+                    r.plan.actions.len(),
+                    match r.log_id {
+                        Some(id) => format!("  (undo with `sessionguard undo --rekey {id}`)"),
+                        None => String::new(),
+                    }
+                );
+                for action in &r.plan.actions {
+                    println!("  - {}", action.describe());
+                }
+                if r.applied {
+                    applied += 1;
+                }
+            }
+
+            if planned == 0 && refused == 0 {
+                println!(
+                    "no sessions reference {} — nothing to re-key.",
+                    from.display()
+                );
+            } else if dry_run {
+                println!("\n--dry-run: nothing changed.");
+            } else {
+                println!("\n{applied} store(s) re-keyed to {}.", to.display());
+            }
+            if refused > 0 && !dry_run {
+                anyhow::bail!("{refused} store(s) refused (see above); they were not re-keyed");
             }
         }
 
@@ -1419,6 +1533,42 @@ fn spawn_background_daemon(config_path: Option<&std::path::Path>) -> Result<()> 
         child.id(),
         log_path.display()
     );
+    Ok(())
+}
+
+/// Reverse one recorded store re-key. The stored `undo_plan` is already the
+/// inverse, so undoing is just applying it — the same code path, which is why
+/// the reversal is as trustworthy as the original.
+fn undo_one_rekey(
+    event_log: &EventLog,
+    entry: sessionguard::event_log::RekeyLogEntry,
+    dry_run: bool,
+) -> Result<()> {
+    if entry.undone_at.is_some() {
+        println!("re-key {} was already undone", entry.id);
+        return Ok(());
+    }
+    let plan: sessionguard::rekey::RekeyPlan = serde_json::from_str(&entry.undo_plan)
+        .map_err(|e| anyhow::anyhow!("re-key {} has a corrupt undo plan: {e}", entry.id))?;
+
+    println!(
+        "{} re-key {} ({}: {} -> {}):",
+        if dry_run { "would undo" } else { "undoing" },
+        entry.id,
+        entry.tool_name,
+        entry.new_path,
+        entry.old_path
+    );
+    for action in &plan.actions {
+        println!("  - {}", action.describe());
+    }
+    if dry_run {
+        println!("\n--dry-run: nothing changed.");
+        return Ok(());
+    }
+    sessionguard::rekey::apply(&plan).map_err(|f| anyhow::anyhow!("undo failed: {}", f.error))?;
+    event_log.mark_rekey_undone(entry.id)?;
+    println!("\nre-key {} undone", entry.id);
     Ok(())
 }
 

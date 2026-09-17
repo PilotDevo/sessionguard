@@ -87,7 +87,7 @@ impl Default for Config {
 }
 
 fn default_watch_roots() -> Vec<PathBuf> {
-    let home = dirs_home().unwrap_or_default();
+    let home = home_dir().unwrap_or_default();
     ["projects", "repos", "code", "dev"]
         .iter()
         .map(|d| home.join(d))
@@ -95,7 +95,9 @@ fn default_watch_roots() -> Vec<PathBuf> {
         .collect()
 }
 
-fn dirs_home() -> Option<PathBuf> {
+/// This machine's home directory. One resolution site, so the daemon, the
+/// census and the re-key engine can't disagree about what `$HOME` is.
+pub fn home_dir() -> Option<PathBuf> {
     directories::BaseDirs::new().map(|d| d.home_dir().to_owned())
 }
 

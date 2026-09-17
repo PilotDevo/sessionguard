@@ -102,7 +102,7 @@ pub struct SessionGroup {
 
 /// Expand a leading `~` against `home`. Declarations use `~` so the same TOML
 /// works for any user and any census root (including a mounted remote home).
-fn expand(home: &Path, raw: &str) -> PathBuf {
+pub fn expand_home(home: &Path, raw: &str) -> PathBuf {
     match raw.strip_prefix("~/") {
         Some(rest) => home.join(rest),
         None if raw == "~" => home.to_path_buf(),
@@ -218,7 +218,7 @@ pub fn census(
                 key_glob,
                 key_field,
             } => read_encoded_dir(
-                &expand(home, path),
+                &expand_home(home, path),
                 separator,
                 key_glob.as_deref(),
                 key_field.as_deref(),
@@ -232,7 +232,7 @@ pub fn census(
                 key_field,
                 fallback_field,
             } => read_jsonl_field(
-                &expand(home, path),
+                &expand_home(home, path),
                 glob,
                 key_field,
                 fallback_field.as_deref(),
@@ -247,7 +247,7 @@ pub fn census(
                 updated_unit,
                 archived_column,
             } => read_sqlite_column(
-                &expand(home, path),
+                &expand_home(home, path),
                 table,
                 path_column,
                 updated_column.as_deref(),
@@ -607,18 +607,56 @@ fn read_jsonl_field(
     tool: &str,
     absorb: &mut impl FnMut(String, DecodeConfidence, &str, ToolSessions),
 ) {
-    if !base.is_dir() {
-        return;
+    let (files, hit_cap) = walk_store_files(base, pattern, SESSION_WALK_CAP);
+    if hit_cap {
+        tracing::warn!(
+            tool,
+            store = %base.display(),
+            cap = SESSION_WALK_CAP,
+            "session store walk hit its entry cap; this store's census is incomplete"
+        );
     }
-    let matcher = match glob::Pattern::new(pattern) {
-        Ok(m) => m,
-        Err(e) => {
-            tracing::warn!(tool, glob = pattern, %e, "invalid session_store glob; skipping store");
-            return;
-        }
-    };
     let mut fields = vec![key_field];
     fields.extend(fallback_field);
+
+    for (p, meta) in files {
+        let Some(cwd) = jsonl_find_field(&p, &fields, 1, FIRST_LINE_BYTES) else {
+            continue;
+        };
+        absorb(
+            cwd,
+            DecodeConfidence::Exact,
+            tool,
+            ToolSessions {
+                count: 1,
+                bytes: meta.len(),
+                last_active_unix: unix_mtime(&meta),
+            },
+        );
+    }
+}
+
+/// Collect the files under `base` matching `pattern`, with their metadata,
+/// plus whether the walk hit `cap`.
+///
+/// Shared by the census and by [`crate::rekey`] so a store is enumerated
+/// exactly one way: same symlink handling, same glob semantics, same bound.
+/// See [`read_jsonl_field`] for why the walk is hand-rolled rather than
+/// `glob::glob` (symlink cycles) and why `pattern` is matched against each
+/// path RELATIVE to `base` (metacharacters in the root).
+pub fn walk_store_files(
+    base: &Path,
+    pattern: &str,
+    cap: usize,
+) -> (Vec<(PathBuf, std::fs::Metadata)>, bool) {
+    let mut out = Vec::new();
+    if !base.is_dir() {
+        return (out, false);
+    }
+    let Ok(matcher) = glob::Pattern::new(pattern) else {
+        tracing::warn!(glob = pattern, "invalid session_store glob; skipping store");
+        return (out, false);
+    };
 
     let mut visited = 0usize;
     let mut stack = vec![base.to_path_buf()];
@@ -628,14 +666,8 @@ fn read_jsonl_field(
         };
         for entry in entries.flatten() {
             visited += 1;
-            if visited > SESSION_WALK_CAP {
-                tracing::warn!(
-                    tool,
-                    store = %base.display(),
-                    cap = SESSION_WALK_CAP,
-                    "session store walk hit its entry cap; this store's census is incomplete"
-                );
-                return;
+            if visited > cap {
+                return (out, true);
             }
             // Does not follow symlinks — see the note above.
             let Ok(meta) = entry.metadata() else { continue };
@@ -648,21 +680,10 @@ fn read_jsonl_field(
             if !meta.is_file() || !matcher.matches_path(rel) {
                 continue;
             }
-            let Some(cwd) = jsonl_find_field(&p, &fields, 1, FIRST_LINE_BYTES) else {
-                continue;
-            };
-            absorb(
-                cwd,
-                DecodeConfidence::Exact,
-                tool,
-                ToolSessions {
-                    count: 1,
-                    bytes: meta.len(),
-                    last_active_unix: unix_mtime(&meta),
-                },
-            );
+            out.push((p, meta));
         }
     }
+    (out, false)
 }
 
 /// Scan up to `max_lines` leading lines of a JSONL file — reading at most

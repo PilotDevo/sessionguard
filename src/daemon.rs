@@ -272,6 +272,42 @@ async fn reload_signal() {
 /// new location, reconciles each tool's artifacts, updates the registry.
 /// Errors are logged in place — this function never fails. Partial move events
 /// (missing `from` or `to`) are silently skipped.
+/// Re-key every declared session store from `old_path` to `new_path`.
+///
+/// This is the reconcile that matters for Claude Code, Codex and OpenCode:
+/// none of them keep the project path inside the project, so rewriting
+/// in-project files moves nothing for them. Failures are logged, never fatal —
+/// a daemon that dies on one unhappy store stops watching everything else.
+fn rekey_stores(
+    tool_registry: &crate::tools::ToolRegistry,
+    old_path: &std::path::Path,
+    new_path: &std::path::Path,
+    event_log: &crate::event_log::EventLog,
+) {
+    let Some(home) = crate::config::home_dir() else {
+        warn!("cannot resolve home directory; session stores not re-keyed");
+        return;
+    };
+    let env = |var: &str| std::env::var(var).ok();
+    let stores = crate::sessions::resolve_stores(tool_registry.all(), Some(&env));
+    for report in
+        crate::rekey::rekey_all(&home, &stores, old_path, new_path, Some(event_log), false)
+    {
+        match (&report.error, report.applied) {
+            (Some(e), _) => warn!(tool = %report.tool, "session store not re-keyed: {e}"),
+            (None, true) => info!(
+                tool = %report.tool,
+                actions = report.plan.actions.len(),
+                undo_id = ?report.log_id,
+                "session store re-keyed to the new project path"
+            ),
+            (None, false) => {
+                tracing::debug!(tool = %report.tool, "no sessions for this project")
+            }
+        }
+    }
+}
+
 fn handle_session_event(
     event: crate::watcher::SessionEvent,
     registry: &crate::registry::Registry,
@@ -314,6 +350,16 @@ fn handle_session_event(
                     }
                 }
             }
+
+            // Re-key the home-dir session stores.
+            //
+            // Deliberately driven by the STORE declarations rather than by
+            // `detected` above: `detect_tools` scans the project directory,
+            // but a `session_store` lives under `$HOME`, so the two answer
+            // different questions. A project can have a year of Claude Code
+            // history and not a single `.claude/` file inside it — gating on
+            // detection would skip exactly the sessions that need re-keying.
+            rekey_stores(tool_registry, &old_path, &new_path, event_log);
 
             // Update registry: re-register under new path and drop old entry
             match registry.register_project(&new_path) {

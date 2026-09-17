@@ -67,6 +67,31 @@ pub struct MigrationLogEntry {
 }
 
 /// Structured event log backed by SQLite.
+/// One recorded store re-key. `undo_plan` is opaque here — see
+/// [`EventLog::record_rekey`].
+#[derive(Debug, Clone)]
+pub struct RekeyLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub tool_name: String,
+    pub old_path: String,
+    pub new_path: String,
+    pub undo_plan: String,
+    pub undone_at: Option<String>,
+}
+
+fn row_to_rekey(row: &rusqlite::Row) -> rusqlite::Result<RekeyLogEntry> {
+    Ok(RekeyLogEntry {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        tool_name: row.get(2)?,
+        old_path: row.get(3)?,
+        new_path: row.get(4)?,
+        undo_plan: row.get(5)?,
+        undone_at: row.get(6)?,
+    })
+}
+
 pub struct EventLog {
     conn: Connection,
 }
@@ -174,6 +199,29 @@ impl EventLog {
         // created by v0.4.0 before this column existed (the events-table
         // pattern; see `add_column_if_missing`).
         self.add_column_if_missing("migrations", "cleaned_at", "TEXT")?;
+
+        // Step 6: store re-key log — one row per `sessionguard rekey` or per
+        // store re-keyed by the daemon on a project move. Its own table for
+        // the same reason `migrations` has one: a re-key is a coarse,
+        // multi-step operation over a store OUTSIDE the project, not a single
+        // in-project field rewrite, and it must not be swept up by
+        // `migrate-cleanup`'s view of pending migrations. `undo_plan` is an
+        // opaque JSON blob (a serialized `rekey::RekeyPlan`), keeping this
+        // module free of any dependency on the re-key engine's types.
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS rekeys (
+                id          INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp   TEXT NOT NULL DEFAULT (datetime('now')),
+                tool_name   TEXT NOT NULL,
+                old_path    TEXT NOT NULL,
+                new_path    TEXT NOT NULL,
+                undo_plan   TEXT NOT NULL,
+                undone_at   TEXT
+            );
+            CREATE INDEX IF NOT EXISTS idx_rekeys_undone ON rekeys(undone_at);
+            ",
+        )?;
         Ok(())
     }
 
@@ -290,6 +338,60 @@ impl EventLog {
     /// Record a completed migration. `undo_plan` is an opaque JSON blob
     /// (a serialized `migrate::MigrationUndo`) used later by undo.
     /// Returns the new row id.
+    /// Record an applied store re-key. `undo_plan` is an opaque JSON blob
+    /// (a serialized `rekey::RekeyPlan` that reverses it).
+    pub fn record_rekey(
+        &self,
+        tool_name: &str,
+        old_path: &str,
+        new_path: &str,
+        undo_plan: &str,
+    ) -> Result<i64> {
+        self.conn.execute(
+            "INSERT INTO rekeys (tool_name, old_path, new_path, undo_plan)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![tool_name, old_path, new_path, undo_plan],
+        )?;
+        Ok(self.conn.last_insert_rowid())
+    }
+
+    /// Most recent re-keys, newest first.
+    pub fn recent_rekeys(&self, limit: usize) -> Result<Vec<RekeyLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, tool_name, old_path, new_path, undo_plan, undone_at
+             FROM rekeys ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], row_to_rekey)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// The newest re-key that has not been undone.
+    pub fn latest_pending_rekey(&self) -> Result<Option<RekeyLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, tool_name, old_path, new_path, undo_plan, undone_at
+             FROM rekeys WHERE undone_at IS NULL ORDER BY id DESC LIMIT 1",
+        )?;
+        let mut rows = stmt.query_map([], row_to_rekey)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    pub fn get_rekey(&self, id: i64) -> Result<Option<RekeyLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, tool_name, old_path, new_path, undo_plan, undone_at
+             FROM rekeys WHERE id = ?1",
+        )?;
+        let mut rows = stmt.query_map([id], row_to_rekey)?;
+        rows.next().transpose().map_err(Into::into)
+    }
+
+    pub fn mark_rekey_undone(&self, id: i64) -> Result<()> {
+        self.conn.execute(
+            "UPDATE rekeys SET undone_at = datetime('now') WHERE id = ?1",
+            params![id],
+        )?;
+        Ok(())
+    }
+
     pub fn record_migration(
         &self,
         tool_name: &str,

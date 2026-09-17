@@ -281,9 +281,28 @@ bindings; `--home`, `[[hosts]]`, `--host`/`--all-hosts` with provenance and
 origin-host orphan evaluation; decode confidence; honesty patch. No mutation of
 session data anywhere, so the risk ceiling is a wrong report.
 
-**Wave 2 — mutation.** Store re-keying for all three layouts, with dry-run,
-event-log records, `undo`, and the refusal rules. The riskiest wave; it lands
-alone.
+**Wave 2 — mutation. SHIPPED in v0.9.0** (`src/rekey.rs`). Store re-keying for
+all three layouts, with dry-run, event-log records, `undo`, and the refusal
+rules, wired into the daemon's move handler and exposed as `sessionguard
+rekey`. Two things the design above did not anticipate:
+
+- **`encoded_dir` is two operations, not one.** v0.8.1 added the key hint, so
+  the store is keyed by the directory name *and* by the `cwd` recorded inside
+  its transcripts — and the census trusts the recorded path over the name.
+  Renaming alone would let the census read the old path straight back out of
+  the renamed directory, silently undoing the re-key. Both keys move together.
+- **The daemon drives re-keying from the store declarations, not from
+  `detect_tools`.** Detection scans the *project* directory; a `session_store`
+  lives under `$HOME`. A project can have a year of Claude Code history and
+  not one `.claude/` file inside it, so gating on detection would have skipped
+  exactly the sessions that needed moving.
+
+Value rewrites match the whole JSON token (quoted and escaped) rather than the
+bare path, so `/work/app` cannot rewrite inside `/work/app-two`, and only the
+*key* moves — path references inside message bodies are a record of what
+happened, not a key. A failure partway through one store rolls that store
+back; stores are otherwise independent, so a refusal on one does not block the
+others.
 
 **Wave 3 — control.** A2A live-session detection; `sessions archive` for
 orphans (rename-aside, undoable, never delete).
@@ -423,4 +442,20 @@ which made the right fix a *model* change rather than a better heuristic:
 - `read_jsonl_field` recursion vs. glob pruning; symlinked session files
   skipped; `tools list --verbose` not showing `session_store`; the remaining
   T3/T5/T6 items above.
-- Store re-keying itself (the reason Wave 2 exists) — see "Store re-keying".
+- ~~Store re-keying itself~~ — shipped in v0.9.0; see "Waves" above.
+
+### Known limits of v0.9.0 re-keying (candidates for wave 3)
+
+- **Only the declared key moves.** A Claude Code store directory can hold
+  subdirectories (`memory/`, per-session dirs) whose contents are not scanned;
+  the directory travels with the rename, but any path reference *inside* those
+  files is left as-is. Fine for re-keying (they aren't keys) — revisit if a
+  tool starts keying from one.
+- **No live-session refusal.** The design called for refusing when a live
+  Claude Code session still references the old path. That needs the A2A peer
+  registry, which is wave 3; today a re-key during an active session can leave
+  that session writing to the old directory until it restarts.
+- **`--dry-run` cost.** Planning counts occurrences, which reads every
+  candidate file in full. On a multi-GB store that is real I/O; acceptable
+  because it buys an honest blast-radius number, but a size-bounded estimate
+  would be cheaper.

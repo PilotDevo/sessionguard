@@ -6,7 +6,26 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.8.0 (current)** — Session-store model, wave 1: where a
+**v0.9.0 (current)** — Session-store model, wave 2: **store re-keying** —
+the reconcile that was missing. v0.8's census proved the shape of the problem
+and v0.8.1's honesty patch named it out loud (`claude_code` and `gemini_cli`
+became `on_move = "notify"`, i.e. "we see the move and do nothing"): Claude
+Code, Codex and OpenCode keep no project path inside the project, so the
+v0.1 in-project reconciler moved nothing for them and a project move stranded
+every session it had. `sessionguard rekey <from> <to>` — and the daemon,
+automatically, on a move — now re-keys each declared `[tool.session_store]`:
+the Claude Code store directory is renamed **and** the `cwd` recorded inside
+its transcripts is rewritten (v0.8.1's key hint made the store keyed twice, so
+renaming alone would let the census read the old path straight back out),
+Codex's field is rewritten, OpenCode's rows updated. Planned before applied
+(`--dry-run` states the exact blast radius), recorded in the event log,
+reversible with `undo`, and it **refuses** rather than guesses when the
+destination store exists (merging two histories) or a database is locked.
+Verified on a real 27 MB Claude Code transcript: re-key → undo is
+byte-for-byte identical. Wave 3 (A2A live-session detection,
+`sessions archive`) is still ahead.
+
+**v0.8.x** — Session-store model, wave 1: where a
 tool's sessions live and how they're keyed to a project is now a
 `[tool.session_store]` TOML declaration (three data-bound layout kinds —
 `encoded_dir`, `jsonl_field`, `sqlite_column`) instead of three hardcoded
@@ -27,10 +46,8 @@ so a gone project previously could never decode). `sessions --home <path>`
 censuses an arbitrary root (a mounted or rsync'd home), and a new `fleet.rs`
 adds `sessions --host <name>` / `--all-hosts` with `[[hosts]]` config to
 census other machines read-only over ssh, merging their JSON with
-provenance — orphan status always comes from the origin host. Wave 2 (store
-re-keying — the actual "reconcile" for these home-dir stores) and wave 3
-(A2A live-session detection, `sessions archive`) are deliberately not in
-this wave. See [`docs/design/session-store-model.md`](docs/design/session-store-model.md).
+provenance — orphan status always comes from the origin host. Wave 2 (store re-keying) shipped in v0.9.0;
+wave 3 (A2A live-session detection, `sessions archive`) is still ahead. See [`docs/design/session-store-model.md`](docs/design/session-store-model.md).
 
 **v0.7.0** — `sessionguard sessions`: a per-project session census
 across the home-dir stores (Claude Code / Codex / OpenCode) with orphan

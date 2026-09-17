@@ -354,7 +354,7 @@ fn replace_all_with_boundary(content: &str, old: &str, new: &str) -> Option<Stri
 /// loss, or `ENOSPC` leaves either the old file or the new file fully intact —
 /// never a truncated one. This is the difference between preserving a user's
 /// session artifact and destroying it; a bare `fs::write` truncates first.
-fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
+pub(crate) fn atomic_write(path: &Path, contents: &str) -> std::io::Result<()> {
     use std::io::Write;
     let dir = path.parent().unwrap_or_else(|| Path::new("."));
     let file_name = path

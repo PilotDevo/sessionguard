@@ -257,7 +257,38 @@ pub enum Command {
         /// Undo a specific migration by id (from the migration log).
         #[arg(long)]
         migration: Option<i64>,
+        /// Undo a specific store re-key by id (from the re-key log).
+        #[arg(long)]
+        rekey: Option<i64>,
         /// Show what would be undone without modifying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+
+    /// Re-key tools' session stores from one project path to another.
+    ///
+    /// This is the reconcile for home-dir stores. Claude Code, Codex and
+    /// OpenCode keep NO project path inside the project — they key sessions by
+    /// absolute path from a store under `$HOME` — so a project that moves
+    /// while the daemon isn't watching leaves every session for it stranded at
+    /// the old path (they show up in `sessions --orphans`). This points them
+    /// at the new location: the Claude Code store directory is renamed AND the
+    /// path recorded inside its transcripts is rewritten, Codex's `cwd` field
+    /// is rewritten, and OpenCode's rows are updated.
+    ///
+    /// Refuses rather than guesses when the destination store already exists
+    /// (that would merge two projects' histories) or the session database is
+    /// locked by a running tool. Every re-key is recorded and reversible with
+    /// `sessionguard undo`.
+    Rekey {
+        /// The project's old path — the one the sessions still record.
+        from: PathBuf,
+        /// Where the project lives now.
+        to: PathBuf,
+        /// Only re-key this tool's store (e.g. `claude_code`).
+        #[arg(long)]
+        tool: Option<String>,
+        /// Print the exact changes and stop, modifying nothing.
         #[arg(long)]
         dry_run: bool,
     },
