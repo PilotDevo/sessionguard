@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.8.1** — v0.8.1 is the post-merge review patch for the v0.8 census: live projects with `_`, `.` or spaces in their path no longer show as orphans (Claude Code transcripts record the real path, and the census now reads it), plus glob, `--home`, `--project`, OpenCode-timestamp and fleet-error fixes — see [CHANGELOG.md](CHANGELOG.md). Verified end-to-end on macOS (FSEvents) and Linux (inotify) with real-data dogfooding. Seven built-in tool patterns. v0.8 makes session storage **data, not code**: a `[tool.session_store]` TOML schema declares where each tool's sessions live and how they're keyed, `sessions.rs` reads from those declarations instead of hardcoded paths, decode confidence (`exact`/`inferred`/`unresolved`) makes deleted Claude Code projects detectable as orphans for the first time, and `sessions --home/--host/--all-hosts` extends the census to another root or across an ssh fleet. v0.4 shipped the **Migrate** arc (`inventory` / `migrate` / `migrate-cleanup`, reversible via `undo`); v0.5 added **`sessionguard update`** (checksum-verified, rollback-safe self-update); the v0.5.2–v0.6.x hardening arc closed a full codebase audit — atomic session-file writes, race-free daemon lifecycle, real backgrounding, `init` onboarding, recursive `scan`, per-file migrate verification, and full-graph `export`/`import`; v0.7 added the per-project `sessions` census. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.9.0** — v0.9 closes the gap the v0.8 census exposed: **store re-keying**. Claude Code, Codex and OpenCode keep no project path inside your project — they key sessions by absolute path from a store under `$HOME` — so until now a project move stranded every session for it. `sessionguard rekey <from> <to>` (and the daemon, automatically, on a move) renames the Claude Code store directory *and* rewrites the path recorded inside its transcripts, rewrites Codex's `cwd`, and updates OpenCode's rows — with `--dry-run`, refusals instead of guesses, and full `undo`. v0.8 made session storage **data, not code** (`[tool.session_store]`) and added the per-project census plus `sessions --home/--host/--all-hosts` for fleet-wide, read-only visibility over ssh. v0.4 shipped the **Migrate** arc; v0.5 added checksum-verified **self-update**; the v0.5.2–v0.6.x hardening arc closed a full codebase audit. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -43,29 +43,32 @@ SessionGuard is a lightweight filesystem daemon that:
 Tool support is defined via runtime-loaded TOML patterns — add new tools without recompiling.
 
 Four support levels today:
-- **Reconcile** — when a project moves, SessionGuard rewrites the tool's in-project session files (e.g. a text-based chat log) to point at the new path, atomically and surgically. **Verified against a real tool's file layout only for the synthetic tool the `dogfood.sh` smoke test declares** — no shipped built-in currently has a proven in-project path field (see below).
+- **Reconcile** — when a project moves, SessionGuard points the tool's sessions at the new path, atomically and reversibly. Two mechanisms, because tools split into two kinds: **store re-keying** (v0.9) for tools whose sessions live in a home-dir store keyed by absolute project path — the store directory is renamed and the path recorded inside the session files is rewritten — and **in-project rewriting** (v0.1) for tools that embed the path in a file inside the project. Every built-in with a `[tool.session_store]` gets the first; the second is **verified against a real tool's file layout only for the synthetic tool the `dogfood.sh` smoke test declares** (see below).
 - **Census** — the tool's sessions live in a home-dir store (not inside the project) that SessionGuard knows how to read via a declared `[tool.session_store]` binding (one of three data-bound layouts — `encoded_dir`, `jsonl_field`, `sqlite_column` — see [`docs/design/session-store-model.md`](docs/design/session-store-model.md)); `sessionguard sessions` groups and reports on them, including orphan detection.
 - **Migrate** — the tool stores session data in the user's home directory; SessionGuard can relocate that home-dir store to a new disk/path and repoint the tool (symlink, config edit, or env override), reversibly. This is the v0.4 `migrate` capability — see [Migrate](#migrate-relocate-a-tools-home-dir-data) below.
 - **Detect** — SessionGuard recognises the project as using the tool but doesn't rewrite, census, or migrate it yet.
 
 | Tool | Session Artifacts | Support |
 |------|------------------|---------|
-| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` (home store: `~/.claude/projects`) | ✅ Census + Migrate *(reconcile is [Wave 2](docs/design/session-store-model.md#waves) store re-keying, not yet shipped — Claude Code embeds the project path in no in-project file)* |
+| **Claude Code** | `.claude/`, `CLAUDE.md`, `.claudeignore` (home store: `~/.claude/projects`) | ✅ Reconcile (re-key) + Census + Migrate |
 | **Cursor** | `.cursor/`, `.cursorignore`, `.cursorindexingignore` | 🔍 Detect *(a `path_fields` reconcile target is declared but its file was not found on a real install — unverified)* |
 | **Windsurf** | `.windsurf/`, `.windsurfrules`, `.windsurfignore` | 🔍 Detect *(reconcile target unverified — same caveat as Cursor)* |
 | **Gemini CLI** | `.gemini/`, `GEMINI.md`, `.geminiignore` | 🔍 Detect *(a previously declared reconcile field was confirmed not to exist on real installs and was removed; no home-dir store declared)* |
 | **Aider** | `.aider.chat.history.md`, `.aider.conf.yml` | 🔍 Detect *(text-adapter reconcile target is a real filename but unverified end-to-end)* |
-| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` (home: `~/.codex`, `CODEX_HOME`; sessions: `~/.codex/sessions/**/*.jsonl`) | ✅ Census + Migrate |
-| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` (home: `~/.local/share/opencode/opencode.db`) | ✅ Census + Migrate |
+| **Codex (OpenAI)** | `AGENTS.md`, `.codex/` (home: `~/.codex`, `CODEX_HOME`; sessions: `~/.codex/sessions/**/*.jsonl`) | ✅ Reconcile (re-key) + Census + Migrate |
+| **OpenCode** | `AGENTS.md`, `opencode.json(c)`, `.opencodeignore` (home: `~/.local/share/opencode/opencode.db`) | ✅ Reconcile (re-key) + Census + Migrate |
 | **GitHub Copilot** | `.github/copilot-instructions.md` | 🔜 Planned |
 | **Continue.dev** | `.continue/`, `config.json` | 🔜 Planned |
 | **Custom / Other** | User-defined patterns via config TOML | ✅ Supported |
 
-None of the built-ins above currently ship a *verified* in-project reconcile
-target — see [`docs/design/session-store-model.md`](docs/design/session-store-model.md)
+None of the built-ins above ships a *verified in-project* reconcile target —
+see [`docs/design/session-store-model.md`](docs/design/session-store-model.md)
 for the audit that found this and the honesty patch that followed (fictional
 `path_fields` on `claude_code` and `gemini_cli` removed rather than left as a
-silent no-op).
+silent no-op). That audit is also what motivated **store re-keying** in v0.9:
+for these tools the in-project file was never where the path lived, so
+reconciling them means re-keying the home-dir store instead. See
+[Re-key](#re-key-make-sessions-follow-a-moved-project).
 
 > **Tool authors:** We'd love your help defining the canonical session artifact list for your tool. See [Contributing](#contributing).
 
@@ -204,6 +207,62 @@ sessionguard doctor
 # Generate shell completions
 sessionguard completions zsh > ~/.zfunc/_sessionguard
 ```
+
+### Re-key: make sessions follow a moved project
+
+Claude Code, Codex and OpenCode keep **no project path inside your project**.
+They key their sessions by absolute path from a store under `$HOME` — Claude
+Code names a directory after the path, Codex records a `cwd` field, OpenCode
+stores a column. So when a project moves, rewriting files inside the project
+reconciles nothing for them: every session stays keyed to the old path and
+shows up as an orphan.
+
+The daemon re-keys automatically on a move. When a project moved *without* the
+daemon watching — the usual case for history that predates installing
+SessionGuard — do it by hand:
+
+```bash
+# See what's stranded
+sessionguard sessions --orphans
+
+# Preview exactly what would change — nothing is written
+sessionguard rekey ~/old/path ~/new/path --dry-run
+
+# Apply it
+sessionguard rekey ~/old/path ~/new/path
+
+# Changed your mind
+sessionguard undo
+```
+
+A dry run states the real blast radius before anything is written:
+
+```
+claude_code: 2 action(s)
+  - rename store dir ~/.claude/projects/-Users-you-old-path -> -Users-you-new-path
+  - rewrite 8279 path reference(s) in ~/.claude/projects/-Users-you-new-path/<session>.jsonl
+codex: 1 action(s)
+  - rewrite 5 path reference(s) in ~/.codex/sessions/2026/07/04/rollout-….jsonl
+
+--dry-run: nothing changed.
+```
+
+Notes on what it will and won't do:
+
+- **It refuses rather than guesses.** If the destination store already exists,
+  re-keying would merge two projects' histories with no way to separate them
+  again — so it stops and says so. Same for a session database locked by a
+  running tool: quit the tool and retry.
+- **Stores are independent.** A refusal on one tool is reported and the others
+  still proceed; re-keying two of three beats re-keying none. A failure
+  partway through one store rolls *that store* back, so none is left half-done.
+- **Only the key moves.** Path references inside message bodies (a file you
+  edited at the old path) are left alone — they are a record of what happened,
+  not a key. Matching is whole-token, so `/work/app` never rewrites inside
+  `/work/app-two`.
+- **It is reversible.** Every re-key is recorded; `sessionguard undo` (or
+  `undo --rekey <id>`) reverses it. A re-key → undo round trip on a real 27 MB
+  Claude Code transcript leaves the store byte-for-byte as it was.
 
 ### Migrate: relocate a tool's home-dir data
 

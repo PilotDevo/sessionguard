@@ -19,6 +19,7 @@ pub mod inventory;
 pub mod migrate;
 pub mod reconciler;
 pub mod registry;
+pub mod rekey;
 pub mod sessions;
 pub mod tools;
 pub mod update;

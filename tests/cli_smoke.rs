@@ -379,6 +379,161 @@ fn cli_sessions_honors_explicit_home_root() {
 }
 
 #[test]
+fn cli_rekey_moves_sessions_to_the_new_project_path_and_undo_reverses_it() {
+    // The product's core promise, end to end: a project with Claude Code and
+    // Codex history moves, and its sessions follow. Before store re-keying,
+    // `sessions` reported the old path as an orphan and there was no way to
+    // fix it — the assistants' history was stranded.
+    let home = TempDir::new().unwrap();
+    let old = home.path().join("work/my_app");
+    std::fs::create_dir_all(&old).unwrap();
+
+    // Claude Code: a store dir named by the encoding, with the true path
+    // recorded inside the transcript (both keys must move).
+    let enc: String = old
+        .display()
+        .to_string()
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+        .collect();
+    let store = home.path().join(".claude/projects").join(&enc);
+    std::fs::create_dir_all(&store).unwrap();
+    std::fs::write(
+        store.join("s.jsonl"),
+        format!(
+            "{{\"type\":\"summary\"}}\n{{\"type\":\"user\",\"cwd\":\"{}\"}}\n",
+            old.display()
+        ),
+    )
+    .unwrap();
+
+    // Codex: a JSONL session keyed on the same path.
+    let codex = home.path().join(".codex/sessions/2026/07");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("rollout.jsonl"),
+        format!("{{\"cwd\": \"{}\"}}\n", old.display()),
+    )
+    .unwrap();
+
+    // The project moves.
+    let new = home.path().join("elsewhere/my_app");
+    std::fs::create_dir_all(new.parent().unwrap()).unwrap();
+    std::fs::rename(&old, &new).unwrap();
+
+    // Both tools' sessions are now stranded at the old path.
+    sg(&home)
+        .args(["sessions", "--orphans"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(old.display().to_string()));
+
+    // --dry-run states the blast radius and changes nothing.
+    sg(&home)
+        .args([
+            "rekey",
+            &old.display().to_string(),
+            &new.display().to_string(),
+            "--dry-run",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("claude_code"))
+        .stdout(predicate::str::contains("codex"))
+        .stdout(predicate::str::contains("nothing changed"));
+    sg(&home)
+        .args(["sessions", "--orphans"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(old.display().to_string()));
+
+    // Apply it for real.
+    sg(&home)
+        .args([
+            "rekey",
+            &old.display().to_string(),
+            &new.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("2 store(s) re-keyed"));
+
+    // The sessions are now at the new path, not orphaned, both tools intact.
+    let out = sg(&home)
+        .args(["sessions", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let groups: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    let arr = groups.as_array().unwrap();
+    assert_eq!(arr.len(), 1, "one project, not one per stale key: {arr:?}");
+    assert_eq!(arr[0]["project_path"], new.display().to_string());
+    assert_eq!(arr[0]["orphaned"], false);
+    assert_eq!(arr[0]["confidence"], "exact");
+    assert_eq!(arr[0]["tools"]["claude_code"]["count"], 1);
+    assert_eq!(arr[0]["tools"]["codex"]["count"], 1);
+
+    // And it is reversible.
+    sg(&home)
+        .args(["undo"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("undone"));
+    sg(&home)
+        .args(["sessions", "--format", "json"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(old.display().to_string()));
+}
+
+#[test]
+fn cli_rekey_refuses_to_merge_two_projects_histories() {
+    // Re-keying onto a store that already exists would fuse two projects'
+    // session histories with no way to separate them again. It must refuse,
+    // exit non-zero, and leave both stores untouched.
+    let home = TempDir::new().unwrap();
+    let enc_of = |p: &std::path::Path| -> String {
+        p.display()
+            .to_string()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect()
+    };
+    let a = home.path().join("work/a");
+    let b = home.path().join("work/b");
+    for p in [&a, &b] {
+        std::fs::create_dir_all(p).unwrap();
+        let store = home.path().join(".claude/projects").join(enc_of(p));
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("s.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", p.display()),
+        )
+        .unwrap();
+    }
+
+    sg(&home)
+        .args(["rekey", &a.display().to_string(), &b.display().to_string()])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("REFUSED"))
+        .stdout(predicate::str::contains("merge"));
+
+    // Both histories still exist, separately.
+    let out = sg(&home)
+        .args(["sessions", "--format", "json"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let groups: serde_json::Value = serde_json::from_slice(&out).unwrap();
+    assert_eq!(groups.as_array().unwrap().len(), 2, "nothing was merged");
+}
+
+#[test]
 fn cli_sessions_rejects_a_home_that_does_not_exist() {
     // A mistyped or unmounted `--home` used to be censused as an EMPTY foreign
     // home — `no sessions found.`, exit 0 — indistinguishable from a machine

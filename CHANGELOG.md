@@ -2,6 +2,62 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.9.0] - 2026-09-16
+
+### Added — store re-keying (session-store model, wave 2): the reconcile that was missing
+
+SessionGuard's thesis is that your AI sessions survive a project move. For the
+three assistants that actually matter that was **not true**, and v0.8.1 made
+the gap explicit rather than fixing it: `claude_code` and `gemini_cli` were
+changed to `on_move = "notify"` because they keep no project path inside the
+project to rewrite. Claude Code, Codex and OpenCode key their sessions by
+absolute path from a store under `$HOME` — so a move left every session for
+that project stranded at the old path, showing up in `sessions --orphans`
+with no way to fix it. This release closes that.
+
+- **`sessionguard rekey <from> <to>`** re-keys every declared
+  `[tool.session_store]` from one project path to another, per layout:
+  `encoded_dir` renames the store directory **and** rewrites the path recorded
+  inside its transcripts; `jsonl_field` rewrites the key field in matching
+  files; `sqlite_column` updates the matching rows. The `encoded_dir` case is
+  two operations because v0.8.1's key hint made the store keyed twice — by the
+  directory name and by the `cwd` inside it, which the census trusts over the
+  name. Renaming alone would let the census read the old path straight back
+  out of the renamed directory.
+- **The daemon re-keys automatically on a project move.** This is a real,
+  automatic mutation of session stores under `$HOME` — new in this release.
+  It is planned before it is applied, recorded in the event log, and
+  reversible. Note it is driven by the store *declarations*, not by
+  `detect_tools`: a project can have a year of Claude Code history and not one
+  `.claude/` file inside it, so gating on in-project detection would have
+  skipped exactly the sessions that needed moving.
+- **`--dry-run` on everything**, stating the exact blast radius before any
+  write ("rewrite 8279 path reference(s) in …"), and **`undo`** reverses a
+  re-key (`undo --rekey <id>`, or a bare `undo`). Verified on a real 27 MB
+  Claude Code transcript: re-key then undo leaves the store byte-for-byte as
+  it was.
+- **Refusals, not guesses.** A re-key refuses when the destination store
+  already exists (that would merge two projects' histories irreversibly) or
+  the SQLite store is locked by a running tool. Stores are independent — a
+  refusal on one is reported and the others still proceed — and a failure
+  partway through one store rolls **that store** back, so none is ever left
+  half-re-keyed.
+- Value rewrites match the **whole JSON token** (quoted and escaped), so
+  `/work/app` can never rewrite inside `/work/app-two`, and historical file
+  references inside message bodies are left alone — they are a record of what
+  happened, not a key. Writes are atomic (temp sibling + rename).
+
+### Changed
+
+- `sessions.rs` exposes `expand_home` and `walk_store_files`, so the census
+  and the re-key engine enumerate a store exactly one way — same symlink
+  handling, same glob semantics, same bound.
+- `config::home_dir()` is now the single home-resolution site shared by the
+  daemon, census and re-key engine (closes deferred item T5).
+- `ToolRegistry::register` already inherited the home-dir blocks (v0.8.1);
+  re-keying depends on that, since an override that omits `session_store`
+  would otherwise silently opt a tool out of being re-keyed.
+
 ## [0.8.1] - 2026-09-05
 
 ### Fixed — post-merge review of the v0.8.0 patch
