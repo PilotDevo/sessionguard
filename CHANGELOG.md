@@ -2,6 +2,51 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.9.1] - 2026-09-18
+
+### Fixed — the v0.9.0 daemon re-key never fired, and `undo` only half-reversed
+
+v0.9.0 shipped store re-keying and advertised that "the daemon re-keys
+automatically on a project move". It did not. Three defects, all found by
+writing the tests and the dogfood that should have accompanied that release.
+
+- **Automatic re-keying never ran for its primary case.** In
+  `handle_session_event`, the `rekey_stores` call sat *below* an early return
+  taken when `detect_tools` finds no artifacts **inside** the project. A
+  project with a year of Claude Code history and no `.claude/` directory in
+  it — exactly what the feature exists for — hit that return and the store was
+  never touched. The `rekey` CLI worked, which is why the end-to-end test
+  passed and this shipped. Re-keying now runs first and unconditionally,
+  before any in-project detection.
+- **`undo` left the project split-brain across tools.** One `rekey` wrote one
+  event-log row *per store*, so a bare `undo` reversed only the last one:
+  Codex back at the old path, Claude Code still at the new one, with nothing
+  saying two more undos were needed. One invocation is now one row carrying
+  every store's plan, replayed in order. Rows written by v0.9.0 are still
+  readable (`RecordedUndo` accepts both shapes) so an upgrade cannot strand an
+  existing undo.
+- **Tests read the operator's real `$HOME`.** `handle_session_event` resolved
+  the home directory through the environment, and the `daemon.rs` unit tests
+  never set it — so every run walked the real session stores (measured: 2.63 s
+  vs 0.02 s, over a 4.8 GB Codex tree), violating the isolation rule
+  `CLAUDE.md` states outright and risking a mutation of real data had a temp
+  path ever collided with a real project key. CI never caught it because
+  runners have empty homes. The census root is now resolved once in
+  `daemon::run()` and passed down — dependency injection rather than
+  environment fiddling, which also avoids `set_var` racing across parallel
+  test threads.
+
+### Added
+
+- **`scripts/rekey-dogfood.sh`**, gated in CI beside the other three. Drives
+  re-key → undo end to end across all three store layouts against a throwaway
+  `$HOME`, asserting the undo is **byte-identical**, unrelated projects are
+  untouched, `--dry-run` writes nothing, and re-keying onto an existing store
+  is refused rather than merging two histories. Re-key was the only mutating
+  operation without one; it found two of the three defects above.
+- A daemon test that a move re-keys the store under the *given* root — the
+  automatic path had no test at all.
+
 ## [0.9.0] - 2026-09-16
 
 ### Added — store re-keying (session-store model, wave 2): the reconcile that was missing
