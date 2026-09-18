@@ -1311,15 +1311,7 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 planned += 1;
-                println!(
-                    "{}: {} action(s){}",
-                    r.tool,
-                    r.plan.actions.len(),
-                    match r.log_id {
-                        Some(id) => format!("  (undo with `sessionguard undo --rekey {id}`)"),
-                        None => String::new(),
-                    }
-                );
+                println!("{}: {} action(s)", r.tool, r.plan.actions.len());
                 for action in &r.plan.actions {
                     println!("  - {}", action.describe());
                 }
@@ -1336,7 +1328,12 @@ async fn main() -> Result<()> {
             } else if dry_run {
                 println!("\n--dry-run: nothing changed.");
             } else {
+                // One undo id for the whole invocation — see `rekey_all`.
+                let undo_id = reports.iter().find_map(|r| r.log_id);
                 println!("\n{applied} store(s) re-keyed to {}.", to.display());
+                if let Some(id) = undo_id {
+                    println!("reverse it all with `sessionguard undo --rekey {id}`.");
+                }
             }
             if refused > 0 && !dry_run {
                 anyhow::bail!("{refused} store(s) refused (see above); they were not re-keyed");
@@ -1548,8 +1545,9 @@ fn undo_one_rekey(
         println!("re-key {} was already undone", entry.id);
         return Ok(());
     }
-    let plan: sessionguard::rekey::RekeyPlan = serde_json::from_str(&entry.undo_plan)
+    let recorded: sessionguard::rekey::RecordedUndo = serde_json::from_str(&entry.undo_plan)
         .map_err(|e| anyhow::anyhow!("re-key {} has a corrupt undo plan: {e}", entry.id))?;
+    let plans = recorded.plans();
 
     println!(
         "{} re-key {} ({}: {} -> {}):",
@@ -1559,14 +1557,34 @@ fn undo_one_rekey(
         entry.new_path,
         entry.old_path
     );
-    for action in &plan.actions {
-        println!("  - {}", action.describe());
+    for plan in &plans {
+        for action in &plan.actions {
+            println!("  - [{}] {}", plan.tool, action.describe());
+        }
     }
     if dry_run {
         println!("\n--dry-run: nothing changed.");
         return Ok(());
     }
-    sessionguard::rekey::apply(&plan).map_err(|f| anyhow::anyhow!("undo failed: {}", f.error))?;
+    // Every store from the original invocation, in replay order. Stopping at
+    // the first failure would leave the project split-brain across tools, so
+    // the error names which stores did come back.
+    let mut reversed: Vec<&str> = Vec::new();
+    for plan in &plans {
+        sessionguard::rekey::apply(plan).map_err(|f| {
+            anyhow::anyhow!(
+                "undo failed on `{}`: {}{}",
+                plan.tool,
+                f.error,
+                if reversed.is_empty() {
+                    String::new()
+                } else {
+                    format!(" (already reversed: {})", reversed.join(", "))
+                }
+            )
+        })?;
+        reversed.push(&plan.tool);
+    }
     event_log.mark_rekey_undone(entry.id)?;
     println!("\nre-key {} undone", entry.id);
     Ok(())

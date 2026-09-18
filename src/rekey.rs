@@ -485,6 +485,32 @@ fn is_locked(e: &rusqlite::Error) -> bool {
     )
 }
 
+/// A re-key's recorded undo plan, as read back from the event log.
+///
+/// v0.9.0 wrote ONE ROW PER STORE, each holding a bare [`RekeyPlan`]; since
+/// v0.9.1 one invocation is one row holding every store's plan, in replay
+/// order. Both shapes are accepted so an event log written by v0.9.0 stays
+/// undoable after an upgrade — the rows are the operator's only route back
+/// from a mutation, so silently failing to parse one is not an option.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum RecordedUndo {
+    /// v0.9.1+: every store from one invocation.
+    Many(Vec<RekeyPlan>),
+    /// v0.9.0: a single store.
+    One(Box<RekeyPlan>),
+}
+
+impl RecordedUndo {
+    /// The plans to replay, in order.
+    pub fn plans(self) -> Vec<RekeyPlan> {
+        match self {
+            RecordedUndo::Many(v) => v,
+            RecordedUndo::One(p) => vec![*p],
+        }
+    }
+}
+
 /// What happened to one tool's store during [`rekey_all`].
 #[derive(Debug)]
 pub struct RekeyReport {
@@ -518,6 +544,7 @@ pub fn rekey_all(
     dry_run: bool,
 ) -> Vec<RekeyReport> {
     let mut reports = Vec::new();
+    let mut undos: Vec<RekeyPlan> = Vec::new();
     for (tool, store) in stores {
         let plan = match plan(home, tool, store, old_path, new_path) {
             Ok(p) => p,
@@ -550,24 +577,14 @@ pub fn rekey_all(
 
         match apply(&plan) {
             Ok(undo) => {
-                let log_id = event_log.and_then(|log| match serde_json::to_string(&undo) {
-                    Ok(blob) => log
-                        .record_rekey(tool, &plan.old_path, &plan.new_path, &blob)
-                        .map_err(|e| {
-                            tracing::warn!(tool, error = %e, "re-key applied but NOT recorded; \
-                                     `undo` cannot reverse it");
-                        })
-                        .ok(),
-                    Err(e) => {
-                        tracing::warn!(tool, error = %e, "could not serialize undo plan");
-                        None
-                    }
-                });
+                // Recorded once for the whole invocation, after the loop —
+                // see the note there.
+                undos.push(undo);
                 reports.push(RekeyReport {
                     tool: tool.clone(),
                     plan,
                     applied: true,
-                    log_id,
+                    log_id: None,
                     error: None,
                 });
             }
@@ -593,6 +610,53 @@ pub fn rekey_all(
                     error: Some(detail),
                 });
             }
+        }
+    }
+
+    // ONE event-log row for the whole invocation, carrying every store's
+    // undo plan — not one row per store.
+    //
+    // The unit of undo must match the unit of action. v0.9.0 recorded a row
+    // per store, so a single `rekey` of a project with Claude Code + Codex +
+    // OpenCode history wrote three rows and a bare `undo` reversed only the
+    // last one: Codex back at the old path, Claude Code still at the new one.
+    // That is a split-brain project across tools — precisely what re-keying
+    // exists to prevent — and nothing told the operator two more undos were
+    // needed. Caught by `scripts/rekey-dogfood.sh`.
+    //
+    // Stored in the order they must be REPLAYED (reverse of application), so
+    // undo is a straight walk of the list.
+    if !undos.is_empty() {
+        undos.reverse();
+        let tools: Vec<&str> = reports
+            .iter()
+            .filter(|r| r.applied)
+            .map(|r| r.tool.as_str())
+            .collect();
+        let label = tools.join(", ");
+        let log_id = event_log.and_then(|log| match serde_json::to_string(&undos) {
+            Ok(blob) => log
+                .record_rekey(
+                    &label,
+                    &old_path.display().to_string(),
+                    &new_path.display().to_string(),
+                    &blob,
+                )
+                .map_err(|e| {
+                    tracing::warn!(
+                        tools = %label,
+                        error = %e,
+                        "re-key applied but NOT recorded; `undo` cannot reverse it"
+                    );
+                })
+                .ok(),
+            Err(e) => {
+                tracing::warn!(tools = %label, error = %e, "could not serialize undo plan");
+                None
+            }
+        });
+        for r in reports.iter_mut().filter(|r| r.applied) {
+            r.log_id = log_id;
         }
     }
     reports
@@ -830,6 +894,98 @@ mod tests {
         apply(&undo).expect("undo");
         assert_eq!(count("/p/old"), 2, "undo restores the original key");
         assert_eq!(count("/p/new"), 0);
+    }
+
+    #[test]
+    fn one_invocation_records_one_undo_covering_every_store() {
+        // v0.9.0 wrote a row per store, so a bare `undo` reversed only the
+        // last one and left the project split-brain across tools. One
+        // invocation must be one undo.
+        let home = TempDir::new().unwrap();
+        let old = home.path().join("work/app");
+        std::fs::create_dir_all(&old).unwrap();
+        seed_claude(home.path(), &old);
+        let codex = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&codex).unwrap();
+        std::fs::write(
+            codex.join("r.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", old.display()),
+        )
+        .unwrap();
+
+        let stores = vec![
+            ("claude_code".to_string(), claude_store()),
+            (
+                "codex".to_string(),
+                SessionStore::JsonlField {
+                    path: "~/.codex/sessions".into(),
+                    glob: "**/*.jsonl".into(),
+                    key_field: "cwd".into(),
+                    fallback_field: None,
+                },
+            ),
+        ];
+        let log = crate::event_log::EventLog::open_in_memory().unwrap();
+        let new = home.path().join("work/moved");
+        let reports = rekey_all(home.path(), &stores, &old, &new, Some(&log), false);
+
+        let applied: Vec<_> = reports.iter().filter(|r| r.applied).collect();
+        assert_eq!(applied.len(), 2, "both stores re-keyed");
+        assert_eq!(
+            log.recent_rekeys(10).unwrap().len(),
+            1,
+            "one invocation must record exactly ONE undo row"
+        );
+        let ids: std::collections::HashSet<_> = applied.iter().map(|r| r.log_id).collect();
+        assert_eq!(ids.len(), 1, "every store reports the same undo id");
+
+        // Replaying that single row must put BOTH stores back.
+        let entry = log.latest_pending_rekey().unwrap().unwrap();
+        assert!(entry.tool_name.contains("claude_code") && entry.tool_name.contains("codex"));
+        let plans: RecordedUndo = serde_json::from_str(&entry.undo_plan).unwrap();
+        let plans = plans.plans();
+        assert_eq!(plans.len(), 2);
+        for plan in &plans {
+            apply(plan).expect("undo applies");
+        }
+        let groups = crate::sessions::census(home.path(), &stores, false);
+        assert!(
+            groups
+                .iter()
+                .all(|g| g.project_path != new.display().to_string()),
+            "nothing may remain at the new path after a full undo"
+        );
+        let back = groups
+            .iter()
+            .find(|g| g.project_path == old.display().to_string())
+            .expect("both stores back at the original path");
+        assert_eq!(back.tools.len(), 2, "both tools reversed, not just one");
+    }
+
+    #[test]
+    fn a_v0_9_0_single_plan_undo_row_still_replays() {
+        // Compatibility: rows written by v0.9.0 hold a bare RekeyPlan object,
+        // not an array. Those rows are the operator's only route back from a
+        // mutation, so an upgrade must not strand them.
+        let single = serde_json::json!({
+            "tool": "claude_code",
+            "old_path": "/new",
+            "new_path": "/old",
+            "actions": []
+        })
+        .to_string();
+        let recorded: RecordedUndo = serde_json::from_str(&single).expect("v0.9.0 shape parses");
+        let plans = recorded.plans();
+        assert_eq!(plans.len(), 1);
+        assert_eq!(plans[0].tool, "claude_code");
+
+        // ...and the v0.9.1 array shape still parses as many.
+        let many = serde_json::json!([{
+            "tool": "codex", "old_path": "/new", "new_path": "/old", "actions": []
+        }])
+        .to_string();
+        let recorded: RecordedUndo = serde_json::from_str(&many).unwrap();
+        assert_eq!(recorded.plans().len(), 1);
     }
 
     #[test]

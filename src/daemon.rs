@@ -189,6 +189,16 @@ pub async fn run(config: &Config) -> Result<()> {
     let registry = crate::registry::Registry::open_default()?;
     let event_log = crate::event_log::EventLog::open_default()?;
 
+    // The home whose session stores get re-keyed on a move. Resolved ONCE
+    // here rather than per event: it cannot change under a running daemon,
+    // and re-resolving would stat the filesystem on every rename. An empty
+    // path means "unresolvable" and disables re-keying (see `rekey_stores`)
+    // rather than silently resolving `~/...` against the working directory.
+    let census_root = crate::config::home_dir().unwrap_or_else(|| {
+        warn!("cannot resolve home directory; session stores will NOT be re-keyed");
+        std::path::PathBuf::new()
+    });
+
     // Start filesystem watcher over the configured roots AND every registered
     // project's parent, so a project tracked via `watch` (which may live outside
     // any configured root) is actually monitored.
@@ -202,7 +212,7 @@ pub async fn run(config: &Config) -> Result<()> {
         tokio::select! {
             Some(event) = watcher.events.recv() => {
                 tracing::debug!(?event, "received filesystem event");
-                handle_session_event(event, &registry, &tool_registry, &event_log);
+                handle_session_event(&census_root, event, &registry, &tool_registry, &event_log);
             }
             _ = reload_signal() => {
                 // SIGHUP: pick up newly-registered projects without a restart
@@ -279,20 +289,26 @@ async fn reload_signal() {
 /// in-project files moves nothing for them. Failures are logged, never fatal —
 /// a daemon that dies on one unhappy store stops watching everything else.
 fn rekey_stores(
+    census_root: &std::path::Path,
     tool_registry: &crate::tools::ToolRegistry,
     old_path: &std::path::Path,
     new_path: &std::path::Path,
     event_log: &crate::event_log::EventLog,
 ) {
-    let Some(home) = crate::config::home_dir() else {
-        warn!("cannot resolve home directory; session stores not re-keyed");
+    if census_root.as_os_str().is_empty() {
+        warn!("no census root; session stores not re-keyed");
         return;
-    };
+    }
     let env = |var: &str| std::env::var(var).ok();
     let stores = crate::sessions::resolve_stores(tool_registry.all(), Some(&env));
-    for report in
-        crate::rekey::rekey_all(&home, &stores, old_path, new_path, Some(event_log), false)
-    {
+    for report in crate::rekey::rekey_all(
+        census_root,
+        &stores,
+        old_path,
+        new_path,
+        Some(event_log),
+        false,
+    ) {
         match (&report.error, report.applied) {
             (Some(e), _) => warn!(tool = %report.tool, "session store not re-keyed: {e}"),
             (None, true) => info!(
@@ -308,7 +324,14 @@ fn rekey_stores(
     }
 }
 
+/// `census_root` is the home directory whose session stores get re-keyed. It
+/// is passed in rather than read from the environment so the caller owns it:
+/// `run()` resolves it once at startup (cheaper than per-event), and tests
+/// point it at a temp dir instead of the operator's real `$HOME`. Setting
+/// `HOME` in tests would be process-global — a data race across parallel test
+/// threads, and `set_var` is `unsafe` in the 2024 edition.
 fn handle_session_event(
+    census_root: &std::path::Path,
     event: crate::watcher::SessionEvent,
     registry: &crate::registry::Registry,
     tool_registry: &crate::tools::ToolRegistry,
@@ -323,10 +346,24 @@ fn handle_session_event(
         } => {
             info!(from = %old_path.display(), to = %new_path.display(), "project moved");
 
+            // Re-key the home-dir session stores FIRST, and unconditionally.
+            //
+            // This must run before the in-project detection guard below, not
+            // after it. `detect_tools` scans the PROJECT directory, but a
+            // `session_store` lives under `$HOME` — the two answer different
+            // questions. A project can have a year of Claude Code history and
+            // not a single `.claude/` file inside it, which is precisely the
+            // case this feature exists for; running after the guard meant the
+            // daemon skipped exactly the sessions it was built to move.
+            // (v0.9.0 shipped with the call below the guard, so automatic
+            // re-keying never fired for Claude Code. Regression test:
+            // `handle_session_event_moved_rekeys_the_store_under_the_given_root`.)
+            rekey_stores(census_root, tool_registry, &old_path, &new_path, event_log);
+
             // Detect which AI tools have artifacts at the new location
             let detected = crate::detector::detect_tools(&new_path, tool_registry);
             if detected.is_empty() {
-                tracing::debug!("no AI session artifacts at new path, skipping");
+                tracing::debug!("no in-project artifacts at new path; stores already re-keyed");
                 return;
             }
 
@@ -350,16 +387,6 @@ fn handle_session_event(
                     }
                 }
             }
-
-            // Re-key the home-dir session stores.
-            //
-            // Deliberately driven by the STORE declarations rather than by
-            // `detected` above: `detect_tools` scans the project directory,
-            // but a `session_store` lives under `$HOME`, so the two answer
-            // different questions. A project can have a year of Claude Code
-            // history and not a single `.claude/` file inside it — gating on
-            // detection would skip exactly the sessions that need re-keying.
-            rekey_stores(tool_registry, &old_path, &new_path, event_log);
 
             // Update registry: re-register under new path and drop old entry
             match registry.register_project(&new_path) {
@@ -496,6 +523,82 @@ mod tests {
         p
     }
 
+    // The daemon's whole reason to exist for Claude Code / Codex / OpenCode:
+    // none of them keep the project path inside the project, so a move must
+    // re-key their HOME-DIR store. v0.9.0 wired this up with no test at all.
+    //
+    // This also pins the isolation contract: the store that moves is the one
+    // under the `census_root` PASSED IN. Before that argument existed, this
+    // path resolved the operator's real `$HOME` and walked their actual
+    // multi-GB session stores on every test run.
+    #[test]
+    fn handle_session_event_moved_rekeys_the_store_under_the_given_root() {
+        let home = TempDir::new().unwrap();
+        let old = home.path().join("work/app");
+        std::fs::create_dir_all(&old).unwrap();
+
+        // A Claude Code store dir for `old`, named the way the real tool
+        // names it, with the true path recorded inside the transcript.
+        let enc: String = old
+            .display()
+            .to_string()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let store = home.path().join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("s.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", old.display()),
+        )
+        .unwrap();
+
+        let new = home.path().join("work/moved");
+        std::fs::rename(&old, &new).unwrap();
+
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+        handle_session_event(
+            home.path(),
+            SessionEvent::Moved {
+                from: Some(old.clone()),
+                to: Some(new.clone()),
+            },
+            &registry,
+            &tools,
+            &log,
+        );
+
+        // The census — the operator-visible truth — must now report the new
+        // path, with the session intact and not orphaned.
+        let stores = crate::sessions::resolve_stores(tools.all(), None);
+        let groups = crate::sessions::census(home.path(), &stores, false);
+        let g = groups
+            .iter()
+            .find(|g| g.project_path == new.display().to_string())
+            .unwrap_or_else(|| {
+                panic!(
+                    "store did not follow the move; census says {:?}",
+                    groups.iter().map(|g| &g.project_path).collect::<Vec<_>>()
+                )
+            });
+        assert!(!g.orphaned, "a re-keyed project is live, not orphaned");
+        assert_eq!(g.tools["claude_code"].count, 1, "the session survived");
+        assert!(
+            !groups
+                .iter()
+                .any(|g| g.project_path == old.display().to_string()),
+            "nothing may still be keyed to the old path"
+        );
+
+        // ...and it is undoable, like every other mutation this daemon makes.
+        assert!(
+            log.latest_pending_rekey().unwrap().is_some(),
+            "the re-key must be recorded so `undo` can reverse it"
+        );
+    }
+
     // The core pipeline seam: a paired Moved event detects the tool at the new
     // location, reconciles its artifacts, registers the new path, and logs it.
     #[test]
@@ -511,6 +614,7 @@ mod tests {
         let log = EventLog::open_in_memory().unwrap();
 
         handle_session_event(
+            dir.path(),
             SessionEvent::Moved {
                 from: Some(old.clone()),
                 to: Some(new.clone()),
@@ -559,6 +663,7 @@ mod tests {
         let log = EventLog::open_in_memory().unwrap();
 
         handle_session_event(
+            dir.path(),
             SessionEvent::Moved {
                 from: Some(dir.path().join("plain-old")),
                 to: Some(new),
@@ -581,6 +686,7 @@ mod tests {
         let log = EventLog::open_in_memory().unwrap();
 
         handle_session_event(
+            dir.path(),
             SessionEvent::Moved {
                 from: Some(dir.path().join("x")),
                 to: None,
@@ -608,7 +714,13 @@ mod tests {
         registry.register_project(&gone).unwrap();
         std::fs::remove_dir_all(&gone).unwrap();
 
-        handle_session_event(SessionEvent::Removed(gone.clone()), &registry, &tools, &log);
+        handle_session_event(
+            dir.path(),
+            SessionEvent::Removed(gone.clone()),
+            &registry,
+            &tools,
+            &log,
+        );
 
         assert!(
             registry

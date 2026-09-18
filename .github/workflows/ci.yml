@@ -89,6 +89,11 @@ jobs:
           SESSIONGUARD_BIN: ./target/release/sessionguard
         run: bash scripts/migrate-dogfood.sh
 
+      - name: Run rekey-dogfood.sh
+        env:
+          SESSIONGUARD_BIN: ./target/release/sessionguard
+        run: bash scripts/rekey-dogfood.sh
+
       - name: Run update-dogfood.sh
         env:
           SESSIONGUARD_BIN: ./target/release/sessionguard
