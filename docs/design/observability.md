@@ -1,6 +1,7 @@
 # Observability: making "it did nothing" visible
 
-**Status:** design approved 2026-09-18, implementing.
+**Status:** shipped in v0.10.0 (2026-09-18). The dashboard surface is the one
+piece deliberately left for a follow-up — see "Not yet done" at the end.
 **Scope:** local-only. No data leaves the machine — no endpoint, no phone-home,
 no third party. Everything here is readable by the operator on the box it
 happened on.
@@ -193,3 +194,34 @@ without an end-to-end smoke test.
 - `daemon.rs` tests pass an explicit temp root; a test asserts no real-home
   read by pointing the root at a temp dir and checking the store is untouched.
 - `rekey-dogfood.sh` drives re-key → undo end to end against a throwaway home.
+
+## Not yet done
+
+- **Dashboard surface.** `status --deep --format json` carries everything the
+  Activity tab would need, but wiring it into `tools/dashboard/` is a
+  follow-up rather than part of this change. The CLI is the primary surface
+  and it is complete and tested; half-adding a UI would have been worse than
+  scheduling it.
+- **`events` retention.** `prune_activity` bounds the new table, and `events`
+  already had undone-row retention (`UNDONE_RETENTION`). Pruning *pending*
+  undo rows remains a semantic decision about how long undo stays available,
+  so hardening item **M17** is narrowed, not closed.
+- **Fleet health.** Local-only by choice; a host's own
+  `status --deep --format json` is readable over the existing read-only
+  `sessions --host` ssh transport whenever we want it.
+
+## What this found while being built
+
+Writing the tests and the dogfood that this design called for surfaced three
+defects in the *previous* release, all shipped in v0.9.1:
+
+1. **Automatic re-keying never fired.** `rekey_stores` sat below an early
+   return taken when no artifacts exist *inside* the project — exactly the
+   case re-keying exists for. The CLI worked, so the end-to-end test passed.
+2. **`undo` half-reversed.** One `rekey` wrote a row per store; a bare `undo`
+   reversed one, leaving the project split-brain across tools.
+3. **Tests read the operator's real `$HOME`** (2.63 s vs 0.02 s), invisible on
+   CI because runners have empty homes.
+
+That ratio — one design, three latent defects in shipped code — is the
+argument for the whole document.

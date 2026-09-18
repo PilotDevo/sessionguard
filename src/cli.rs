@@ -65,6 +65,12 @@ pub enum Command {
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,
+        /// Also report whether the daemon is actually DOING anything: watch
+        /// roots that no longer exist, when it last changed something, and
+        /// what it refused or failed. "Running" and "working" are different
+        /// questions — this answers the second one.
+        #[arg(long)]
+        deep: bool,
     },
 
     /// Register a directory tree for monitoring.
@@ -124,6 +130,11 @@ pub enum Command {
         /// Number of recent entries to show.
         #[arg(long, default_value = "20")]
         last: usize,
+        /// Show the DECISION log instead of the rewrite log: what SessionGuard
+        /// decided and why, including every time it decided to do nothing.
+        /// A log of actions taken cannot answer "why did nothing happen?".
+        #[arg(long)]
+        activity: bool,
         /// Output format.
         #[arg(long, value_enum, default_value_t = Format::Text)]
         format: Format,

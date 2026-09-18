@@ -202,6 +202,14 @@ pub async fn run(config: &Config) -> Result<()> {
     // Start filesystem watcher over the configured roots AND every registered
     // project's parent, so a project tracked via `watch` (which may live outside
     // any configured root) is actually monitored.
+    // Bound the activity log at startup. Observability must not become the
+    // thing that fills the disk.
+    match event_log.prune_activity(config.activity_retention_days, config.activity_max_rows) {
+        Ok(n) if n > 0 => info!(pruned = n, "pruned old activity rows"),
+        Ok(_) => {}
+        Err(e) => warn!(error = %e, "could not prune the activity log"),
+    }
+
     let watch_set = build_watch_set(config, &registry);
     let mut watcher = crate::watcher::FsWatcher::new(&watch_set, &config.watch_mode)?;
 
@@ -309,17 +317,17 @@ fn rekey_stores(
         Some(event_log),
         false,
     ) {
-        match (&report.error, report.applied) {
-            (Some(e), _) => warn!(tool = %report.tool, "session store not re-keyed: {e}"),
-            (None, true) => info!(
+        // Outcomes are recorded by `rekey_all` itself (same for the CLI path).
+        // This is the daemon's operator-facing summary line only.
+        if let Some(e) = &report.error {
+            warn!(tool = %report.tool, "session store not re-keyed: {e}");
+        } else if report.applied {
+            info!(
                 tool = %report.tool,
                 actions = report.plan.actions.len(),
                 undo_id = ?report.log_id,
                 "session store re-keyed to the new project path"
-            ),
-            (None, false) => {
-                tracing::debug!(tool = %report.tool, "no sessions for this project")
-            }
+            );
         }
     }
 }
@@ -372,19 +380,15 @@ fn handle_session_event(
                 if let Some(tool) = tool_registry.get(&detection.tool_name) {
                     let result =
                         crate::reconciler::reconcile(tool, &old_path, &new_path, event_log);
-                    if result.success {
-                        info!(
-                            tool = %detection.display_name,
-                            rewrites = result.actions_taken.len(),
-                            "reconciled session artifacts"
-                        );
-                    } else {
-                        warn!(
-                            tool = %detection.display_name,
-                            error = ?result.error,
-                            "reconciliation failed"
-                        );
-                    }
+                    // Recorded whatever it was — including a no-op. A store of
+                    // actions taken cannot answer "why did nothing happen?".
+                    crate::activity::ActivityRecord::new(
+                        crate::activity::ActivityKind::Reconcile,
+                        result.outcome,
+                    )
+                    .tool(&result.tool_name)
+                    .project(new_path.display().to_string())
+                    .emit(Some(event_log));
                 }
             }
 

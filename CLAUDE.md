@@ -50,9 +50,14 @@ Events flow:
    - `reconciler::reconcile()` — rewrites old path strings in IN-PROJECT files
    - `rekey::rekey_all()` — re-keys the HOME-DIR session stores (v0.9); driven
      by the `session_store` declarations, NOT by `detect_tools`, because a
-     store lives under `$HOME` and a project may have no in-project artifact
+     store lives under `$HOME` and a project may have no in-project artifact.
+     **Runs FIRST, before the in-project detection guard.** v0.9.0 had it after,
+     so a project with no `.claude/` inside it hit the early return and was
+     never re-keyed — the exact case the feature exists for. Don't reorder.
    - `registry` — re-registers project under new path, drops old entry
-4. All actions are recorded to `EventLog` for auditability
+4. Every DECISION — including the decisions to do nothing — is recorded to the
+   `EventLog`'s `activity` table via `activity::ActivityRecord::emit()` (v0.10).
+   Recording only actions taken is what let a totally inert daemon look healthy.
 
 ### Binary + Library Split
 
@@ -60,6 +65,7 @@ Events flow:
 
 ### Module Map
 
+- **`activity.rs`** (v0.10) — **What was decided, and why — including "nothing".** `Outcome` (`Acted{actions}`/`NoOp{reason}`/`Refused`/`Failed`) replaced `success: bool` on `ReconcileResult`. A bool cannot express "succeeded and did nothing", so it got used for "didn't fail": the `Notify` arm returned `success: true` with an empty action list, making a healthy reconcile and a totally inert one the same value — which is how store re-keying stayed broken for months. `Outcome::acted(n, reason)` is the ONLY way to build an `Acted` and returns a `NoOp` when `n == 0`, so that shape is unconstructible. `ActivityRecord::emit()` writes to the event log AND emits a matching tracing event so the two channels cannot disagree.
 - **`cli.rs`** — Clap derive definitions for all subcommands. Add new commands here.
 - **`config.rs`** — TOML config loading from `~/.config/sessionguard/config.toml`, defaults. Supports `SESSIONGUARD_DATA_DIR` env var override (used by tests for isolation).
 - **`daemon.rs`** — Daemon lifecycle: PID file, signal handling, main event loop (`tokio::select!`). Contains `handle_session_event()` — the pipeline dispatcher.
@@ -69,8 +75,8 @@ Events flow:
 - **`tools/builtin/`** — Built-in TOML tool patterns compiled into the binary via `include_str!`.
 - **`registry.rs`** — SQLite-backed project-to-session mapping. Stores actual artifact file paths (e.g., `.claude/settings.json`), not just project roots. Schema auto-migrates on open.
 - **`reconciler.rs`** — Adapter-based path rewriting engine. `JsonAdapter` and `TomlAdapter` parse files and surgically rewrite only the declared target field. `TextAdapter` falls back to string replace. Dispatched by `PathFieldSpec.format`.
-- **`event_log.rs`** — SQLite audit log of reconciliation actions, **migrations**, and **store re-keys** (the `migrations` and `rekeys` tables each store an opaque JSON undo-plan blob, decoupled from the engine that produced it), powering `undo` for all three.
-- **`health.rs`** — Tool-presence / launcher health checks (binary on PATH, etc.).
+- **`event_log.rs`** — SQLite audit log of reconciliation actions, **migrations**, and **store re-keys** (the `migrations` and `rekeys` tables each store an opaque JSON undo-plan blob, decoupled from the engine that produced it), powering `undo` for all three. Plus the v0.10 `activity` table — one row per DECISION, no-ops included. Tables are separated by DURABILITY CLASS: `events`/`migrations`/`rekeys` back `undo` and are never auto-pruned; `activity` is disposable and bounded by `prune_activity`. Don't blur that boundary.
+- **`health.rs`** — Tool-presence / launcher health checks (binary on PATH, etc.), plus `DaemonHealth` (v0.10): whether the daemon is actually DOING anything. Every field is DERIVED at query time (PID file, config vs. filesystem, activity log) — a stored health record is a lie the moment the process dies. `is_inert()` (running but never acted) is the direct antidote to the silent-no-op failure. Backs `status --deep`.
 - **`inventory.rs`** — Bounded filesystem walk that enumerates each tool's declared `home_dir_layout`: location, size, file count, last-modified. Backs `sessionguard inventory`; read-only lead-in to `migrate`.
 - **`migrate/`** (`mod.rs` + `tests.rs`) — The v0.4 migration engine: a nine-stage state machine (Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite → Resume → Validate → Retain, then Done) with trait-DI backends (`Quiescer`/`EnvWriter` + `Fake*` test doubles), `undo_migration`, and `cleanup_migration`. Returns a `MigrationResult`; `main.rs` persists it to the event log. Driven by `home_dir_layout` on `ToolDefinition`.
 - **`sessions.rs`** — Per-project session census across the tools' home-dir stores. As of v0.8, **declaration-driven**: it no longer hardcodes the three store paths but dispatches on each loaded tool's `[tool.session_store]` binding (`SessionStore::EncodedDir`/`JsonlField`/`SqliteColumn` in `tools/mod.rs`) — Claude Code encoded-dir decoding — the declaration's *key hint* (`key_glob`/`key_field`, builtin `*.jsonl`/`cwd`) reads the literal path recorded inside a transcript first, and only hint-less directories fall back to the encoding-aware filesystem DFS, with three-state `DecodeConfidence`: `exact`/`inferred`/`unresolved` (so a deleted project can decode as an orphan instead of vanishing). `resolve_stores()` builds the store list from the registry, re-rooting env-discovered stores (`CODEX_HOME`) for a local census, Codex JSONL field lookup, OpenCode SQLite read-only. `census(home, stores, foreign_root)` also backs `--home <path>` (an arbitrary root, e.g. a mounted remote home). Backs `sessionguard sessions` (+ `--orphans`); the dashboard's Activity tab consumes its `--format json`.
@@ -95,7 +101,7 @@ To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_
 Tests use `SESSIONGUARD_DATA_DIR` (and `SESSIONGUARD_CONFIG_DIR`) to point each test at an isolated per-test SQLite registry and config dir — no shared state, and no reads of the operator's real `~/.config`/`$HOME`.
 
 ```bash
-cargo test                           # ~240 tests (unit + integration)
+cargo test                           # ~255 tests (unit + integration)
 cargo test sandbox_                  # integration tests only
 cargo test reconcile_               # end-to-end reconciliation proofs
 cargo test -- --nocapture            # with stdout
@@ -127,7 +133,7 @@ Tags follow `v0.1.0` format. Pushing a tag triggers: build → GitHub release �
 ```
 src/                    # Library + binary source (cli, daemon, watcher, detector,
                         #   reconciler, registry, event_log, tools/, health,
-                        #   inventory, migrate, sessions, fleet, rekey, update, config, error,
+                        #   inventory, migrate, sessions, fleet, rekey, activity, update, config, error,
                         #   main, lib)
 tests/
   cli_smoke.rs          # Basic CLI invocation tests
@@ -137,6 +143,7 @@ examples/
 scripts/
   dogfood.sh            # E2E reconcile smoke test
   migrate-dogfood.sh    # E2E migrate → undo smoke test
+  rekey-dogfood.sh      # E2E store re-key -> undo smoke test (byte-identity)
   update-dogfood.sh     # E2E self-update smoke test (offline fake release)
   check-consistency.sh  # release-metadata consistency gate (runs in CI)
 docs/

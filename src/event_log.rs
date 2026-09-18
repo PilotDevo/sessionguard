@@ -66,7 +66,32 @@ pub struct MigrationLogEntry {
     pub cleaned_at: Option<String>,
 }
 
-/// Structured event log backed by SQLite.
+/// One recorded decision, as read back.
+#[derive(Debug, Clone)]
+pub struct ActivityLogEntry {
+    pub id: i64,
+    pub timestamp: String,
+    pub kind: String,
+    pub tool_name: Option<String>,
+    pub project_path: Option<String>,
+    pub outcome: String,
+    pub reason: Option<String>,
+    pub actions: i64,
+}
+
+fn row_to_activity(row: &rusqlite::Row) -> rusqlite::Result<ActivityLogEntry> {
+    Ok(ActivityLogEntry {
+        id: row.get(0)?,
+        timestamp: row.get(1)?,
+        kind: row.get(2)?,
+        tool_name: row.get(3)?,
+        project_path: row.get(4)?,
+        outcome: row.get(5)?,
+        reason: row.get(6)?,
+        actions: row.get(7)?,
+    })
+}
+
 /// One recorded store re-key. `undo_plan` is opaque here — see
 /// [`EventLog::record_rekey`].
 #[derive(Debug, Clone)]
@@ -92,6 +117,7 @@ fn row_to_rekey(row: &rusqlite::Row) -> rusqlite::Result<RekeyLogEntry> {
     })
 }
 
+/// Structured event log backed by SQLite.
 pub struct EventLog {
     conn: Connection,
 }
@@ -222,6 +248,36 @@ impl EventLog {
             CREATE INDEX IF NOT EXISTS idx_rekeys_undone ON rekeys(undone_at);
             ",
         )?;
+
+        // Step 7: the activity log — one row per DECISION, including the
+        // decisions to do nothing.
+        //
+        // Separate from the three tables above by DURABILITY CLASS, which is
+        // the load-bearing distinction here: `events`, `migrations` and
+        // `rekeys` back `undo`, so they are never auto-pruned. `activity` is
+        // observability — disposable, and bounded (see `prune_activity`).
+        // Mixing them would force a choice between pruning rows `undo` needs
+        // and never pruning at all.
+        //
+        // No-ops are recorded ON PURPOSE: a log of actions taken cannot answer
+        // "why did nothing happen?", which is the question that went
+        // unanswered while re-keying was silently broken.
+        self.conn.execute_batch(
+            "
+            CREATE TABLE IF NOT EXISTS activity (
+                id           INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp    TEXT NOT NULL DEFAULT (datetime('now')),
+                kind         TEXT NOT NULL,
+                tool_name    TEXT,
+                project_path TEXT,
+                outcome      TEXT NOT NULL,
+                reason       TEXT,
+                actions      INTEGER NOT NULL DEFAULT 0
+            );
+            CREATE INDEX IF NOT EXISTS idx_activity_time ON activity(timestamp);
+            CREATE INDEX IF NOT EXISTS idx_activity_outcome ON activity(outcome);
+            ",
+        )?;
         Ok(())
     }
 
@@ -338,6 +394,90 @@ impl EventLog {
     /// Record a completed migration. `undo_plan` is an opaque JSON blob
     /// (a serialized `migrate::MigrationUndo`) used later by undo.
     /// Returns the new row id.
+    /// Record one decision. See [`crate::activity`].
+    pub fn record_activity(&self, rec: &crate::activity::ActivityRecord) -> Result<()> {
+        self.conn.execute(
+            "INSERT INTO activity (kind, tool_name, project_path, outcome, reason, actions)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                rec.kind.as_str(),
+                rec.tool_name.as_deref(),
+                rec.project_path.as_deref(),
+                rec.outcome.kind(),
+                rec.outcome.reason(),
+                rec.outcome.actions() as i64,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Most recent decisions, newest first.
+    pub fn recent_activity(&self, limit: usize) -> Result<Vec<ActivityLogEntry>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, timestamp, kind, tool_name, project_path, outcome, reason, actions
+             FROM activity ORDER BY id DESC LIMIT ?1",
+        )?;
+        let rows = stmt.query_map([limit as i64], row_to_activity)?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Timestamp of the newest activity row, if any.
+    pub fn last_activity_at(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row("SELECT MAX(timestamp) FROM activity", [], |r| {
+                r.get::<_, Option<String>>(0)
+            })
+            .unwrap_or(None))
+    }
+
+    /// Timestamp of the newest row where something actually CHANGED.
+    ///
+    /// The direct antidote to the silent-no-op failure: a daemon with plenty
+    /// of activity but no `acted` row has been running and doing nothing, and
+    /// that is reported as inert rather than healthy.
+    pub fn last_acted_at(&self) -> Result<Option<String>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT MAX(timestamp) FROM activity WHERE outcome = 'acted'",
+                [],
+                |r| r.get::<_, Option<String>>(0),
+            )
+            .unwrap_or(None))
+    }
+
+    /// Counts per outcome over the whole retained window.
+    pub fn activity_counts(&self) -> Result<Vec<(String, usize)>> {
+        let mut stmt = self
+            .conn
+            .prepare("SELECT outcome, COUNT(*) FROM activity GROUP BY outcome ORDER BY 2 DESC")?;
+        let rows = stmt.query_map([], |r| {
+            Ok((r.get::<_, String>(0)?, r.get::<_, i64>(1)? as usize))
+        })?;
+        Ok(rows.collect::<std::result::Result<Vec<_>, _>>()?)
+    }
+
+    /// Bound the activity log: drop rows older than `max_age_days` and, of
+    /// what remains, all but the newest `max_rows`. Returns rows removed.
+    ///
+    /// Applied ONLY to `activity`. `events`/`migrations`/`rekeys` back `undo`,
+    /// so pruning them is a decision about how long undo stays available — a
+    /// semantic question, not a storage one, and deliberately not made here
+    /// (hardening item M17 remains open for those).
+    pub fn prune_activity(&self, max_age_days: u32, max_rows: usize) -> Result<usize> {
+        let by_age = self.conn.execute(
+            "DELETE FROM activity WHERE timestamp < datetime('now', ?1)",
+            params![format!("-{max_age_days} days")],
+        )?;
+        let by_count = self.conn.execute(
+            "DELETE FROM activity WHERE id NOT IN
+               (SELECT id FROM activity ORDER BY id DESC LIMIT ?1)",
+            params![max_rows as i64],
+        )?;
+        Ok(by_age + by_count)
+    }
+
     /// Record an applied store re-key. `undo_plan` is an opaque JSON blob
     /// (a serialized `rekey::RekeyPlan` that reverses it).
     pub fn record_rekey(
@@ -696,5 +836,76 @@ mod tests {
         log.mark_migration_undone(id).unwrap();
         let second_ts = log.get_migration(id).unwrap().unwrap().undone_at;
         assert_eq!(first_ts, second_ts, "undone_at must not change on repeat");
+    }
+}
+
+#[cfg(test)]
+mod activity_tests {
+    use crate::activity::{ActivityKind, ActivityRecord, NoOpReason, Outcome};
+    use crate::event_log::EventLog;
+
+    fn rec(log: &EventLog, outcome: Outcome) {
+        log.record_activity(&ActivityRecord::new(ActivityKind::Rekey, outcome).tool("claude_code"))
+            .unwrap();
+    }
+
+    #[test]
+    fn retention_bounds_activity_and_never_touches_undo_critical_rows() {
+        // The design's load-bearing boundary: `activity` is disposable and
+        // bounded; `rekeys`/`migrations` back `undo` and must survive any
+        // prune, or the operator loses their route back from a mutation.
+        let log = EventLog::open_in_memory().unwrap();
+        for _ in 0..50 {
+            rec(&log, Outcome::acted(1, NoOpReason::NoStoreForProject));
+        }
+        log.record_rekey("claude_code", "/old", "/new", "[]")
+            .unwrap();
+        log.record_migration(
+            "codex",
+            std::path::Path::new("/a"),
+            std::path::Path::new("/b"),
+            "{}",
+        )
+        .unwrap();
+
+        let pruned = log.prune_activity(3650, 10).unwrap();
+        assert_eq!(pruned, 40, "kept only the newest 10 activity rows");
+        assert_eq!(log.recent_activity(100).unwrap().len(), 10);
+
+        assert_eq!(
+            log.recent_rekeys(10).unwrap().len(),
+            1,
+            "pruning observability must not delete a re-key's undo plan"
+        );
+        assert_eq!(
+            log.recent_migrations(10).unwrap().len(),
+            1,
+            "pruning observability must not delete a migration's undo plan"
+        );
+    }
+
+    #[test]
+    fn a_log_full_of_noops_reports_no_acted_timestamp() {
+        // The silent-no-op signature: plenty of activity, nothing achieved.
+        let log = EventLog::open_in_memory().unwrap();
+        for _ in 0..5 {
+            rec(
+                &log,
+                Outcome::NoOp {
+                    reason: NoOpReason::ToolDeclaresNotify,
+                },
+            );
+        }
+        assert!(
+            log.last_activity_at().unwrap().is_some(),
+            "the daemon was clearly busy"
+        );
+        assert!(
+            log.last_acted_at().unwrap().is_none(),
+            "...and achieved nothing — which is exactly what must be visible"
+        );
+
+        rec(&log, Outcome::acted(2, NoOpReason::NoStoreForProject));
+        assert!(log.last_acted_at().unwrap().is_some());
     }
 }

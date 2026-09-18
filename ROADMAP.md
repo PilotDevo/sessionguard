@@ -6,7 +6,22 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.9.0 (current)** — Session-store model, wave 2: **store re-keying** —
+**v0.10.0 (current)** — **Local observability.** Store re-keying was broken for
+months and nothing in the product said so: a reconcile that did nothing
+returned `success: true`, so "worked" and "did nothing" were the same value in
+the data model. v0.10 makes the distinction structural. An `Outcome` type
+(`Acted`/`NoOp`/`Refused`/`Failed`) replaces the bool and its constructor makes
+"acted on zero things" unconstructible; an `activity` table records one row per
+decision **including the decisions to do nothing**, because a log of actions
+taken cannot answer "why did nothing happen?"; and tables are split by
+durability class so observability can be pruned while the rows backing `undo`
+never are. `sessionguard status --deep` answers "is it working?" rather than
+"is it running?" — a daemon that is up with no `acted` row is reported
+**inert** — and `log --activity` shows the decision history. Entirely
+local: no endpoint, nothing leaves the machine. Design:
+[`docs/design/observability.md`](docs/design/observability.md).
+
+**v0.9.x** — Session-store model, wave 2: **store re-keying** —
 the reconcile that was missing. v0.8's census proved the shape of the problem
 and v0.8.1's honesty patch named it out loud (`claude_code` and `gemini_cli`
 became `on_move = "notify"`, i.e. "we see the move and do nothing"): Claude

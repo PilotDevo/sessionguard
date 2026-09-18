@@ -175,3 +175,165 @@ mod tests {
         assert_eq!(j["status"], "not_configured");
     }
 }
+
+/// Whether the daemon is doing its job — derived, never stored.
+///
+/// A stored health record is a lie the moment the process dies, so every
+/// field here is computed at query time from the PID file, the config, the
+/// filesystem and the activity log.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct DaemonHealth {
+    pub running: bool,
+    pub pid: Option<u32>,
+    pub version: String,
+    /// Configured watch roots that do NOT exist on disk. A root renamed out
+    /// from under the config is a silent way for the daemon to become inert:
+    /// it is up, watching nothing.
+    pub missing_watch_roots: Vec<String>,
+    pub watch_root_count: usize,
+    pub tracked_projects: usize,
+    /// Newest decision of any kind.
+    pub last_activity: Option<String>,
+    /// Newest decision that actually CHANGED something.
+    pub last_acted: Option<String>,
+    /// Counts per outcome over the retained window.
+    pub outcomes: Vec<(String, usize)>,
+    /// Problems worth an operator's attention, in plain language.
+    pub warnings: Vec<String>,
+}
+
+impl DaemonHealth {
+    /// True when the daemon is up but has never actually changed anything.
+    ///
+    /// This is the direct antidote to the failure that motivated this module:
+    /// for months the daemon ran, logged, reported success, and moved zero
+    /// sessions. "Up" was never the same question as "working".
+    pub fn is_inert(&self) -> bool {
+        self.running && self.last_acted.is_none()
+    }
+
+    /// Gather everything. `registry` and `log` are passed in so this stays
+    /// testable and never opens the operator's real databases implicitly.
+    pub fn gather(
+        config: &crate::config::Config,
+        registry: &crate::registry::Registry,
+        log: &crate::event_log::EventLog,
+    ) -> Self {
+        let running = crate::daemon::is_running();
+        let pid = crate::daemon::read_pid().ok().flatten();
+        let missing_watch_roots: Vec<String> = config
+            .watch_roots
+            .iter()
+            .filter(|p| !p.is_dir())
+            .map(|p| p.display().to_string())
+            .collect();
+        let tracked_projects = registry.list_projects().map(|p| p.len()).unwrap_or(0);
+        let last_activity = log.last_activity_at().ok().flatten();
+        let last_acted = log.last_acted_at().ok().flatten();
+        let outcomes = log.activity_counts().unwrap_or_default();
+
+        let mut health = Self {
+            running,
+            pid,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            missing_watch_roots,
+            watch_root_count: config.watch_roots.len(),
+            tracked_projects,
+            last_activity,
+            last_acted,
+            outcomes,
+            warnings: Vec::new(),
+        };
+
+        if !health.running {
+            health.warnings.push(
+                "the daemon is not running — no moves are being reconciled. Start it with \
+                 `sessionguard start`."
+                    .into(),
+            );
+        }
+        if health.watch_root_count == 0 {
+            health.warnings.push(
+                "no watch roots are configured, so nothing is being watched. Add some with \
+                 `sessionguard watch <path>` or in config.toml."
+                    .into(),
+            );
+        }
+        for root in &health.missing_watch_roots {
+            health.warnings.push(format!(
+                "watch root {root} does not exist — it was moved or deleted, so nothing under \
+                 it is being watched"
+            ));
+        }
+        if health.is_inert() {
+            health.warnings.push(
+                "the daemon is running but has NEVER changed anything. If projects have moved \
+                 since it started, it is not doing its job — check `sessionguard log --activity`."
+                    .into(),
+            );
+        }
+        let refused = health
+            .outcomes
+            .iter()
+            .find(|(k, _)| k == "refused")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if refused > 0 {
+            health.warnings.push(format!(
+                "{refused} operation(s) were REFUSED to protect your data and need your \
+                 attention — see `sessionguard log --activity`"
+            ));
+        }
+        let failed = health
+            .outcomes
+            .iter()
+            .find(|(k, _)| k == "failed")
+            .map(|(_, n)| *n)
+            .unwrap_or(0);
+        if failed > 0 {
+            health.warnings.push(format!(
+                "{failed} operation(s) FAILED — see `sessionguard log --activity`"
+            ));
+        }
+        health
+    }
+}
+
+#[cfg(test)]
+mod daemon_health_tests {
+    use super::DaemonHealth;
+
+    /// A daemon that is up but has never changed anything is INERT, and must
+    /// be reported that way. This is the v0.9.0 scenario: running, logging,
+    /// reporting success, moving zero sessions, for months.
+    #[test]
+    fn running_but_never_acted_is_inert_and_warns() {
+        let h = DaemonHealth {
+            running: true,
+            pid: Some(42),
+            version: "test".into(),
+            missing_watch_roots: vec![],
+            watch_root_count: 2,
+            tracked_projects: 3,
+            last_activity: Some("2026-09-18 00:00:00".into()),
+            last_acted: None,
+            outcomes: vec![("noop".into(), 12)],
+            warnings: vec![],
+        };
+        assert!(h.is_inert(), "busy but achieving nothing is inert");
+
+        let working = DaemonHealth {
+            last_acted: Some("2026-09-18 00:00:01".into()),
+            ..h.clone()
+        };
+        assert!(!working.is_inert());
+
+        // A stopped daemon is "not running", which is a different problem —
+        // don't also cry "inert" at it.
+        let stopped = DaemonHealth {
+            running: false,
+            ..h.clone()
+        };
+        assert!(!stopped.is_inert());
+    }
+}

@@ -4,7 +4,7 @@
 
 | Version | Supported |
 | ------- | --------- |
-| 0.9.x   | ✅ Yes     |
+| 0.10.x   | ✅ Yes     |
 | < 0.8   | ⚠️ Best-effort (upgrade to the latest 0.8.x) |
 
 ## Reporting a Vulnerability

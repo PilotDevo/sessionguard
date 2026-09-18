@@ -7,6 +7,7 @@
 //! This library crate contains all core logic. The binary (`main.rs`) is a thin
 //! wrapper that parses CLI args and dispatches to library functions.
 
+pub mod activity;
 pub mod cli;
 pub mod config;
 pub mod daemon;

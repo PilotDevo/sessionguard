@@ -2,6 +2,55 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.10.0] - 2026-09-18
+
+### Added — local observability: making "it did nothing" visible
+
+Store re-keying was broken for months and **nothing in the product said so**.
+The reason is in one line of `reconciler.rs`:
+
+```rust
+ReconcileStrategy::Notify => { ... ReconcileResult { actions_taken: vec![], success: true, error: None } }
+```
+
+`success: true` with zero actions. Every time the daemon declined to do
+anything it recorded a success, so "worked" and "did nothing" were the same
+value in the data model and no amount of log-reading could tell them apart.
+This release makes that distinction structural. Everything is **local-only** —
+no endpoint, no phone-home, nothing leaves the machine.
+
+- **`Outcome` replaces `success: bool`** (`src/activity.rs`):
+  `Acted { actions }` / `NoOp { reason }` / `Refused { reason }` /
+  `Failed { error }`. `Outcome::acted(n, reason)` is the only way to build an
+  `Acted` and returns a `NoOp` when `n == 0`, so the shape above is
+  **unconstructible**. `NoOpReason` is an enum, not prose — prose is how the
+  original bug hid.
+- **An `activity` table records one row per DECISION**, including every
+  decision to do nothing. A log of actions taken cannot answer "why did
+  nothing happen?", which is the question that went unanswered.
+- **Tables are separated by durability class.** `events`/`migrations`/`rekeys`
+  back `undo` and are never auto-pruned; `activity` is disposable and bounded
+  by `activity_retention_days` (30) and `activity_max_rows` (50 000), both
+  configurable, pruned at daemon startup. A test pins that boundary.
+- **`sessionguard status --deep`** answers "is it actually working?", not just
+  "is it running": watch roots configured vs. actually present, when it last
+  did anything, when it last *changed* anything, outcome counts, and plain
+  warnings. A daemon that is up with no `acted` row is reported **inert** —
+  the direct antidote to the failure above.
+- **`sessionguard log --activity`** shows the decision history, marking
+  `✔ acted` / `· no-op` / `⚠ refused` / `✖ failed` so a no-op cannot read as a
+  success at a glance.
+- Re-key outcomes are recorded in `rekey_all` itself, so the CLI and the
+  daemon are observed identically rather than only whichever path was wired.
+
+### Changed
+
+- `ReconcileResult.success`/`.error` → `ReconcileResult.outcome` (breaking for
+  library consumers).
+- `config.toml` gains `activity_retention_days` and `activity_max_rows`.
+
+Design: [`docs/design/observability.md`](docs/design/observability.md).
+
 ## [0.9.1] - 2026-09-18
 
 ### Fixed — the v0.9.0 daemon re-key never fired, and `undo` only half-reversed

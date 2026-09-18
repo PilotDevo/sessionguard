@@ -14,17 +14,24 @@ use std::path::Path;
 
 use tracing::{debug, info, warn};
 
+use crate::activity::{NoOpReason, Outcome};
 use crate::error::Result;
 use crate::event_log::{EventLog, LogEntry, ReconcileAction};
 use crate::tools::{PathFieldSpec, ReconcileStrategy, ToolDefinition};
 
 /// Outcome of a single reconciliation operation.
+///
+/// `outcome` replaced a `success: bool` + `error: Option<String>` pair. The
+/// bool could not express "succeeded and did nothing", so it was used for
+/// "didn't fail" — and the `Notify` arm below returned `success: true` with an
+/// empty action list every time it declined to do anything. That made a
+/// healthy reconcile and a totally inert one the same value, which is how
+/// store re-keying stayed broken for months. See [`crate::activity`].
 #[derive(Debug, Clone)]
 pub struct ReconcileResult {
     pub tool_name: String,
     pub actions_taken: Vec<ReconcileAction>,
-    pub success: bool,
-    pub error: Option<String>,
+    pub outcome: Outcome,
 }
 
 /// Reconcile session artifacts for a project that has moved.
@@ -43,22 +50,25 @@ pub fn reconcile(
 
     match &tool.on_move {
         ReconcileStrategy::RewritePaths => rewrite_paths(tool, old_root, new_root, event_log),
-        ReconcileStrategy::Notify => {
-            info!(tool = %tool.name, "notify-only strategy, no paths rewritten");
-            ReconcileResult {
-                tool_name: tool.name.clone(),
-                actions_taken: vec![],
-                success: true,
-                error: None,
-            }
-        }
+        // Not a success. The tool declares it has no in-project path to
+        // rewrite, which for a tool WITH a session_store is fine (re-keying
+        // handles it) and for one without means the move is unreconciled.
+        // Either way the operator can now tell it apart from real work.
+        ReconcileStrategy::Notify => ReconcileResult {
+            tool_name: tool.name.clone(),
+            actions_taken: vec![],
+            outcome: Outcome::NoOp {
+                reason: NoOpReason::ToolDeclaresNotify,
+            },
+        },
         ReconcileStrategy::Custom(cmd) => {
             warn!(tool = %tool.name, cmd = %cmd, "custom reconciliation not yet implemented");
             ReconcileResult {
                 tool_name: tool.name.clone(),
                 actions_taken: vec![],
-                success: false,
-                error: Some("custom reconciliation not yet implemented".to_string()),
+                outcome: Outcome::Failed {
+                    error: "custom reconciliation not yet implemented".to_string(),
+                },
             }
         }
     }
@@ -107,12 +117,13 @@ fn rewrite_paths(
                     return ReconcileResult {
                         tool_name: tool.name.clone(),
                         actions_taken: actions,
-                        success: false,
-                        error: Some(format!(
-                            "rewrote {} but failed to record its undo entry \
-                             (undo unavailable for this change): {e}",
-                            artifact_path.display()
-                        )),
+                        outcome: Outcome::Failed {
+                            error: format!(
+                                "rewrote {} but failed to record its undo entry \
+                                 (undo unavailable for this change): {e}",
+                                artifact_path.display()
+                            ),
+                        },
                     };
                 }
                 actions.push(action);
@@ -136,16 +147,19 @@ fn rewrite_paths(
         return ReconcileResult {
             tool_name: tool.name.clone(),
             actions_taken: actions,
-            success: false,
-            error: Some(format!("failed to rewrite: {}", errors.join("; "))),
+            outcome: Outcome::Failed {
+                error: format!("failed to rewrite: {}", errors.join("; ")),
+            },
         };
     }
 
+    // `acted` refuses to report zero rewrites as work done: a tool whose
+    // declared path_fields matched nothing on disk gets a no-op with a reason,
+    // not a success. That distinction is the whole point.
     ReconcileResult {
         tool_name: tool.name.clone(),
+        outcome: Outcome::acted(actions.len(), NoOpReason::NoArtifactsFound),
         actions_taken: actions,
-        success: true,
-        error: None,
     }
 }
 
@@ -534,6 +548,78 @@ fn rewrite_text(path: &Path, pairs: &[(String, String)]) -> Result<Option<usize>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The regression that makes this whole module's `Outcome` worth having.
+    ///
+    /// `Notify` used to return `success: true` with an empty action list, so a
+    /// tool that reconciles NOTHING on a move was indistinguishable from one
+    /// that worked. That is how Claude Code went months without its sessions
+    /// following a move while the daemon reported success every time.
+    #[test]
+    fn a_notify_only_tool_reports_a_noop_with_a_reason_not_a_success() {
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+        let tool = ToolDefinition {
+            name: "notify_only".into(),
+            display_name: "Notify Only".into(),
+            session_patterns: vec![],
+            path_fields: vec![],
+            on_move: ReconcileStrategy::Notify,
+            version: None,
+            binary: None,
+            home_dir_layout: None,
+            session_store: None,
+        };
+        let result = reconcile(&tool, dir.path(), dir.path(), &log);
+
+        assert_eq!(
+            result.outcome,
+            Outcome::NoOp {
+                reason: NoOpReason::ToolDeclaresNotify
+            },
+            "a notify-only tool did nothing; that must be recorded as a no-op WITH a reason"
+        );
+        assert!(
+            !result.outcome.changed_something(),
+            "nothing was rewritten, so nothing changed"
+        );
+        assert!(
+            !result.outcome.is_failure(),
+            "declining is not a crash — reporting it as one would cry wolf"
+        );
+        assert!(result.actions_taken.is_empty());
+    }
+
+    /// A tool that DOES declare rewritable fields, none of which exist on
+    /// disk, is also a no-op — not a success with zero rewrites.
+    #[test]
+    fn declared_fields_that_match_nothing_are_a_noop_not_a_success() {
+        let dir = TempDir::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+        let tool = ToolDefinition {
+            name: "ghost".into(),
+            display_name: "Ghost".into(),
+            session_patterns: vec![],
+            path_fields: vec![PathFieldSpec {
+                file: ".nope/settings.json".into(),
+                field: "project_path".into(),
+                format: "json".into(),
+            }],
+            on_move: ReconcileStrategy::RewritePaths,
+            version: None,
+            binary: None,
+            home_dir_layout: None,
+            session_store: None,
+        };
+        let result = reconcile(&tool, dir.path(), dir.path(), &log);
+        assert_eq!(
+            result.outcome,
+            Outcome::NoOp {
+                reason: NoOpReason::NoArtifactsFound
+            },
+            "zero rewrites is not work done"
+        );
+    }
     use crate::event_log::EventLog;
     use crate::tools::ToolRegistry;
     use std::fs;
@@ -942,7 +1028,11 @@ mod tests {
         let result = reconcile(&tool, &old_path, &new_path, &event_log);
 
         // Assertions
-        assert!(result.success, "reconciliation should succeed");
+        assert!(
+            result.outcome.changed_something(),
+            "expected real work, got {:?}",
+            result.outcome
+        );
         assert_eq!(result.actions_taken.len(), 1, "should rewrite one file");
         assert_eq!(result.actions_taken[0].field, "project_path");
 
@@ -999,7 +1089,11 @@ mod tests {
         let result = reconcile(tool, &old_path, &new_path, &event_log);
 
         // Assertions
-        assert!(result.success, "reconciliation should succeed");
+        assert!(
+            result.outcome.changed_something(),
+            "expected real work, got {:?}",
+            result.outcome
+        );
         assert_eq!(result.actions_taken.len(), 1);
         assert_eq!(result.actions_taken[0].field, "project_root");
 
@@ -1053,7 +1147,11 @@ mod tests {
         ] {
             let name = tool.name.clone();
             let result = reconcile(&tool, &old_path, &new_path, &event_log);
-            assert!(result.success, "{name} reconciliation should succeed");
+            assert!(
+                result.outcome.changed_something(),
+                "{name}: expected real work, got {:?}",
+                result.outcome
+            );
             assert_eq!(result.actions_taken.len(), 1);
         }
 
@@ -1093,7 +1191,7 @@ mod tests {
         let event_log = EventLog::open_in_memory().unwrap();
 
         let result = reconcile(&tool, &old_path, &new_path, &event_log);
-        assert!(result.success);
+        assert!(result.outcome.changed_something());
 
         let content = fs::read_to_string(new_path.join(".testtool/settings.json")).unwrap();
         let v: serde_json::Value = serde_json::from_str(&content).unwrap();
@@ -1133,7 +1231,7 @@ mod tests {
         let tool = synthetic_json_tool();
         let event_log = EventLog::open_in_memory().unwrap();
         let r = reconcile(&tool, &old_path, &new_path, &event_log);
-        assert!(r.success);
+        assert!(r.outcome.changed_something());
 
         // Grab the logged entry and run undo
         let entry = &event_log.recent(1).unwrap()[0];

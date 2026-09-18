@@ -73,6 +73,24 @@ pub struct Config {
     /// Fleet hosts this machine can census over ssh (`--host`/`--all-hosts`).
     #[serde(default)]
     pub hosts: Vec<HostSpec>,
+
+    /// How long to keep the activity log (days). Activity is observability
+    /// and disposable; the `events`/`migrations`/`rekeys` tables back `undo`
+    /// and are never pruned by this.
+    #[serde(default = "default_activity_retention_days")]
+    pub activity_retention_days: u32,
+
+    /// Hard cap on retained activity rows, whichever bound is tighter.
+    #[serde(default = "default_activity_max_rows")]
+    pub activity_max_rows: usize,
+}
+
+fn default_activity_retention_days() -> u32 {
+    30
+}
+
+fn default_activity_max_rows() -> usize {
+    50_000
 }
 
 impl Default for Config {
@@ -82,6 +100,8 @@ impl Default for Config {
             watch_mode: WatchMode::default(),
             tools: Vec::new(),
             hosts: Vec::new(),
+            activity_retention_days: default_activity_retention_days(),
+            activity_max_rows: default_activity_max_rows(),
         }
     }
 }

@@ -659,6 +659,29 @@ pub fn rekey_all(
             r.log_id = log_id;
         }
     }
+
+    // Record what was DECIDED for every store — including the ones that had
+    // nothing to do. Done here rather than in the callers so the CLI and the
+    // daemon are observed identically; a decision only one entry point records
+    // is a blind spot in whichever path the operator happens to use.
+    if !dry_run {
+        for r in &reports {
+            let outcome = match (&r.error, r.applied) {
+                (Some(e), _) => crate::activity::Outcome::Refused { reason: e.clone() },
+                (None, true) => crate::activity::Outcome::acted(
+                    r.plan.actions.len(),
+                    crate::activity::NoOpReason::NoStoreForProject,
+                ),
+                (None, false) => crate::activity::Outcome::NoOp {
+                    reason: crate::activity::NoOpReason::NoStoreForProject,
+                },
+            };
+            crate::activity::ActivityRecord::new(crate::activity::ActivityKind::Rekey, outcome)
+                .tool(&r.tool)
+                .project(new_path.display().to_string())
+                .emit(event_log);
+        }
+    }
     reports
 }
 

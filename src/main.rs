@@ -95,15 +95,24 @@ async fn main() -> Result<()> {
             }
         }
 
-        Command::Status { format } => {
+        Command::Status { format, deep } => {
             let registry = Registry::open_default()?;
             let projects = registry.list_projects()?;
             let running = sessionguard::daemon::is_running();
+            let health = if deep {
+                let log = EventLog::open_default()?;
+                Some(sessionguard::health::DaemonHealth::gather(
+                    &config, &registry, &log,
+                ))
+            } else {
+                None
+            };
             match format {
                 sessionguard::cli::Format::Json => {
                     let payload = serde_json::json!({
                         "daemon_running": running,
                         "projects": projects,
+                        "health": health,
                     });
                     println!("{}", serde_json::to_string_pretty(&payload)?);
                 }
@@ -117,6 +126,9 @@ async fn main() -> Result<()> {
                         }
                     }
                     println!("\ndaemon running: {running}");
+                    if let Some(h) = &health {
+                        print_health(h);
+                    }
                 }
             }
         }
@@ -352,7 +364,68 @@ async fn main() -> Result<()> {
             }
         },
 
-        Command::Log { last, format } => {
+        Command::Log {
+            last,
+            activity,
+            format,
+        } if activity => {
+            let event_log = EventLog::open_default()?;
+            let entries = event_log.recent_activity(last)?;
+            match format {
+                sessionguard::cli::Format::Json => {
+                    let rows: Vec<_> = entries
+                        .iter()
+                        .map(|e| {
+                            serde_json::json!({
+                                "id": e.id, "timestamp": e.timestamp, "kind": e.kind,
+                                "tool": e.tool_name, "project": e.project_path,
+                                "outcome": e.outcome, "reason": e.reason, "actions": e.actions,
+                            })
+                        })
+                        .collect();
+                    println!("{}", serde_json::to_string_pretty(&rows)?);
+                }
+                sessionguard::cli::Format::Text => {
+                    if entries.is_empty() {
+                        println!(
+                            "no activity recorded yet.\n\
+                             (the daemon records every decision here — including the decisions \
+                             to do nothing — so an empty log means it has not processed a move.)"
+                        );
+                    } else {
+                        for e in &entries {
+                            // The marker is the point: a no-op must not read
+                            // like a success at a glance.
+                            let mark = match e.outcome.as_str() {
+                                "acted" => "✔",
+                                "noop" => "·",
+                                "refused" => "⚠",
+                                _ => "✖",
+                            };
+                            let detail = match (&e.reason, e.actions) {
+                                (Some(r), _) if e.outcome != "acted" => format!(" — {r}"),
+                                (_, n) if n > 0 => format!(" — {n} action(s)"),
+                                _ => String::new(),
+                            };
+                            println!(
+                                "{mark} [{}] {:<9} {:<12} {}{}",
+                                e.timestamp,
+                                e.kind,
+                                e.tool_name.as_deref().unwrap_or("-"),
+                                e.project_path.as_deref().unwrap_or("-"),
+                                detail
+                            );
+                        }
+                        println!(
+                            "\nlegend: ✔ changed something · · deliberately did nothing \
+                             · ⚠ refused (needs you) · ✖ failed"
+                        );
+                    }
+                }
+            }
+        }
+
+        Command::Log { last, format, .. } => {
             let event_log = EventLog::open_default()?;
             let entries = event_log.recent(last)?;
             match format {
@@ -1588,6 +1661,42 @@ fn undo_one_rekey(
     event_log.mark_rekey_undone(entry.id)?;
     println!("\nre-key {} undone", entry.id);
     Ok(())
+}
+
+/// Render `status --deep`. Leads with whether the daemon is actually DOING
+/// anything, because "running" and "working" are different questions and only
+/// the first one used to be answerable.
+fn print_health(h: &sessionguard::health::DaemonHealth) {
+    println!("version: {}", h.version);
+    if let Some(pid) = h.pid {
+        println!("pid: {pid}");
+    }
+    println!(
+        "watch roots: {} configured, {} missing",
+        h.watch_root_count,
+        h.missing_watch_roots.len()
+    );
+    println!("tracked projects: {}", h.tracked_projects);
+    println!(
+        "last activity: {}",
+        h.last_activity.as_deref().unwrap_or("never")
+    );
+    println!(
+        "last actually changed something: {}",
+        h.last_acted.as_deref().unwrap_or("never")
+    );
+    if !h.outcomes.is_empty() {
+        let summary: Vec<String> = h.outcomes.iter().map(|(k, n)| format!("{k} {n}")).collect();
+        println!("outcomes: {}", summary.join(", "));
+    }
+    if h.warnings.is_empty() {
+        println!("\n✔ no problems detected.");
+    } else {
+        println!();
+        for w in &h.warnings {
+            println!("⚠ {w}");
+        }
+    }
 }
 
 /// Census this machine. Resolves the census root (`--home` if given, else
