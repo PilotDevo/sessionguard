@@ -2,6 +2,18 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.11.1] - 2026-09-22
+
+### Fixed
+
+- **Interactive commands no longer print the daemon's log lines.** Since
+  v0.10 every `sessionguard rekey` printed three `INFO sessionguard::activity`
+  lines, with colour codes, on top of its own output. These belong in the
+  daemon's audit log. Without `RUST_LOG`, only `start` now logs at `info`;
+  every other command defaults to warnings only. Found by using v0.11.0 on a
+  real machine to recover four stranded projects; no test had looked at a
+  command's stderr.
+
 ## [0.11.0] - 2026-09-22
 
 ### Fixed — safe to actually run
