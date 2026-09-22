@@ -183,6 +183,64 @@ diff -r "$WORKDIR/snapshot-claude" "$HOME/.claude" >/dev/null \
     || fail "a REFUSED re-key still modified the store"
 echo "  ✓ refused, explained, and changed nothing"
 
+# ── 6. the DAEMON path: noise does nothing, real moves are re-keyed ──────
+# The unit tests call the move handler with fabricated events; this runs the
+# real daemon against real filesystem events. v0.9.0's automatic re-key never
+# fired, and through v0.10 every rename (git, cargo, editor saves) planned a
+# re-key across every store — both invisible without exactly this.
+echo "▶ daemon: real watcher, real git commit, real project + folder moves..."
+D="$WORKDIR/daemon"
+mkdir -p "$D/code/proj" "$D/code/folder/inner"
+for p in "$D/code/proj" "$D/code/folder/inner"; do
+    SD="$HOME/.claude/projects/$(encode "$p")"
+    mkdir -p "$SD"
+    printf '{"cwd":"%s"}\n' "$p" > "$SD/s.jsonl"
+done
+printf 'watch_roots = ["%s"]\n' "$D/code" > "$SESSIONGUARD_CONFIG_DIR/config.toml"
+
+activity_count() { sg log --activity --last 10000 --format json 2>/dev/null \
+    | python3 -c 'import json,sys; print(len(json.load(sys.stdin)))'; }
+BEFORE=$(activity_count)
+
+sg start --foreground > "$WORKDIR/daemon.log" 2>&1 &
+DPID=$!
+for _ in $(seq 1 50); do
+    grep -q "watching for filesystem events" "$WORKDIR/daemon.log" 2>/dev/null && break
+    sleep 0.1
+done
+kill -0 "$DPID" 2>/dev/null || { cat "$WORKDIR/daemon.log"; fail "daemon exited during startup"; }
+sleep 1
+
+(cd "$D/code/proj" && git init -q && echo x > f && git add f \
+    && git -c user.email=a@b -c user.name=t commit -qm x)
+sleep 2
+AFTER_GIT=$(activity_count)
+[[ "$AFTER_GIT" == "$BEFORE" ]] \
+    || fail "a git commit is not a project move, but the daemon recorded $((AFTER_GIT - BEFORE)) decision(s)"
+echo "  ✓ git commit inside a watched project: no re-key planned"
+
+mv "$D/code/proj" "$D/code/proj-moved"
+mv "$D/code/folder" "$D/code/folder2"
+sleep 3
+kill -TERM "$DPID" 2>/dev/null; wait "$DPID" 2>/dev/null || true
+
+sg sessions --format json > "$WORKDIR/daemon-after.json" 2>/dev/null
+python3 - "$WORKDIR/daemon-after.json" "$D/code" <<'PY2' || { cat "$WORKDIR/daemon.log"; fail "the daemon did not re-key the moves"; }
+import json, os, sys
+groups = {os.path.realpath(g["project_path"]): g for g in json.load(open(sys.argv[1]))}
+code = os.path.realpath(sys.argv[2])
+for want in (f"{code}/proj-moved", f"{code}/folder2/inner"):
+    g = groups.get(want)
+    if g is None:
+        sys.exit(f"{want} missing — sessions did not follow the move; census has {sorted(groups)}")
+    if g["orphaned"]:
+        sys.exit(f"{want} is orphaned")
+for gone in (f"{code}/proj", f"{code}/folder/inner"):
+    if gone in groups:
+        sys.exit(f"{gone} still has sessions keyed to it")
+PY2
+echo "  ✓ project move and folder move both re-keyed by the daemon"
+
 echo
-echo "✅ PASS — rekey → undo byte-exact, bystanders untouched, merge refused"
+echo "✅ PASS — rekey → undo byte-exact, bystanders untouched, merge refused, daemon re-keys real moves and ignores noise"
 exit 0

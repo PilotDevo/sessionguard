@@ -6,7 +6,20 @@ in real-world dogfooding.
 
 ## Where we are
 
-**v0.10.0 (current)** — **Local observability.** Store re-keying was broken for
+**v0.11.0 (current)** — **Safe to actually run.** A ground-truth audit (running
+it, not reading tests or docs) found SessionGuard had never reconciled a real
+session on either of the author's machines. The code worked in isolation; the
+product didn't: macOS had no autostart, `init` proposed watching `/Users` for
+any Claude Code user, and the daemon treated every file rename — each git
+commit, editor save and Cargo build — as a project move, planning a re-key
+across every store at ~1.2 s and ~3.9 GB per event. v0.11 fixes all three
+(`service install`, safe `init` roots, a known-project filter), makes planning
+bounded-memory (0.01 s / 11 MB for the same probe), re-keys whole folders of
+projects as one undo, and stops the Codex re-key from rewriting other
+projects' sessions that merely mention a moved path. The next step is not a
+feature: it is running it daily on real machines.
+
+**v0.10.x** — **Local observability.** Store re-keying was broken for
 months and nothing in the product said so: a reconcile that did nothing
 returned `success: true`, so "worked" and "did nothing" were the same value in
 the data model. v0.10 makes the distinction structural. An `Outcome` type

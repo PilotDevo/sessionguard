@@ -2,7 +2,9 @@
 # Copyright 2026 Devin R O'Loughlin / Droco LLC
 # SPDX-License-Identifier: MIT
 #
-# Install (per-user, recommended):
+# Easiest: `sessionguard service install` writes this unit for you, with
+# ExecStart pointing at the binary you ran it with. Manual install:
+#
 #   mkdir -p ~/.config/systemd/user
 #   cp sessionguard.service ~/.config/systemd/user/
 #   systemctl --user enable --now sessionguard

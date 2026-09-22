@@ -276,6 +276,15 @@ pub enum Command {
         dry_run: bool,
     },
 
+    /// Run the daemon at every login (launchd on macOS, systemd on Linux).
+    ///
+    /// Without this the daemon runs only until you log out or reboot — and a
+    /// watcher that isn't running reconciles nothing.
+    Service {
+        #[command(subcommand)]
+        action: ServiceAction,
+    },
+
     /// Re-key tools' session stores from one project path to another.
     ///
     /// This is the reconcile for home-dir stores. Claude Code, Codex and
@@ -337,6 +346,32 @@ pub enum Command {
         /// Shell to generate completions for.
         shell: Shell,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ServiceAction {
+    /// Install and start the login service for this user.
+    ///
+    /// Stops a daemon you started by hand first, so the two don't fight
+    /// over the PID file. The service restarts the daemon if it crashes, but
+    /// a clean `sessionguard stop` keeps it stopped until your next login.
+    Install {
+        /// Print the service file and the commands, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+        /// Allow pointing the service at a binary inside a Cargo `target/`
+        /// directory (it breaks on the next `cargo clean`).
+        #[arg(long)]
+        allow_dev_build: bool,
+    },
+    /// Stop the login service and remove it.
+    Uninstall {
+        /// Print what would be removed, change nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show whether the login service is installed, loaded and running.
+    Status,
 }
 
 #[derive(Debug, Subcommand)]

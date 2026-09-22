@@ -199,9 +199,6 @@ pub async fn run(config: &Config) -> Result<()> {
         std::path::PathBuf::new()
     });
 
-    // Start filesystem watcher over the configured roots AND every registered
-    // project's parent, so a project tracked via `watch` (which may live outside
-    // any configured root) is actually monitored.
     // Bound the activity log at startup. Observability must not become the
     // thing that fills the disk.
     match event_log.prune_activity(config.activity_retention_days, config.activity_max_rows) {
@@ -210,6 +207,14 @@ pub async fn run(config: &Config) -> Result<()> {
         Err(e) => warn!(error = %e, "could not prune the activity log"),
     }
 
+    // Which directories are projects. Everything else a rename touches is
+    // ignored before any store is read — see `known.rs`.
+    let mut known = crate::known::KnownProjects::build(&census_root, &tool_registry, &registry);
+    info!(projects = known.len(), "indexed known projects");
+
+    // Start filesystem watcher over the configured roots AND every registered
+    // project's parent, so a project tracked via `watch` (which may live outside
+    // any configured root) is actually monitored.
     let watch_set = build_watch_set(config, &registry);
     let mut watcher = crate::watcher::FsWatcher::new(&watch_set, &config.watch_mode)?;
 
@@ -220,21 +225,28 @@ pub async fn run(config: &Config) -> Result<()> {
         tokio::select! {
             Some(event) = watcher.events.recv() => {
                 tracing::debug!(?event, "received filesystem event");
-                handle_session_event(&census_root, event, &registry, &tool_registry, &event_log);
+                handle_session_event(
+                    &census_root,
+                    event,
+                    &registry,
+                    &tool_registry,
+                    &event_log,
+                    &mut known,
+                );
             }
             _ = reload_signal() => {
                 // SIGHUP: pick up newly-registered projects without a restart
-                // (the `watch` command sends this to us).
+                // (the `watch` command sends this to us). The watch set is
+                // updated IN PLACE — replacing the watcher dropped events
+                // still queued in its channel, so a project moved right after
+                // `watch` lost its move — and only then is the project index
+                // rebuilt, so the rebuild can't widen that window either.
                 let set = build_watch_set(config, &registry);
-                match crate::watcher::FsWatcher::new(&set, &config.watch_mode) {
-                    Ok(w) => {
-                        watcher = w;
-                        info!(watch_roots = ?set, "reloaded watch set (SIGHUP)");
-                    }
-                    Err(e) => {
-                        tracing::warn!(error = %e, "watch reload failed; keeping previous set");
-                    }
+                match watcher.update_roots(&set) {
+                    Ok(()) => info!(watch_roots = ?watcher.watched(), "reloaded watch set (SIGHUP)"),
+                    Err(e) => warn!(error = %e, "some watch roots could not be added"),
                 }
+                known = crate::known::KnownProjects::build(&census_root, &tool_registry, &registry);
             }
             _ = shutdown_signal() => {
                 info!("shutdown signal received");
@@ -261,10 +273,24 @@ fn build_watch_set(
             set.push(parent.to_path_buf());
         }
     }
+    // Canonicalize, then drop any root inside another. The same directory
+    // spelled two ways (`/var/…` and `/private/var/…` on macOS), or a folder
+    // plus its own parent, would otherwise be watched twice — and every event
+    // under it reported twice.
+    let mut set: Vec<std::path::PathBuf> = set
+        .into_iter()
+        .filter(|p| p.is_dir())
+        .map(|p| std::fs::canonicalize(&p).unwrap_or(p))
+        .collect();
     set.sort();
     set.dedup();
-    set.retain(|p| p.is_dir());
-    set
+    let mut out: Vec<std::path::PathBuf> = Vec::new();
+    for p in set {
+        if !out.iter().any(|o| p.starts_with(o)) {
+            out.push(p);
+        }
+    }
+    out
 }
 
 /// Resolve when a reload (SIGHUP) is requested. On non-Unix it never fires.
@@ -299,8 +325,8 @@ async fn reload_signal() {
 fn rekey_stores(
     census_root: &std::path::Path,
     tool_registry: &crate::tools::ToolRegistry,
-    old_path: &std::path::Path,
-    new_path: &std::path::Path,
+    moved: (&std::path::Path, &std::path::Path),
+    pairs: &[(std::path::PathBuf, std::path::PathBuf)],
     event_log: &crate::event_log::EventLog,
 ) {
     if census_root.as_os_str().is_empty() {
@@ -309,27 +335,65 @@ fn rekey_stores(
     }
     let env = |var: &str| std::env::var(var).ok();
     let stores = crate::sessions::resolve_stores(tool_registry.all(), Some(&env));
-    for report in crate::rekey::rekey_all(
-        census_root,
-        &stores,
-        old_path,
-        new_path,
-        Some(event_log),
-        false,
-    ) {
-        // Outcomes are recorded by `rekey_all` itself (same for the CLI path).
-        // This is the daemon's operator-facing summary line only.
+    for report in
+        crate::rekey::rekey_pairs(census_root, &stores, moved, pairs, Some(event_log), false)
+    {
+        // Outcomes are recorded by `rekey_pairs` itself (same for the CLI
+        // path). This is the daemon's operator-facing summary line only.
         if let Some(e) = &report.error {
             warn!(tool = %report.tool, "session store not re-keyed: {e}");
         } else if report.applied {
             info!(
                 tool = %report.tool,
+                project = %report.plan.new_path,
                 actions = report.plan.actions.len(),
                 undo_id = ?report.log_id,
                 "session store re-keyed to the new project path"
             );
         }
     }
+}
+
+/// Minimum age before a miss triggers a full index rebuild. A rebuild is a
+/// census (~20 ms warm on a real machine), so this caps the cost of a burst of
+/// unrelated directory renames — a Cargo build renames incremental dirs — at
+/// one census per interval, while still recognising a project that got its
+/// first session moments ago.
+const INDEX_REBUILD_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// Which known projects a directory move carries, or `None` if it carries
+/// none. On a miss, first re-reads the registry (cheap — it covers a project
+/// `watch`ed a moment before being moved), then, if the index is old enough,
+/// rebuilds it from the census.
+fn known_pairs(
+    census_root: &std::path::Path,
+    tool_registry: &crate::tools::ToolRegistry,
+    registry: &crate::registry::Registry,
+    known: &mut crate::known::KnownProjects,
+    from: &std::path::Path,
+    to: &std::path::Path,
+) -> Option<Vec<(std::path::PathBuf, std::path::PathBuf)>> {
+    let pairs = known.pairs_for_move(from, to);
+    if !pairs.is_empty() {
+        return Some(pairs);
+    }
+    if let Ok(projects) = registry.list_projects() {
+        let home = (!census_root.as_os_str().is_empty()).then_some(census_root);
+        let fresh =
+            crate::known::KnownProjects::from_keys(projects.into_iter().map(|p| p.path), home);
+        let pairs = fresh.pairs_for_move(from, to);
+        if !pairs.is_empty() {
+            return Some(pairs);
+        }
+    }
+    if known.age() >= INDEX_REBUILD_MIN_AGE {
+        *known = crate::known::KnownProjects::build(census_root, tool_registry, registry);
+        let pairs = known.pairs_for_move(from, to);
+        if !pairs.is_empty() {
+            return Some(pairs);
+        }
+    }
+    None
 }
 
 /// `census_root` is the home directory whose session stores get re-keyed. It
@@ -344,6 +408,7 @@ fn handle_session_event(
     registry: &crate::registry::Registry,
     tool_registry: &crate::tools::ToolRegistry,
     event_log: &crate::event_log::EventLog,
+    known: &mut crate::known::KnownProjects,
 ) {
     use crate::watcher::SessionEvent;
 
@@ -352,60 +417,103 @@ fn handle_session_event(
             from: Some(old_path),
             to: Some(new_path),
         } => {
-            info!(from = %old_path.display(), to = %new_path.display(), "project moved");
-
-            // Re-key the home-dir session stores FIRST, and unconditionally.
-            //
-            // This must run before the in-project detection guard below, not
-            // after it. `detect_tools` scans the PROJECT directory, but a
-            // `session_store` lives under `$HOME` — the two answer different
-            // questions. A project can have a year of Claude Code history and
-            // not a single `.claude/` file inside it, which is precisely the
-            // case this feature exists for; running after the guard meant the
-            // daemon skipped exactly the sessions it was built to move.
-            // (v0.9.0 shipped with the call below the guard, so automatic
-            // re-keying never fired for Claude Code. Regression test:
-            // `handle_session_event_moved_rekeys_the_store_under_the_given_root`.)
-            rekey_stores(census_root, tool_registry, &old_path, &new_path, event_log);
-
-            // Detect which AI tools have artifacts at the new location
-            let detected = crate::detector::detect_tools(&new_path, tool_registry);
-            if detected.is_empty() {
-                tracing::debug!("no in-project artifacts at new path; stores already re-keyed");
+            // 1. Only a directory can be a project. File renames — an
+            //    editor's atomic save, git's lock-file dance — are the vast
+            //    majority of rename events in a working tree, and can never
+            //    move a project. One `stat` rules them out.
+            if !new_path.is_dir() {
+                tracing::trace!(to = %new_path.display(), "file rename; not a project move");
                 return;
             }
 
-            // Reconcile each detected tool
-            for detection in &detected {
-                if let Some(tool) = tool_registry.get(&detection.tool_name) {
-                    let result =
-                        crate::reconciler::reconcile(tool, &old_path, &new_path, event_log);
-                    // Recorded whatever it was — including a no-op. A store of
-                    // actions taken cannot answer "why did nothing happen?".
-                    crate::activity::ActivityRecord::new(
-                        crate::activity::ActivityKind::Reconcile,
-                        result.outcome,
-                    )
-                    .tool(&result.tool_name)
-                    .project(new_path.display().to_string())
-                    .emit(Some(event_log));
+            // 2. Only act on a directory that IS, or CONTAINS, a known
+            //    project. Through v0.10 every rename planned a re-key across
+            //    every session store (~1.2 s and ~3.9 GB per event on a real
+            //    machine), so a `cargo build` or `git commit` inside a watched
+            //    tree hammered the host. See `known.rs`.
+            let pairs = match known_pairs(
+                census_root,
+                tool_registry,
+                registry,
+                known,
+                &old_path,
+                &new_path,
+            ) {
+                Some(p) => p,
+                None => {
+                    tracing::debug!(
+                        from = %old_path.display(),
+                        to = %new_path.display(),
+                        "directory rename of no known project; ignoring"
+                    );
+                    return;
                 }
-            }
+            };
+            info!(
+                from = %old_path.display(),
+                to = %new_path.display(),
+                projects = pairs.len(),
+                "project moved"
+            );
 
-            // Update registry: re-register under new path and drop old entry
-            match registry.register_project(&new_path) {
-                Ok(new_id) => {
-                    for detection in &detected {
-                        for artifact in &detection.artifact_files {
-                            let _ = registry.add_artifact(new_id, &detection.tool_name, artifact);
-                        }
+            // 3. Re-key the home-dir session stores FIRST, and before any
+            //    in-project detection. `detect_tools` scans the PROJECT
+            //    directory, but a `session_store` lives under `$HOME` — a
+            //    project can have a year of Claude Code history and not one
+            //    `.claude/` file inside it. v0.9.0 ran this after an early
+            //    return on "no in-project artifacts" and so never re-keyed the
+            //    case it exists for. (Regression test:
+            //    `handle_session_event_moved_rekeys_the_store_under_the_given_root`.)
+            //    All projects the move carried are re-keyed as ONE undo.
+            rekey_stores(
+                census_root,
+                tool_registry,
+                (&old_path, &new_path),
+                &pairs,
+                event_log,
+            );
+
+            // 4. Per moved project: in-project reconcile, then the registry.
+            for (old, new) in &pairs {
+                let detected = crate::detector::detect_tools(new, tool_registry);
+                for detection in &detected {
+                    if let Some(tool) = tool_registry.get(&detection.tool_name) {
+                        let result = crate::reconciler::reconcile(tool, old, new, event_log);
+                        // Recorded whatever it was — including a no-op. A store
+                        // of actions taken cannot answer "why did nothing happen?".
+                        crate::activity::ActivityRecord::new(
+                            crate::activity::ActivityKind::Reconcile,
+                            result.outcome,
+                        )
+                        .tool(&result.tool_name)
+                        .project(new.display().to_string())
+                        .emit(Some(event_log));
                     }
                 }
-                Err(e) => warn!(error = %e, "failed to register new project path"),
+
+                let was_registered = registry
+                    .list_projects()
+                    .map(|ps| ps.iter().any(|p| &p.path == old))
+                    .unwrap_or(false);
+                if !was_registered && detected.is_empty() {
+                    continue;
+                }
+                match registry.register_project(new) {
+                    Ok(new_id) => {
+                        for detection in &detected {
+                            for artifact in &detection.artifact_files {
+                                let _ =
+                                    registry.add_artifact(new_id, &detection.tool_name, artifact);
+                            }
+                        }
+                    }
+                    Err(e) => warn!(error = %e, "failed to register new project path"),
+                }
+                if let Err(e) = registry.unregister_project(old) {
+                    tracing::debug!(error = %e, "could not remove old registry entry");
+                }
             }
-            if let Err(e) = registry.unregister_project(&old_path) {
-                tracing::debug!(error = %e, "could not remove old registry entry (may not have been watched)");
-            }
+            known.apply_move(&pairs);
         }
         SessionEvent::Moved { .. } => {
             // Partial move event — notify only emits both paths on some platforms
@@ -474,6 +582,7 @@ async fn shutdown_signal() {
 mod tests {
     use super::handle_session_event;
     use crate::event_log::EventLog;
+    use crate::known::KnownProjects;
     use crate::registry::Registry;
     use crate::tools::{PathFieldSpec, ReconcileStrategy, ToolDefinition, ToolRegistry};
     use crate::watcher::SessionEvent;
@@ -558,10 +667,14 @@ mod tests {
         .unwrap();
 
         let new = home.path().join("work/moved");
-        std::fs::rename(&old, &new).unwrap();
-
         let registry = Registry::open_in_memory().unwrap();
         let tools = ToolRegistry::new().unwrap();
+        // Indexed BEFORE the move, as the daemon does at startup: the store is
+        // keyed to `old`, which is what makes this directory a known project.
+        let mut known = KnownProjects::build(home.path(), &tools, &registry);
+        assert_eq!(known.len(), 1, "the census indexes the project's store key");
+
+        std::fs::rename(&old, &new).unwrap();
         let log = EventLog::open_in_memory().unwrap();
         handle_session_event(
             home.path(),
@@ -572,6 +685,7 @@ mod tests {
             &registry,
             &tools,
             &log,
+            &mut known,
         );
 
         // The census — the operator-visible truth — must now report the new
@@ -603,6 +717,150 @@ mod tests {
         );
     }
 
+    /// Claude Code store dir for `project`, keyed both ways as the real tool does.
+    fn claude_store(home: &Path, project: &Path) {
+        let enc: String = project
+            .display()
+            .to_string()
+            .chars()
+            .map(|c| if c.is_ascii_alphanumeric() { c } else { '-' })
+            .collect();
+        let store = home.join(".claude/projects").join(&enc);
+        std::fs::create_dir_all(&store).unwrap();
+        std::fs::write(
+            store.join("s.jsonl"),
+            format!("{{\"cwd\":\"{}\"}}\n", project.display()),
+        )
+        .unwrap();
+    }
+
+    fn move_event(from: &Path, to: &Path) -> SessionEvent {
+        SessionEvent::Moved {
+            from: Some(from.to_path_buf()),
+            to: Some(to.to_path_buf()),
+        }
+    }
+
+    /// The noise a working tree makes — measured on a real daemon: one
+    /// `git init && git commit` produced 9 rename events, a hello-world
+    /// `cargo build` 3. Through v0.10 each planned a re-key across every
+    /// store (~1.2 s / ~3.9 GB on a real machine). None of them is a project
+    /// move, so none may do anything at all: no store walk, no activity row.
+    #[test]
+    fn file_renames_and_unknown_directory_renames_do_nothing() {
+        let home = TempDir::new().unwrap();
+        let project = home.path().join("work/app");
+        std::fs::create_dir_all(project.join(".git/refs/heads")).unwrap();
+        std::fs::create_dir_all(project.join("target/debug/incremental")).unwrap();
+        claude_store(home.path(), &project);
+
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+        let mut known = KnownProjects::build(home.path(), &tools, &registry);
+
+        // git's lock-file dance: a FILE rename.
+        std::fs::write(project.join(".git/index"), b"x").unwrap();
+        let lock = project.join(".git/index.lock");
+        // Cargo's incremental dir finalisation: a DIRECTORY rename, but not a project.
+        let inc_from = project.join("target/debug/incremental/s-abc-working");
+        let inc_to = project.join("target/debug/incremental/s-abc");
+        std::fs::create_dir_all(&inc_to).unwrap();
+
+        for ev in [
+            move_event(&lock, &project.join(".git/index")),
+            move_event(&inc_from, &inc_to),
+        ] {
+            handle_session_event(home.path(), ev, &registry, &tools, &log, &mut known);
+        }
+
+        assert!(
+            log.recent_activity(10).unwrap().is_empty(),
+            "noise must not even be planned, let alone recorded"
+        );
+        assert!(log.latest_pending_rekey().unwrap().is_none());
+        let stores = crate::sessions::resolve_stores(tools.all(), None);
+        let groups = crate::sessions::census(home.path(), &stores, false);
+        assert_eq!(
+            groups[0].project_path,
+            project.display().to_string(),
+            "the real project's store is untouched"
+        );
+    }
+
+    /// Moving a FOLDER moves every project in it. Before the index, the
+    /// daemon only ever re-keyed the renamed path itself, so a reorganisation
+    /// like `junk-drawer/rndm → junk-drawer/devins-stuff/legal` stranded every
+    /// project inside — and `undo` must bring them all back together.
+    #[test]
+    fn moving_a_folder_rekeys_every_project_beneath_it_as_one_undo() {
+        let home = TempDir::new().unwrap();
+        let folder = home.path().join("junk/rndm");
+        let a = folder.join("peoples");
+        let b = folder.join("deep/nested");
+        let bystander = home.path().join("junk/keep");
+        for p in [&a, &b, &bystander] {
+            std::fs::create_dir_all(p).unwrap();
+            claude_store(home.path(), p);
+        }
+
+        let registry = Registry::open_in_memory().unwrap();
+        let tools = ToolRegistry::new().unwrap();
+        let log = EventLog::open_in_memory().unwrap();
+        let mut known = KnownProjects::build(home.path(), &tools, &registry);
+
+        let moved = home.path().join("junk/legal");
+        std::fs::rename(&folder, &moved).unwrap();
+        handle_session_event(
+            home.path(),
+            move_event(&folder, &moved),
+            &registry,
+            &tools,
+            &log,
+            &mut known,
+        );
+
+        let stores = crate::sessions::resolve_stores(tools.all(), None);
+        let paths: Vec<String> = crate::sessions::census(home.path(), &stores, false)
+            .into_iter()
+            .map(|g| g.project_path)
+            .collect();
+        for want in [
+            moved.join("peoples"),
+            moved.join("deep/nested"),
+            bystander.clone(),
+        ] {
+            assert!(
+                paths.contains(&want.display().to_string()),
+                "{} missing from census {paths:?}",
+                want.display()
+            );
+        }
+        assert_eq!(
+            paths.len(),
+            3,
+            "nothing left keyed to the old folder: {paths:?}"
+        );
+
+        let undo_rows = log.recent_rekeys(10).unwrap();
+        assert_eq!(undo_rows.len(), 1, "one folder move is ONE undo");
+        assert_eq!(undo_rows[0].old_path, folder.display().to_string());
+
+        // ...and that one undo brings both projects back.
+        let plans: crate::rekey::RecordedUndo =
+            serde_json::from_str(&undo_rows[0].undo_plan).unwrap();
+        std::fs::rename(&moved, &folder).unwrap();
+        for plan in plans.plans() {
+            crate::rekey::apply(&plan).expect("undo applies");
+        }
+        let back: Vec<String> = crate::sessions::census(home.path(), &stores, false)
+            .into_iter()
+            .map(|g| g.project_path)
+            .collect();
+        assert!(back.contains(&a.display().to_string()));
+        assert!(back.contains(&b.display().to_string()));
+    }
+
     // The core pipeline seam: a paired Moved event detects the tool at the new
     // location, reconciles its artifacts, registers the new path, and logs it.
     #[test]
@@ -613,6 +871,9 @@ mod tests {
         std::fs::rename(&old, &new).unwrap(); // settings.json still names `old`
 
         let registry = Registry::open_in_memory().unwrap();
+        // As `sessionguard watch` would: the daemon only acts on directories
+        // it knows are projects.
+        registry.register_project(&old).unwrap();
         let mut tools = ToolRegistry::new().unwrap();
         tools.register(synthetic_json_tool());
         let log = EventLog::open_in_memory().unwrap();
@@ -626,6 +887,7 @@ mod tests {
             &registry,
             &tools,
             &log,
+            &mut KnownProjects::from_keys(Vec::<PathBuf>::new(), None),
         );
 
         let settings = std::fs::read_to_string(new.join(".testtool/settings.json")).unwrap();
@@ -675,6 +937,7 @@ mod tests {
             &registry,
             &tools,
             &log,
+            &mut KnownProjects::from_keys(Vec::<PathBuf>::new(), None),
         );
 
         assert!(registry.list_projects().unwrap().is_empty());
@@ -698,6 +961,7 @@ mod tests {
             &registry,
             &tools,
             &log,
+            &mut KnownProjects::from_keys(Vec::<PathBuf>::new(), None),
         );
 
         assert!(registry.list_projects().unwrap().is_empty());
@@ -724,6 +988,7 @@ mod tests {
             &registry,
             &tools,
             &log,
+            &mut KnownProjects::from_keys(Vec::<PathBuf>::new(), None),
         );
 
         assert!(

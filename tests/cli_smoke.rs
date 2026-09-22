@@ -585,3 +585,35 @@ fn cli_sessions_project_filter_accepts_the_spelling_the_tool_recorded() {
             .stdout(predicate::str::contains("\"codex\""));
     }
 }
+
+#[test]
+fn cli_service_install_dry_run_renders_the_unit_and_changes_nothing() {
+    // The test binary lives in target/, so it must be refused without the
+    // explicit flag — a login service pointing there breaks on `cargo clean`.
+    let home = TempDir::new().unwrap();
+    sg(&home)
+        .args(["service", "install", "--dry-run"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("development build"));
+
+    let out = sg(&home)
+        .args(["service", "install", "--dry-run", "--allow-dev-build"])
+        .assert()
+        .success()
+        .get_output()
+        .stdout
+        .clone();
+    let out = String::from_utf8(out).unwrap();
+    assert!(out.contains("start"), "{out}");
+    assert!(out.contains("--foreground"), "{out}");
+    assert!(out.contains("nothing changed"), "{out}");
+    #[cfg(target_os = "macos")]
+    assert!(out.contains("launchctl bootstrap"), "{out}");
+    #[cfg(target_os = "linux")]
+    assert!(out.contains("systemctl --user enable --now"), "{out}");
+
+    // Nothing was written under the (isolated) home.
+    assert!(!home.path().join("Library/LaunchAgents").exists());
+    assert!(!home.path().join(".config/systemd").exists());
+}
