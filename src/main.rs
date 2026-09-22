@@ -20,11 +20,21 @@ async fn main() -> Result<()> {
     // Initialize tracing. An explicit `--verbose` beats an ambient RUST_LOG —
     // a user who asks for debug output must get it, not silently inherit
     // whatever their shell exported.
+    //
+    // Without RUST_LOG, only the DAEMON logs at `info`: that stream is its
+    // audit trail (every decision, including the decisions to do nothing).
+    // Interactive commands default to `warn` — their `println!` output IS the
+    // interface, and the daemon-style activity lines (`rekey` emitted three per
+    // run, with colour codes) are noise on a terminal.
+    let default_level = match cli.command {
+        Command::Start { .. } => "info",
+        _ => "warn",
+    };
     let env_filter = if cli.verbose {
         tracing_subscriber::EnvFilter::new("debug")
     } else {
         tracing_subscriber::EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"))
+            .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level))
     };
     // Write log lines to stderr, never stdout: several subcommands emit
     // machine-readable stdout (e.g. `--format json`), and a stray `WARN`

@@ -617,3 +617,33 @@ fn cli_service_install_dry_run_renders_the_unit_and_changes_nothing() {
     assert!(!home.path().join("Library/LaunchAgents").exists());
     assert!(!home.path().join(".config/systemd").exists());
 }
+
+#[test]
+fn interactive_commands_keep_daemon_log_lines_off_the_terminal() {
+    // `rekey` used to print three `INFO sessionguard::activity` lines per run
+    // (with ANSI colour codes) on top of its own output. Those lines belong in
+    // the daemon's log; an interactive command's printed output is its UI.
+    let home = TempDir::new().unwrap();
+    let old = home.path().join("work/app");
+    std::fs::create_dir_all(&old).unwrap();
+    let codex = home.path().join(".codex/sessions");
+    std::fs::create_dir_all(&codex).unwrap();
+    std::fs::write(
+        codex.join("r.jsonl"),
+        format!("{{\"cwd\":\"{}\"}}\n", old.display()),
+    )
+    .unwrap();
+    let new = home.path().join("work/moved");
+    std::fs::create_dir_all(&new).unwrap();
+    sg(&home)
+        .env_remove("RUST_LOG")
+        .args([
+            "rekey",
+            &old.display().to_string(),
+            &new.display().to_string(),
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("1 store(s) re-keyed"))
+        .stderr(predicate::str::contains("INFO").not());
+}
