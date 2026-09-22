@@ -2,6 +2,14 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [Unreleased]
+
+### Fixed
+
+- `service install` over an already-running service said it had stopped "the
+  daemon you had started by hand". It now names the PID it stopped without
+  guessing how that daemon was started.
+
 ## [0.11.1] - 2026-09-22
 
 ### Fixed

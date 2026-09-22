@@ -1433,11 +1433,16 @@ async fn main() -> Result<()> {
                         return Ok(());
                     }
 
-                    // A daemon started by hand would hold the PID file, and the
-                    // service's copy would fail and be retried forever.
+                    // Any running daemon — started by hand or by a previous
+                    // install — holds the PID file, and the service's copy would
+                    // fail and be retried forever. Stop it, and say which one
+                    // without guessing how it was started.
+                    let running_pid = sessionguard::daemon::read_pid()?
+                        .filter(|_| sessionguard::daemon::is_running());
                     if stop_running_daemon()? {
                         println!(
-                            "stopped the daemon you had started by hand; the service takes over."
+                            "stopped the running daemon (PID {}); the service's copy takes over.",
+                            running_pid.unwrap_or(0)
                         );
                     }
                     if let Some(parent) = unit.parent() {
