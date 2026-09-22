@@ -274,9 +274,31 @@ pub fn plan(
                 }
             }
         }
-        SessionStore::JsonlField { path, glob, .. } => {
+        SessionStore::JsonlField {
+            path,
+            glob,
+            key_field,
+            fallback_field,
+        } => {
             let base = crate::sessions::expand_home(home, path);
+            let mut fields = vec![key_field.as_str()];
+            fields.extend(fallback_field.as_deref());
             for (file, _) in crate::sessions::walk_store_files(&base, glob, REKEY_WALK_CAP).0 {
+                // Only a session KEYED to this project moves. Checking the key
+                // (a bounded first-line read) before counting does two things:
+                // a session belonging to ANOTHER project that merely mentions
+                // this path is never rewritten — only the key moves, the
+                // record of what happened elsewhere does not — and a plan reads
+                // ~64 KiB per file instead of every file in full.
+                match crate::sessions::jsonl_find_field(
+                    &file,
+                    &fields,
+                    1,
+                    crate::sessions::FIRST_LINE_BYTES,
+                ) {
+                    Some(key) if key == old => {}
+                    _ => continue,
+                }
                 let occurrences = count_json_token(&file, &old);
                 if occurrences > 0 {
                     actions.push(RekeyAction::RewriteJsonValue {
@@ -327,11 +349,128 @@ pub fn plan(
 
 /// How many times the JSON token for `value` appears in a file. Counting up
 /// front is what lets `--dry-run` state the blast radius honestly.
+///
+/// Streamed in bounded chunks: the largest real session file observed is
+/// ~3 GB, and reading it whole (as v0.9–v0.10 did) peaked the process at
+/// ~3.9 GB of memory for a single planned re-key.
 fn count_json_token(file: &Path, value: &str) -> usize {
-    let Ok(content) = std::fs::read_to_string(file) else {
+    let Ok(f) = std::fs::File::open(file) else {
         return 0;
     };
-    content.matches(&json_token(value)).count()
+    let token = json_token(value);
+    stream_replace(f, token.as_bytes(), b"", STREAM_CHUNK, |_| Ok(())).unwrap_or(0)
+}
+
+/// Read size for streamed counting and rewriting. Memory stays at roughly
+/// this plus one needle regardless of file size.
+const STREAM_CHUNK: usize = 1 << 20;
+
+/// First occurrence of `needle` in `hay` at or after `from`.
+fn find_bytes(hay: &[u8], needle: &[u8], from: usize) -> Option<usize> {
+    if needle.is_empty() || hay.len() < needle.len() {
+        return None;
+    }
+    let last_start = hay.len() - needle.len();
+    let mut i = from;
+    while i <= last_start {
+        let off = hay[i..=last_start].iter().position(|&b| b == needle[0])?;
+        let s = i + off;
+        if &hay[s..s + needle.len()] == needle {
+            return Some(s);
+        }
+        i = s + 1;
+    }
+    None
+}
+
+/// Copy `r` to `out`, replacing every occurrence of `needle` with
+/// `replacement`, in bounded memory. Returns the number of replacements.
+///
+/// Works on bytes, so a file that is not valid UTF-8 is handled rather than
+/// skipped. A match can straddle two reads, so the last `needle.len() - 1`
+/// bytes of each pass are held back and re-examined with the next read;
+/// a match that STARTS before that hold-back line is always fully inside the
+/// buffer, so it can be replaced immediately.
+fn stream_replace<R: std::io::Read>(
+    mut r: R,
+    needle: &[u8],
+    replacement: &[u8],
+    chunk: usize,
+    mut out: impl FnMut(&[u8]) -> std::io::Result<()>,
+) -> std::io::Result<usize> {
+    let hold = needle.len().saturating_sub(1);
+    let mut data: Vec<u8> = Vec::with_capacity(chunk + hold);
+    let mut buf = vec![0u8; chunk.max(1)];
+    let mut count = 0usize;
+    loop {
+        let n = r.read(&mut buf)?;
+        let eof = n == 0;
+        data.extend_from_slice(&buf[..n]);
+        let safe_end = if eof {
+            data.len()
+        } else {
+            data.len().saturating_sub(hold)
+        };
+        let mut cursor = 0usize;
+        while let Some(i) = find_bytes(&data, needle, cursor) {
+            if i >= safe_end {
+                break;
+            }
+            out(&data[cursor..i])?;
+            out(replacement)?;
+            count += 1;
+            cursor = i + needle.len();
+        }
+        let emit_to = cursor.max(safe_end);
+        if emit_to > cursor {
+            out(&data[cursor..emit_to])?;
+        }
+        data.drain(..emit_to);
+        if eof {
+            return Ok(count);
+        }
+    }
+}
+
+/// Rewrite every occurrence of `from`'s JSON token to `to`'s, streaming into
+/// a temp sibling that atomically replaces the original (same crash-safety
+/// as [`crate::reconciler::atomic_write`], without holding the file in
+/// memory). A file with no occurrences is left untouched.
+fn stream_rewrite_file(file: &Path, from: &str, to: &str) -> std::io::Result<usize> {
+    use std::io::Write;
+    let dir = file.parent().unwrap_or_else(|| Path::new("."));
+    let name = file
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("session");
+    let tmp = dir.join(format!(".{name}.sg-rekey-{}", std::process::id()));
+    let perms = std::fs::metadata(file)?.permissions();
+
+    let result = (|| {
+        let src = std::fs::File::open(file)?;
+        let mut w = std::io::BufWriter::new(std::fs::File::create(&tmp)?);
+        let n = stream_replace(
+            src,
+            json_token(from).as_bytes(),
+            json_token(to).as_bytes(),
+            STREAM_CHUNK,
+            |b| w.write_all(b),
+        )?;
+        let f = w.into_inner().map_err(|e| e.into_error())?;
+        f.sync_all()?;
+        drop(f);
+        if n == 0 {
+            std::fs::remove_file(&tmp)?;
+            return Ok(0);
+        }
+        std::fs::set_permissions(&tmp, perms)?;
+        std::fs::rename(&tmp, file)?;
+        Ok(n)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+    result
 }
 
 fn count_sqlite_rows(
@@ -414,22 +553,13 @@ fn apply_action(tool: &str, action: &RekeyAction) -> Result<(), RekeyError> {
                 detail: e.to_string(),
             })
         }
-        RekeyAction::RewriteJsonValue { file, from, to, .. } => {
-            let content = std::fs::read_to_string(file).map_err(|e| RekeyError::Failed {
+        RekeyAction::RewriteJsonValue { file, from, to, .. } => stream_rewrite_file(file, from, to)
+            .map(|_| ())
+            .map_err(|e| RekeyError::Failed {
                 tool: tool.into(),
                 path: file.display().to_string(),
                 detail: e.to_string(),
-            })?;
-            let rewritten = content.replace(&json_token(from), &json_token(to));
-            if rewritten == content {
-                return Ok(());
-            }
-            crate::reconciler::atomic_write(file, &rewritten).map_err(|e| RekeyError::Failed {
-                tool: tool.into(),
-                path: file.display().to_string(),
-                detail: e.to_string(),
-            })
-        }
+            }),
         RekeyAction::UpdateSqliteRows {
             db,
             table,
@@ -543,72 +673,102 @@ pub fn rekey_all(
     event_log: Option<&crate::event_log::EventLog>,
     dry_run: bool,
 ) -> Vec<RekeyReport> {
+    let pairs = [(old_path.to_path_buf(), new_path.to_path_buf())];
+    rekey_pairs(
+        home,
+        stores,
+        (old_path, new_path),
+        &pairs,
+        event_log,
+        dry_run,
+    )
+}
+
+/// Re-key several `(old, new)` project paths as ONE undoable operation.
+///
+/// This is what a folder move needs: moving `~/work` to `~/archive/work`
+/// moves every project under it, so each project's store key must follow —
+/// `~/work/a → ~/archive/work/a`, `~/work/b → ~/archive/work/b`, … — and
+/// `undo` must reverse all of them together, for the same reason one
+/// invocation is one undo row across stores (see the note below). `label`
+/// is the move as the operator saw it, recorded on the undo row.
+pub fn rekey_pairs(
+    home: &Path,
+    stores: &[(String, SessionStore)],
+    label: (&Path, &Path),
+    pairs: &[(PathBuf, PathBuf)],
+    event_log: Option<&crate::event_log::EventLog>,
+    dry_run: bool,
+) -> Vec<RekeyReport> {
     let mut reports = Vec::new();
     let mut undos: Vec<RekeyPlan> = Vec::new();
-    for (tool, store) in stores {
-        let plan = match plan(home, tool, store, old_path, new_path) {
-            Ok(p) => p,
-            Err(e) => {
-                reports.push(RekeyReport {
-                    tool: tool.clone(),
-                    plan: RekeyPlan {
+    for (old_path, new_path) in pairs {
+        let (old_path, new_path) = (old_path.as_path(), new_path.as_path());
+        for (tool, store) in stores {
+            let plan = match plan(home, tool, store, old_path, new_path) {
+                Ok(p) => p,
+                Err(e) => {
+                    reports.push(RekeyReport {
                         tool: tool.clone(),
-                        old_path: old_path.display().to_string(),
-                        new_path: new_path.display().to_string(),
-                        actions: Vec::new(),
-                    },
-                    applied: false,
-                    log_id: None,
-                    error: Some(e.to_string()),
-                });
-                continue;
-            }
-        };
-        if plan.is_empty() || dry_run {
-            reports.push(RekeyReport {
-                tool: tool.clone(),
-                plan,
-                applied: false,
-                log_id: None,
-                error: None,
-            });
-            continue;
-        }
-
-        match apply(&plan) {
-            Ok(undo) => {
-                // Recorded once for the whole invocation, after the loop —
-                // see the note there.
-                undos.push(undo);
+                        plan: RekeyPlan {
+                            tool: tool.clone(),
+                            old_path: old_path.display().to_string(),
+                            new_path: new_path.display().to_string(),
+                            actions: Vec::new(),
+                        },
+                        applied: false,
+                        log_id: None,
+                        error: Some(e.to_string()),
+                    });
+                    continue;
+                }
+            };
+            if plan.is_empty() || dry_run {
                 reports.push(RekeyReport {
                     tool: tool.clone(),
                     plan,
-                    applied: true,
+                    applied: false,
                     log_id: None,
                     error: None,
                 });
+                continue;
             }
-            Err(failure) => {
-                // Put this store back the way we found it. A half-re-keyed
-                // store is the one outcome worse than not re-keying at all.
-                let rolled_back = apply(&failure.rollback).is_ok();
-                let e = &failure.error;
-                let detail = if rolled_back {
-                    format!("{e} (this store was rolled back, nothing changed)")
-                } else {
-                    format!(
-                        "{e} — AND the rollback also failed; this store is partly re-keyed. \
+
+            match apply(&plan) {
+                Ok(undo) => {
+                    // Recorded once for the whole invocation, after the loop —
+                    // see the note there.
+                    undos.push(undo);
+                    reports.push(RekeyReport {
+                        tool: tool.clone(),
+                        plan,
+                        applied: true,
+                        log_id: None,
+                        error: None,
+                    });
+                }
+                Err(failure) => {
+                    // Put this store back the way we found it. A half-re-keyed
+                    // store is the one outcome worse than not re-keying at all.
+                    let rolled_back = apply(&failure.rollback).is_ok();
+                    let e = &failure.error;
+                    let detail = if rolled_back {
+                        format!("{e} (this store was rolled back, nothing changed)")
+                    } else {
+                        format!(
+                            "{e} — AND the rollback also failed; this store is partly re-keyed. \
                          Inspect {} before using it.",
-                        plan.old_path
-                    )
-                };
-                reports.push(RekeyReport {
-                    tool: tool.clone(),
-                    plan,
-                    applied: false,
-                    log_id: None,
-                    error: Some(detail),
-                });
+                            plan.old_path
+                        )
+                    };
+                    reports.push(RekeyReport {
+                        tool: tool.clone(),
+                        plan,
+                        applied: false,
+                        log_id: None,
+                        error: Some(detail),
+                    });
+                }
             }
         }
     }
@@ -626,20 +786,22 @@ pub fn rekey_all(
     //
     // Stored in the order they must be REPLAYED (reverse of application), so
     // undo is a straight walk of the list.
+    let (label_old, label_new) = label;
     if !undos.is_empty() {
         undos.reverse();
-        let tools: Vec<&str> = reports
-            .iter()
-            .filter(|r| r.applied)
-            .map(|r| r.tool.as_str())
-            .collect();
+        let mut tools: Vec<&str> = Vec::new();
+        for r in reports.iter().filter(|r| r.applied) {
+            if !tools.contains(&r.tool.as_str()) {
+                tools.push(r.tool.as_str());
+            }
+        }
         let label = tools.join(", ");
         let log_id = event_log.and_then(|log| match serde_json::to_string(&undos) {
             Ok(blob) => log
                 .record_rekey(
                     &label,
-                    &old_path.display().to_string(),
-                    &new_path.display().to_string(),
+                    &label_old.display().to_string(),
+                    &label_new.display().to_string(),
                     &blob,
                 )
                 .map_err(|e| {
@@ -678,7 +840,7 @@ pub fn rekey_all(
             };
             crate::activity::ActivityRecord::new(crate::activity::ActivityKind::Rekey, outcome)
                 .tool(&r.tool)
-                .project(new_path.display().to_string())
+                .project(r.plan.new_path.clone())
                 .emit(event_log);
         }
     }
@@ -1009,6 +1171,120 @@ mod tests {
         .to_string();
         let recorded: RecordedUndo = serde_json::from_str(&many).unwrap();
         assert_eq!(recorded.plans().len(), 1);
+    }
+
+    /// Streaming must give byte-for-byte the same result as an in-memory
+    /// replace, at EVERY chunk size — a match straddling two reads is exactly
+    /// where streaming code breaks.
+    #[test]
+    fn streamed_replace_matches_in_memory_replace_at_every_chunk_size() {
+        let needle = b"\"/work/app\"";
+        let repl = b"\"/elsewhere/moved-app\"";
+        let input: &[u8] = b"\"/work/app\"{\"cwd\":\"/work/app\",\"x\":\"/work/app-two\"}\n\
+            \"/work/app\"\"/work/app\"tail\"/work/ap";
+        let expected = {
+            let s = String::from_utf8(input.to_vec()).unwrap();
+            s.replace("\"/work/app\"", "\"/elsewhere/moved-app\"")
+        };
+        let want_count = String::from_utf8(input.to_vec())
+            .unwrap()
+            .matches("\"/work/app\"")
+            .count();
+        for chunk in 1..=24 {
+            let mut out = Vec::new();
+            let n = stream_replace(input, needle, repl, chunk, |b| {
+                out.extend_from_slice(b);
+                Ok(())
+            })
+            .unwrap();
+            assert_eq!(n, want_count, "count at chunk {chunk}");
+            assert_eq!(
+                String::from_utf8(out).unwrap(),
+                expected,
+                "output at chunk {chunk}"
+            );
+        }
+    }
+
+    /// A Codex session belonging to ANOTHER project that merely mentions the
+    /// moved path must not be rewritten. v0.9–v0.10 rewrote any file
+    /// containing the token, silently editing other projects' history.
+    #[test]
+    fn jsonl_rekey_only_touches_sessions_keyed_to_the_project() {
+        let home = TempDir::new().unwrap();
+        let old = home.path().join("work/app");
+        let new = home.path().join("work/moved");
+        let sessions = home.path().join(".codex/sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let mine = sessions.join("mine.jsonl");
+        let theirs = sessions.join("theirs.jsonl");
+        std::fs::write(&mine, format!("{{\"cwd\":\"{}\"}}\n", old.display())).unwrap();
+        let theirs_body = format!(
+            "{{\"cwd\":\"/somewhere/else\"}}\n{{\"tool\":\"ls\",\"workdir\":\"{}\"}}\n",
+            old.display()
+        );
+        std::fs::write(&theirs, &theirs_body).unwrap();
+
+        let store = SessionStore::JsonlField {
+            path: "~/.codex/sessions".into(),
+            glob: "**/*.jsonl".into(),
+            key_field: "cwd".into(),
+            fallback_field: None,
+        };
+        let p = plan(home.path(), "codex", &store, &old, &new).unwrap();
+        assert_eq!(p.actions.len(), 1, "only the session KEYED to the project");
+        apply(&p).expect("apply");
+        assert!(std::fs::read_to_string(&mine)
+            .unwrap()
+            .contains(&new.display().to_string()));
+        assert_eq!(
+            std::fs::read_to_string(&theirs).unwrap(),
+            theirs_body,
+            "another project's history is a record, not a key — byte-identical"
+        );
+    }
+
+    #[test]
+    fn streamed_rewrite_handles_non_utf8_and_preserves_permissions() {
+        let dir = TempDir::new().unwrap();
+        let f = dir.path().join("s.jsonl");
+        let mut body = b"{\"cwd\":\"/a/b\"}\n".to_vec();
+        body.extend_from_slice(&[0xff, 0xfe, b'\n']); // not valid UTF-8
+        std::fs::write(&f, &body).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&f, std::fs::Permissions::from_mode(0o600)).unwrap();
+        }
+        assert_eq!(
+            count_json_token(&f, "/a/b"),
+            1,
+            "non-UTF-8 files are counted, not skipped"
+        );
+        assert_eq!(stream_rewrite_file(&f, "/a/b", "/c/d").unwrap(), 1);
+        let got = std::fs::read(&f).unwrap();
+        assert!(got.starts_with(b"{\"cwd\":\"/c/d\"}\n"));
+        assert!(
+            got.ends_with(&[0xff, 0xfe, b'\n']),
+            "untouched bytes survive exactly"
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&f).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+        assert!(
+            std::fs::read_dir(dir.path()).unwrap().count() == 1,
+            "no temp file left behind"
+        );
+        assert_eq!(
+            stream_rewrite_file(&f, "/not/there", "/x").unwrap(),
+            0,
+            "no match leaves the file alone"
+        );
     }
 
     #[test]

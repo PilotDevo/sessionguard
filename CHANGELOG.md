@@ -2,6 +2,95 @@
 
 All notable changes to SessionGuard will be documented in this file.
 
+## [0.11.0] - 2026-09-22
+
+### Fixed — safe to actually run
+
+An audit that *ran* SessionGuard instead of reading its tests found it had
+never reconciled a real session on either of the author's machines. The only
+row in each event log was a test. On the Mac the daemon had run for 49 seconds
+in its lifetime; on the Linux host it had spent five weeks watching folders
+where nothing changed. The code worked in isolation. The product had three
+problems that kept anyone from running it, and one that would have hurt them
+if they did.
+
+- **The daemon treated every rename as a project move.** Measured on a real
+  daemon: one `git init && git commit` produced 9 "project moved" events, an
+  editor save 1, a hello-world `cargo build` 3. Each planned a re-key across
+  every session store, costing ~1.2 s and ~3.9 GB of memory against real
+  stores (one 2.97 GB Codex transcript was read whole). The daemon now ignores
+  any rename whose destination is a file, and any directory rename unless the
+  directory **is or contains a project it knows**: a census store key or a
+  registered project (`src/known.rs`). The same operations now produce zero
+  events.
+- **`init` proposed watching `/Users`.** Claude Code creates `~/.claude/` (its
+  global config), which matches the `.claude/` project pattern. So every
+  Claude Code user's home counted as "a project", the scan stopped there, and
+  `init` offered its parent. Home is now never a project. Watch roots are the
+  top-level folders under home that hold your projects (e.g. `~/Droco`), found
+  from AI-tool files *and* from your session history. They are never home
+  itself, never hidden folders or `~/Library`, and never anything above home.
+  On the author's Mac `init` now proposes 4 folders covering 40 projects.
+- **No autostart on macOS.** There was no LaunchAgent, no `brew services`
+  block, and no mention of either in the docs. A daemon that isn't running
+  reconciles nothing. New **`sessionguard service install | uninstall |
+  status`** writes a launchd agent on macOS or a systemd user unit on Linux,
+  pointing at the binary you ran it with. It uses the stable `PATH` name, not
+  a Homebrew Cellar path that `brew upgrade` deletes. It restarts the daemon
+  only if it crashes, so `sessionguard stop` still stops it. It first stops a
+  daemon you started by hand, so the two can't fight over the PID file. It
+  refuses a binary inside a Cargo `target/` directory. `status --deep` now
+  warns when no login service is installed.
+- **Planning a re-key read every session file whole.** Counting and
+  rewriting now stream in 1 MiB chunks: the same probe went from 1.2 s /
+  3.9 GB to 0.01 s / 11 MB. Rewrites work on bytes, so a file that isn't valid
+  UTF-8 is handled rather than skipped. The chunk-boundary logic is tested at
+  every chunk size from 1 to 24 bytes against an in-memory replace.
+- **Codex re-keys rewrote other projects' sessions.** Any session file
+  containing the moved path as a JSON string was planned, including sessions
+  of *other* projects that merely mentioned it. A session is now re-keyed only
+  if its own `cwd` key is the moved path; history elsewhere is left
+  byte-identical.
+
+- **A project moved right after `sessionguard watch` lost its move.** `watch`
+  signals the daemon to reload, and the reload rebuilt the filesystem watcher
+  from scratch, dropping every event still queued in the old one. This window
+  always existed; it surfaced when `dogfood.sh` (which does exactly this)
+  started failing after this release added an index rebuild to the reload.
+  The watch set is now updated in place on a single watcher, and the index is
+  rebuilt only afterwards. Verified under the slow-rebuild condition that
+  failed 2/2 before: 3/3.
+- **Every event under some folders was reported twice.** The same directory
+  spelled two ways (`/var/…` and `/private/var/…` on macOS), or a folder plus
+  its own parent, was watched twice. Watch roots are now canonicalized, and
+  roots nested inside another are dropped.
+- **`dogfood.sh` read the operator's real session stores.** It never isolated
+  `HOME`, so since v0.9 its daemon indexed, and could have re-keyed, real
+  stores (37 real projects on the author's Mac). It now runs against its own
+  work directory like the other three dogfoods.
+
+### Added
+
+- **Moving a folder re-keys every project in it**, as one undo, both from the
+  daemon and from `sessionguard rekey <folder> <new-folder>`. Before, only the
+  renamed path itself was re-keyed, so reorganising a folder of projects
+  stranded all of them.
+- **`scripts/rekey-dogfood.sh` now drives the real daemon** against a real
+  `git commit` (which must record nothing) and a real project move and folder
+  move (which must be re-keyed). Run against the v0.10.0 binary it fails with
+  "the daemon recorded 24 decision(s)" for a git commit.
+
+### Documentation
+
+- The README no longer claims "zero config for common setups". Setup is
+  `init`, then `service install`.
+- The README now states plainly what does **not** follow a move: Claude Code's
+  per-project trust, approved tools and MCP servers (`~/.claude.json`) and
+  Codex's trust levels (`~/.codex/config.toml`) are keyed by path and are not
+  re-keyed.
+- `CLAUDE.md` no longer describes `main.rs` as a "thin CLI dispatcher". It is
+  ~1.9k lines of command logic.
+
 ## [0.10.0] - 2026-09-18
 
 ### Added — local observability: making "it did nothing" visible

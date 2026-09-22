@@ -46,6 +46,12 @@ Events flow:
 1. `notify` fires a rename/move event
 2. `watcher.rs` classifies it as `SessionEvent::Moved { from, to }`
 3. `daemon.rs` calls `handle_session_event()` which dispatches to:
+   - **Filter first** (v0.11): a rename whose destination is a *file* is ignored
+     (one `stat`), and so is a directory rename unless the directory IS or
+     CONTAINS a known project (`known::KnownProjects` — census keys + registry).
+     Through v0.10 every rename — each git commit, editor save, Cargo build —
+     planned a re-key across every store (~1.2 s / ~3.9 GB per event). A folder
+     move yields one `(old, new)` pair per project beneath it.
    - `detector::detect_tools()` — finds AI tool artifacts at new path
    - `reconciler::reconcile()` — rewrites old path strings in IN-PROJECT files
    - `rekey::rekey_all()` — re-keys the HOME-DIR session stores (v0.9); driven
@@ -61,7 +67,7 @@ Events flow:
 
 ### Binary + Library Split
 
-`src/main.rs` is a thin CLI dispatcher. All logic lives in `src/lib.rs` modules for testability.
+`src/main.rs` is the CLI dispatcher — **not thin**: at ~1.9k lines it holds real command logic (undo, rekey output, init, service install, census rendering) with almost no tests of its own. Prefer putting new logic in a `src/lib.rs` module (pure, injectable, unit-testable) and keeping `main.rs` to I/O and printing; `service.rs` renders files and `main.rs` only writes them and runs the commands, which is the pattern to follow.
 
 ### Module Map
 
@@ -81,6 +87,8 @@ Events flow:
 - **`migrate/`** (`mod.rs` + `tests.rs`) — The v0.4 migration engine: a nine-stage state machine (Preflight → Snapshot → Quiesce → Copy → Verify → Rewrite → Resume → Validate → Retain, then Done) with trait-DI backends (`Quiescer`/`EnvWriter` + `Fake*` test doubles), `undo_migration`, and `cleanup_migration`. Returns a `MigrationResult`; `main.rs` persists it to the event log. Driven by `home_dir_layout` on `ToolDefinition`.
 - **`sessions.rs`** — Per-project session census across the tools' home-dir stores. As of v0.8, **declaration-driven**: it no longer hardcodes the three store paths but dispatches on each loaded tool's `[tool.session_store]` binding (`SessionStore::EncodedDir`/`JsonlField`/`SqliteColumn` in `tools/mod.rs`) — Claude Code encoded-dir decoding — the declaration's *key hint* (`key_glob`/`key_field`, builtin `*.jsonl`/`cwd`) reads the literal path recorded inside a transcript first, and only hint-less directories fall back to the encoding-aware filesystem DFS, with three-state `DecodeConfidence`: `exact`/`inferred`/`unresolved` (so a deleted project can decode as an orphan instead of vanishing). `resolve_stores()` builds the store list from the registry, re-rooting env-discovered stores (`CODEX_HOME`) for a local census, Codex JSONL field lookup, OpenCode SQLite read-only. `census(home, stores, foreign_root)` also backs `--home <path>` (an arbitrary root, e.g. a mounted remote home). Backs `sessionguard sessions` (+ `--orphans`); the dashboard's Activity tab consumes its `--format json`.
 - **`rekey.rs`** (v0.9) — **Store re-keying: the reconcile for home-dir stores.** `reconciler.rs` rewrites paths *inside a project*; the three store-bearing tools keep none there, so this re-keys the store itself from an old project path to a new one, driven by the same `[tool.session_store]` declaration `sessions.rs` reads. `plan()` is pure (no mutation) and returns exactly what `apply()` will do — that is what backs `--dry-run`; `apply()` returns the inverse plan, which `main.rs` records in the event log so `undo` can reverse it. `encoded_dir` is TWO actions (rename the dir **and** rewrite the recorded `cwd` inside, since v0.8.1's key hint made the store keyed twice); rewrites match the whole JSON token so `/a/b` can't match inside `/a/bc`. Refuses on an existing destination store (would merge histories) or a locked DB. Called by `daemon.rs::rekey_stores` on a move — from the STORE list, never from `detect_tools` (detection scans the project; the store is under `$HOME`). Carries its own `RekeyError`/`RekeyFailure`.
+- **`known.rs`** (v0.11) — `KnownProjects`: which directories are projects the daemon should act on (every census store key that decodes, plus every registered project; `$HOME` and its ancestors excluded). `pairs_for_move(from, to)` returns `from` itself if known plus every known project beneath it, translated under `to`, matching through symlinked prefixes (macOS `/var` → `/private/var`). Rebuilt at startup, on SIGHUP, and on a miss at most every 2 s (a census is ~20 ms).
+- **`service.rs`** (v0.11) — Login service: renders a launchd plist (macOS) or systemd user unit (Linux) that runs `start --foreground`, restarting only on a crash (a clean `stop` stays stopped). Pure rendering + command lists; `main.rs` writes and runs them. `stable_exe_path` points the service at the `PATH` name, not a Homebrew Cellar path that `brew upgrade` deletes. Through v0.10 macOS had no autostart at all.
 - **`fleet.rs`** (v0.8) — Fleet-wide session census: runs the *remote* `sessionguard --version` + `sessions --format json` over ssh per `[[hosts]]` config and merges the result, stamping `host` provenance without re-deriving `orphaned` (that verdict always comes from the origin host). Backs `sessionguard sessions --host <name>` / `--all-hosts`. Read-only by construction — no other remote command is ever run — and upgrades a pre-`confidence` 0.7.0 payload on the fly. Refuses an ssh destination starting with `-` (and passes `--` before it) and restricts the per-host `binary` to a plain path before spawning any process (argv/remote-shell injection guards); distinguishes ssh's own exit 255 (`Unreachable`) from the remote command's status (`RemoteFailed`, 127 = not on the remote PATH). Carries its own `FleetError`.
 - **`update.rs`** — Self-update for `sessionguard update` (v0.5): install-method detection (defer to brew/cargo, refuse dev builds), version compare, a curl-backed `ReleaseClient` trait (faked in tests), and SHA256SUMS-verified download → atomic swap with `.bak-<ver>` rollback → daemon restart. Carries its own `UpdateError`.
 - **`error.rs`** — `thiserror` error enum used across the daemon/reconciler core (`migrate.rs`, `update.rs`, and `fleet.rs` carry their own domain errors).
@@ -101,7 +109,7 @@ To add a new tool: create a TOML file in `src/tools/builtin/`, add its `include_
 Tests use `SESSIONGUARD_DATA_DIR` (and `SESSIONGUARD_CONFIG_DIR`) to point each test at an isolated per-test SQLite registry and config dir — no shared state, and no reads of the operator's real `~/.config`/`$HOME`.
 
 ```bash
-cargo test                           # ~255 tests (unit + integration)
+cargo test                           # ~275 tests (unit + integration)
 cargo test sandbox_                  # integration tests only
 cargo test reconcile_               # end-to-end reconciliation proofs
 cargo test -- --nocapture            # with stdout
@@ -109,7 +117,7 @@ cargo test -- --nocapture            # with stdout
 
 The `cmd()` helper in `tests/sandbox.rs` wraps `Command::cargo_bin` and injects the isolation env vars automatically — use it for all new sandbox tests.
 
-End-to-end smoke scripts live in `scripts/`: `dogfood.sh` (reconcile path), `migrate-dogfood.sh` (migrate → undo round-trip), and `update-dogfood.sh` (self-update swap/rollback/tamper-refusal via a file:// fake release). All isolate via the env vars and a throwaway config; CI runs all three on both OSes. `scripts/check-consistency.sh` gates release-metadata drift in CI.
+End-to-end smoke scripts live in `scripts/`: `dogfood.sh` (reconcile path, real daemon, synthetic tool), `migrate-dogfood.sh` (migrate → undo round-trip), `rekey-dogfood.sh` (re-key → undo byte-identity, then the REAL daemon against real git/move events), and `update-dogfood.sh` (self-update swap/rollback/tamper-refusal via a file:// fake release). All isolate via the env vars and a throwaway config; CI runs all four on both OSes. **Unit tests are not enough for the daemon path**: every daemon defect found so far passed its unit tests and was caught only by running the real daemon. `scripts/check-consistency.sh` gates release-metadata drift in CI.
 
 ## CI/CD
 
@@ -133,7 +141,8 @@ Tags follow `v0.1.0` format. Pushing a tag triggers: build → GitHub release �
 ```
 src/                    # Library + binary source (cli, daemon, watcher, detector,
                         #   reconciler, registry, event_log, tools/, health,
-                        #   inventory, migrate, sessions, fleet, rekey, activity, update, config, error,
+                        #   inventory, migrate, sessions, fleet, rekey, activity, known, service,
+#   update, config, error,
                         #   main, lib)
 tests/
   cli_smoke.rs          # Basic CLI invocation tests
@@ -143,7 +152,7 @@ examples/
 scripts/
   dogfood.sh            # E2E reconcile smoke test
   migrate-dogfood.sh    # E2E migrate → undo smoke test
-  rekey-dogfood.sh      # E2E store re-key -> undo smoke test (byte-identity)
+  rekey-dogfood.sh      # E2E re-key -> undo (byte-identity) + REAL DAEMON: git noise ignored, project & folder moves re-keyed
   update-dogfood.sh     # E2E self-update smoke test (offline fake release)
   check-consistency.sh  # release-metadata consistency gate (runs in CI)
 docs/

@@ -12,7 +12,7 @@
 [![Platform: macOS | Linux](https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg)]()
 [![Conventional Commits](https://img.shields.io/badge/commits-Conventional-FE5196.svg?logo=conventionalcommits)](https://conventionalcommits.org)
 
-> **Status: v0.10.0** — v0.10 adds **local observability**: SessionGuard can now tell you whether it is actually *doing* anything. Store re-keying was broken for months because a reconcile that did nothing returned `success: true` — "worked" and "did nothing" were the same value. An `Outcome` type makes that shape unconstructible, an activity log records every decision *including the decisions to do nothing*, and `sessionguard status --deep` reports a daemon that is running but has never changed anything as **inert**. All local — nothing leaves your machine. v0.9 shipped **store re-keying** so sessions follow a moved project (`sessionguard rekey`, plus the daemon automatically); v0.8 made session storage **data, not code** and added the per-project census plus fleet-wide read-only visibility over ssh. v0.4 shipped **Migrate**; v0.5 added checksum-verified **self-update**; v0.5.2–v0.6.x closed a full hardening audit. A read-only local dashboard (`tools/dashboard/`) surfaces what the daemon sees. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
+> **Status: v0.11.0** — v0.11 makes SessionGuard safe to actually run. An audit found it had never reconciled a real session on the author's own machines: there was no way to autostart it on macOS, `init` proposed watching all of `/Users`, and the daemon treated every file rename — every git commit, editor save and build — as a project move, spending ~1.2 s and ~3.9 GB per event. Now `init` picks the folders your projects live in, `sessionguard service install` runs the daemon at login on macOS and Linux, the daemon acts only on directories that are (or contain) projects it knows — including whole folders of them — and planning a re-key reads bounded memory. v0.10 added **local observability** (`status --deep`, `log --activity`) so you can see whether it is doing anything; v0.9 shipped **store re-keying** so sessions follow a moved project; v0.8 made session storage **data, not code**. v0.4 shipped **Migrate**; v0.5 **self-update**. Still alpha — use it, report issues. See [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -36,7 +36,7 @@ SessionGuard is a lightweight filesystem daemon that:
 - **Detects** AI tool session files across all major coding assistants
 - **Reconciles** broken paths, symlinks, and internal references when projects move
 - **Preserves** your accumulated AI context so you never start from zero
-- **Stays out of your way** — zero config for common setups, runs quietly in the background
+- **Stays out of your way** — two commands to set up (`init`, then `service install`), then it runs quietly in the background and ignores the churn of normal work (editor saves, git, builds)
 
 ## Supported Tools
 
@@ -129,14 +129,22 @@ cd sessionguard
 cargo install --path .
 ```
 
-### Linux autostart (systemd)
+### Set it up (macOS and Linux)
 
 ```bash
-mkdir -p ~/.config/systemd/user
-curl -fsSL https://raw.githubusercontent.com/PilotDevo/sessionguard/main/contrib/sessionguard.service \
-    -o ~/.config/systemd/user/sessionguard.service
-systemctl --user enable --now sessionguard
+sessionguard init --dry-run      # preview: which folders it will watch
+sessionguard init                # write them to the config
+sessionguard service install     # run the daemon now and at every login
+sessionguard status --deep       # confirm it is running AND doing its job
 ```
+
+`init` watches the top-level folders under your home where your projects live
+(for example `~/Droco`), found from AI-tool files *and* from your assistants'
+session history — never your whole home directory. `service install` writes a
+launchd agent on macOS or a systemd user unit on Linux, pointing at the binary
+you ran it with, and works the same whether you installed with Homebrew,
+`cargo install`, or `install.sh`. Without it, `sessionguard start` runs only
+until you log out. `sessionguard service uninstall` removes it.
 
 ### Basic usage
 
@@ -145,7 +153,11 @@ systemctl --user enable --now sessionguard
 sessionguard init                        # scan ~ for projects, write watch_roots
 sessionguard init --dry-run              # preview without writing config
 
-# Start the daemon (backgrounds by default; logs to <data-dir>/daemon.log)
+# Run the daemon at every login (launchd on macOS, systemd on Linux)
+sessionguard service install
+sessionguard service status              # installed? loaded? running?
+
+# Or start it just for this session (backgrounds; logs to <data-dir>/daemon.log)
 sessionguard start
 sessionguard start --foreground          # run attached instead
 sessionguard logs --follow               # tail the daemon log
@@ -256,10 +268,21 @@ Notes on what it will and won't do:
 - **Stores are independent.** A refusal on one tool is reported and the others
   still proceed; re-keying two of three beats re-keying none. A failure
   partway through one store rolls *that store* back, so none is left half-done.
+- **Folders carry their projects.** Moving a folder moves every project in
+  it, and so does re-keying one: `sessionguard rekey ~/junk/rndm
+  ~/junk/legal` re-keys each project that was under `~/junk/rndm`, as a single
+  undo. The daemon does the same when you move a folder while it's watching.
 - **Only the key moves.** Path references inside message bodies (a file you
   edited at the old path) are left alone — they are a record of what happened,
-  not a key. Matching is whole-token, so `/work/app` never rewrites inside
-  `/work/app-two`.
+  not a key. Sessions belonging to *other* projects are never touched, even if
+  they mention the moved path. Matching is whole-token, so `/work/app` never
+  rewrites inside `/work/app-two`.
+- **History follows; per-project tool settings don't (yet).** Claude Code keeps
+  per-project trust, approved tools and MCP servers in `~/.claude.json`, and
+  Codex keeps trust levels in `~/.codex/config.toml` — both keyed by the
+  project's path, and neither is re-keyed. After a move your session history
+  is there, but the tool may ask you to trust the folder again and per-project
+  MCP servers need re-adding.
 - **It is reversible.** Every re-key is recorded; `sessionguard undo` (or
   `undo --rekey <id>`) reverses it. A re-key → undo round trip on a real 27 MB
   Claude Code transcript leaves the store byte-for-byte as it was.

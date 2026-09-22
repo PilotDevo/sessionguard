@@ -468,7 +468,7 @@ const HINT_BYTES: u64 = 512 * 1024;
 /// A `jsonl_field` store keys on its FIRST line (Codex `session_meta`); the
 /// read is bounded so a pathological first line cannot buffer a whole
 /// transcript into memory.
-const FIRST_LINE_BYTES: u64 = 64 * 1024;
+pub(crate) const FIRST_LINE_BYTES: u64 = 64 * 1024;
 
 /// `encoded_dir` layout: one subdir per project under `base`; each file
 /// inside is session state (transcripts, todos, …). With a key hint, the
@@ -690,7 +690,7 @@ pub fn walk_store_files(
 /// `max_bytes` in total — for the first JSON object carrying one of `fields`
 /// (each optionally dotted, tried in order per line) as a string. Lines that
 /// are not JSON objects (or were cut by the byte budget) are skipped.
-fn jsonl_find_field(
+pub(crate) fn jsonl_find_field(
     path: &Path,
     fields: &[&str],
     max_lines: usize,

@@ -6,7 +6,7 @@
 use anyhow::{Context, Result};
 use clap::Parser;
 use clap_complete::generate;
-use sessionguard::cli::{Cli, Command, ConfigAction, SimulateAction};
+use sessionguard::cli::{Cli, Command, ConfigAction, ServiceAction, SimulateAction};
 use sessionguard::config::Config;
 use sessionguard::detector;
 use sessionguard::event_log::EventLog;
@@ -72,6 +72,14 @@ async fn main() -> Result<()> {
                         let rc = unsafe { libc::kill(pid as i32, libc::SIGTERM) };
                         if rc == 0 {
                             println!("sent stop signal to daemon (PID {pid})");
+                            if let Some(home) = sessionguard::config::home_dir() {
+                                if sessionguard::service::is_installed(&home) == Some(true) {
+                                    println!(
+                                        "note: installed as a login service, so it starts again at \
+                                         your next login (`sessionguard service uninstall` removes it)."
+                                    );
+                                }
+                            }
                         } else {
                             // Don't claim success we didn't have (EPERM etc.).
                             let err = std::io::Error::last_os_error();
@@ -203,8 +211,9 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 println!("scanning: {} (depth {depth})", root.display());
+                let home = sessionguard::config::home_dir();
                 let (projects, truncated) =
-                    detector::walk_for_projects(root, depth, &tool_registry);
+                    detector::walk_for_projects(root, depth, &tool_registry, home.as_deref());
                 for project in projects {
                     // Canonicalize so registered paths match what the daemon
                     // sees from filesystem events (macOS `/var` → `/private/var`).
@@ -242,30 +251,57 @@ async fn main() -> Result<()> {
                 "scanning {} for AI-tool projects (depth {depth})...",
                 home.display()
             );
-            let (projects, truncated) = detector::walk_for_projects(&home, depth, &tool_registry);
+            let (projects, truncated) =
+                detector::walk_for_projects(&home, depth, &tool_registry, Some(&home));
             if truncated {
                 eprintln!("note: scan hit the directory cap; results may be partial.");
             }
-            if projects.is_empty() {
+
+            // Plus every project your assistants actually have sessions for:
+            // the census knows where you work even when a folder carries no
+            // marker file, and a watch root that misses it misses its moves.
+            let env = |var: &str| std::env::var(var).ok();
+            let stores = sessionguard::sessions::resolve_stores(tool_registry.all(), Some(&env));
+            let mut candidates = projects.clone();
+            for g in sessionguard::sessions::census(&home, &stores, false) {
+                if g.confidence == sessionguard::sessions::DecodeConfidence::Unresolved {
+                    continue;
+                }
+                let p = std::path::PathBuf::from(&g.project_path);
+                if p.is_dir() {
+                    candidates.push(p);
+                }
+            }
+            if candidates.is_empty() {
                 println!("no AI-tool projects found under {}.", home.display());
                 println!("you can still track any project directly: `sessionguard watch <path>`.");
                 return Ok(());
             }
 
-            // watch_roots = the unique parent directories that contain projects.
-            let mut roots: Vec<std::path::PathBuf> = projects
-                .iter()
-                .filter_map(|p| p.parent().map(|x| x.to_path_buf()))
-                .collect();
-            roots.sort();
-            roots.dedup();
+            // The top-level folders under home that hold them — never home
+            // itself or anything above it (see `detector::watch_roots_for`).
+            let roots = detector::watch_roots_for(&candidates, &home);
+            if roots.is_empty() {
+                println!(
+                    "found {} project(s), but none in a folder that is safe to watch \
+                     recursively (only home itself, hidden folders or ~/Library).",
+                    candidates.len()
+                );
+                println!("track projects directly instead: `sessionguard watch <path>`.");
+                return Ok(());
+            }
+            candidates.sort();
+            candidates.dedup();
             println!(
-                "found {} project(s) across {} root(s):",
+                "found {} project(s) ({} with AI-tool files, the rest from your session \
+                 history) across {} watch root(s):",
+                candidates.len(),
                 projects.len(),
                 roots.len()
             );
             for r in &roots {
-                println!("  {}", r.display());
+                let n = candidates.iter().filter(|c| c.starts_with(r)).count();
+                println!("  {}  ({n} project(s))", r.display());
             }
 
             // Merge discovered roots into the config (preserving existing ones).
@@ -296,9 +332,13 @@ async fn main() -> Result<()> {
             std::fs::write(&target, toml)
                 .with_context(|| format!("failed to write config to {}", target.display()))?;
             println!(
-                "\nwrote {} watch root(s) to {}. start the daemon with `sessionguard start`.",
+                "\nwrote {} watch root(s) to {}.",
                 new_config.watch_roots.len(),
                 target.display()
+            );
+            println!(
+                "next: `sessionguard service install` runs the daemon now and at every login \
+                 (`sessionguard start` runs it only until you log out)."
             );
         }
 
@@ -1328,6 +1368,157 @@ async fn main() -> Result<()> {
             }
         }
 
+        Command::Service { action } => {
+            use sessionguard::service::{looks_like_dev_build, Manager};
+            let Some(manager) = Manager::current() else {
+                anyhow::bail!(
+                    "login services are supported on macOS (launchd) and Linux (systemd)"
+                );
+            };
+            let home = sessionguard::config::home_dir()
+                .ok_or_else(|| anyhow::anyhow!("cannot determine your home directory"))?;
+            let unit = manager.unit_path(&home);
+            #[cfg(unix)]
+            let uid = unsafe { libc::getuid() };
+            #[cfg(not(unix))]
+            let uid = 0u32;
+            let shown = |p: &std::path::Path| {
+                p.display()
+                    .to_string()
+                    .replace(&home.display().to_string(), "~")
+            };
+
+            match action {
+                ServiceAction::Install {
+                    dry_run,
+                    allow_dev_build,
+                } => {
+                    let exe_canonical = std::env::current_exe()
+                        .and_then(|e| e.canonicalize())
+                        .context("cannot locate this binary")?;
+                    let exe = sessionguard::service::stable_exe_path(
+                        &exe_canonical,
+                        std::env::var_os("PATH").as_deref(),
+                    );
+                    if looks_like_dev_build(&exe_canonical) && !allow_dev_build {
+                        anyhow::bail!(
+                            "{} is a development build inside a Cargo target/ directory; a login \
+                             service pointing at it breaks on the next `cargo clean`. Install the \
+                             binary first (`cargo install --path .`, Homebrew, or install.sh) and \
+                             run `service install` from there, or pass --allow-dev-build.",
+                            exe.display()
+                        );
+                    }
+                    let log = Config::data_dir().join("daemon.log");
+                    let contents = manager.render(&exe, &log, cli.config.as_deref());
+                    let commands = manager.install_commands(&unit, uid);
+                    if dry_run {
+                        println!("would write {}:\n", shown(&unit));
+                        println!("{contents}");
+                        println!("then run:");
+                        for c in &commands {
+                            println!("  {}", c.join(" "));
+                        }
+                        println!("\n--dry-run: nothing changed.");
+                        return Ok(());
+                    }
+
+                    // A daemon started by hand would hold the PID file, and the
+                    // service's copy would fail and be retried forever.
+                    if stop_running_daemon()? {
+                        println!(
+                            "stopped the daemon you had started by hand; the service takes over."
+                        );
+                    }
+                    if let Some(parent) = unit.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if let Some(parent) = log.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    std::fs::write(&unit, &contents)
+                        .with_context(|| format!("cannot write {}", unit.display()))?;
+                    for (i, c) in commands.iter().enumerate() {
+                        // launchd's first command unloads a previous copy; it
+                        // fails harmlessly when nothing was loaded.
+                        let may_fail = manager == Manager::Launchd && i == 0;
+                        run_service_command(c, may_fail)?;
+                    }
+                    let mut up = false;
+                    for _ in 0..50 {
+                        if sessionguard::daemon::is_running() {
+                            up = true;
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    println!("installed {}", shown(&unit));
+                    if up {
+                        let pid = sessionguard::daemon::read_pid()?.unwrap_or(0);
+                        println!("daemon running (PID {pid}); it will start at every login.");
+                        println!("check it is doing its job with `sessionguard status --deep`.");
+                    } else {
+                        anyhow::bail!(
+                            "the service is installed but the daemon did not start within 5s — \
+                             see `sessionguard logs`"
+                        );
+                    }
+                }
+                ServiceAction::Uninstall { dry_run } => {
+                    let commands = manager.uninstall_commands(uid);
+                    if dry_run {
+                        println!("would run:");
+                        for c in &commands {
+                            println!("  {}", c.join(" "));
+                        }
+                        println!("and remove {}\n\n--dry-run: nothing changed.", shown(&unit));
+                        return Ok(());
+                    }
+                    if !unit.exists() {
+                        println!("no login service installed ({} not found).", shown(&unit));
+                        return Ok(());
+                    }
+                    for c in &commands {
+                        run_service_command(c, true)?;
+                    }
+                    std::fs::remove_file(&unit)
+                        .with_context(|| format!("cannot remove {}", unit.display()))?;
+                    println!(
+                        "removed {}; the daemon will no longer start at login.",
+                        shown(&unit)
+                    );
+                }
+                ServiceAction::Status => {
+                    let installed = unit.is_file();
+                    let check = manager.loaded_check(uid);
+                    let loaded = installed
+                        && std::process::Command::new(&check[0])
+                            .args(&check[1..])
+                            .output()
+                            .map(|o| o.status.success())
+                            .unwrap_or(false);
+                    let running = sessionguard::daemon::is_running();
+                    println!(
+                        "service ({}): {}",
+                        match manager {
+                            Manager::Launchd => "launchd",
+                            Manager::Systemd => "systemd --user",
+                        },
+                        shown(&unit)
+                    );
+                    println!("  installed: {}", if installed { "yes" } else { "no" });
+                    println!("  loaded:    {}", if loaded { "yes" } else { "no" });
+                    match (running, sessionguard::daemon::read_pid()?) {
+                        (true, Some(pid)) => println!("  daemon:    running (PID {pid})"),
+                        _ => println!("  daemon:    not running"),
+                    }
+                    if !installed {
+                        println!("\nthe daemon will not survive a logout or reboot — `sessionguard service install`.");
+                    }
+                }
+            }
+        }
+
         Command::Rekey {
             from,
             to,
@@ -1361,12 +1552,37 @@ async fn main() -> Result<()> {
                 );
             }
 
+            // A trailing slash would make `/work/app/` a different key than
+            // the `/work/app` every store records.
+            let from: std::path::PathBuf = from.components().collect();
+            let to: std::path::PathBuf = to.components().collect();
+
+            // Same rule as the daemon: re-key `from` itself AND every known
+            // project beneath it, so re-keying a moved FOLDER carries all of
+            // its projects — as one undo.
+            let registry = Registry::open_default()?;
+            let known = sessionguard::known::KnownProjects::build(&home, &tool_registry, &registry);
+            let mut pairs = known.pairs_for_move(&from, &to);
+            if pairs.is_empty() {
+                pairs.push((from.clone(), to.clone()));
+            } else if pairs.len() > 1 || pairs[0].0 != from {
+                println!(
+                    "{} project(s) under {} move with it:",
+                    pairs.len(),
+                    from.display()
+                );
+                for (old, new) in &pairs {
+                    println!("  {} -> {}", old.display(), new.display());
+                }
+                println!();
+            }
+
             let event_log = EventLog::open_default()?;
-            let reports = sessionguard::rekey::rekey_all(
+            let reports = sessionguard::rekey::rekey_pairs(
                 &home,
                 &stores,
-                &from,
-                &to,
+                (&from, &to),
+                &pairs,
                 Some(&event_log),
                 dry_run,
             );
@@ -1384,7 +1600,16 @@ async fn main() -> Result<()> {
                     continue;
                 }
                 planned += 1;
-                println!("{}: {} action(s)", r.tool, r.plan.actions.len());
+                if pairs.len() > 1 {
+                    println!(
+                        "{} [{}]: {} action(s)",
+                        r.tool,
+                        r.plan.new_path,
+                        r.plan.actions.len()
+                    );
+                } else {
+                    println!("{}: {} action(s)", r.tool, r.plan.actions.len());
+                }
                 for action in &r.plan.actions {
                     println!("  - {}", action.describe());
                 }
@@ -1660,6 +1885,44 @@ fn undo_one_rekey(
     }
     event_log.mark_rekey_undone(entry.id)?;
     println!("\nre-key {} undone", entry.id);
+    Ok(())
+}
+
+/// SIGTERM a running daemon and wait for it to exit. Returns whether one was
+/// running.
+fn stop_running_daemon() -> Result<bool> {
+    let Some(pid) = sessionguard::daemon::read_pid()? else {
+        return Ok(false);
+    };
+    if !sessionguard::daemon::is_running() {
+        return Ok(false);
+    }
+    #[cfg(unix)]
+    unsafe {
+        libc::kill(pid as i32, libc::SIGTERM);
+    }
+    for _ in 0..50 {
+        if !sessionguard::daemon::is_running() {
+            return Ok(true);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    anyhow::bail!("the running daemon (PID {pid}) did not stop within 5s")
+}
+
+/// Run one service-manager command, surfacing its own error text.
+fn run_service_command(cmd: &[String], may_fail: bool) -> Result<()> {
+    let out = std::process::Command::new(&cmd[0])
+        .args(&cmd[1..])
+        .output()
+        .with_context(|| format!("cannot run `{}`", cmd[0]))?;
+    if !out.status.success() && !may_fail {
+        anyhow::bail!(
+            "`{}` failed: {}",
+            cmd.join(" "),
+            String::from_utf8_lossy(&out.stderr).trim()
+        );
+    }
     Ok(())
 }
 

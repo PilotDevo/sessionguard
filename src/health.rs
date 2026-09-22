@@ -198,6 +198,10 @@ pub struct DaemonHealth {
     pub last_acted: Option<String>,
     /// Counts per outcome over the retained window.
     pub outcomes: Vec<(String, usize)>,
+    /// Whether a login service is installed (`None` on an unsupported
+    /// platform). Without one the daemon dies at logout — which is how it came
+    /// to have run for 49 seconds, ever, on the operator's own Mac.
+    pub service_installed: Option<bool>,
     /// Problems worth an operator's attention, in plain language.
     pub warnings: Vec<String>,
 }
@@ -242,6 +246,8 @@ impl DaemonHealth {
             last_activity,
             last_acted,
             outcomes,
+            service_installed: crate::config::home_dir()
+                .and_then(|h| crate::service::is_installed(&h)),
             warnings: Vec::new(),
         };
 
@@ -249,6 +255,13 @@ impl DaemonHealth {
             health.warnings.push(
                 "the daemon is not running — no moves are being reconciled. Start it with \
                  `sessionguard start`."
+                    .into(),
+            );
+        }
+        if health.service_installed == Some(false) {
+            health.warnings.push(
+                "not installed as a login service, so the daemon stops at logout or reboot and \
+                 moves after that go unnoticed. Run `sessionguard service install`."
                     .into(),
             );
         }
@@ -318,6 +331,7 @@ mod daemon_health_tests {
             last_activity: Some("2026-09-18 00:00:00".into()),
             last_acted: None,
             outcomes: vec![("noop".into(), 12)],
+            service_installed: Some(true),
             warnings: vec![],
         };
         assert!(h.is_inert(), "busy but achieving nothing is inert");

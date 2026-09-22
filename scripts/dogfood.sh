@@ -64,6 +64,11 @@ DATA_DIR="$WORKDIR/sg-data"
 CONFIG_FILE="$WORKDIR/config.toml"
 mkdir -p "$DATA_DIR"
 export SESSIONGUARD_DATA_DIR="$DATA_DIR"
+# Since v0.9 the daemon reads session stores under $HOME to decide what is a
+# project and to re-key them. Without this the smoke test read (and could have
+# re-keyed) the operator's REAL stores — it indexed 37 real projects on the
+# author's Mac before this line existed.
+export HOME="$WORKDIR"
 cat > "$CONFIG_FILE" <<EOF
 watch_roots = ["$WORKDIR"]
 watch_mode = "balanced"

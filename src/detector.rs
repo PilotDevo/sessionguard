@@ -39,10 +39,16 @@ pub fn detect_tools(project_root: &Path, registry: &ToolRegistry) -> Vec<Detecti
 /// dirs and other dot-directories, and stops after [`WALK_DIR_CAP`] directories.
 ///
 /// Returns whether the walk was truncated by the cap, plus the projects found.
+/// `home` is never itself counted as a project, nor is any directory above
+/// it: Claude Code creates `~/.claude/` (its GLOBAL config) on first run,
+/// which matches the `.claude/` project pattern — so through v0.10 every
+/// Claude Code user's home was "a project", the walk pruned there, and `init`
+/// proposed its parent, `/Users`, as a watch root.
 pub fn walk_for_projects(
     root: &Path,
     max_depth: usize,
     registry: &ToolRegistry,
+    home: Option<&Path>,
 ) -> (Vec<PathBuf>, bool) {
     let mut found = Vec::new();
     let mut stack = vec![(root.to_path_buf(), 0usize)];
@@ -53,7 +59,8 @@ pub fn walk_for_projects(
         if visited > WALK_DIR_CAP {
             return (found, true);
         }
-        if !detect_tools(&dir, registry).is_empty() {
+        let structural = home.is_some_and(|h| h.starts_with(&dir));
+        if !structural && !detect_tools(&dir, registry).is_empty() {
             found.push(dir);
             continue; // prune: don't descend into a detected project
         }
@@ -83,7 +90,66 @@ fn is_skippable_dir(p: &Path) -> bool {
     matches!(
         name,
         "node_modules" | "target" | "vendor" | "__pycache__" | "dist" | "build"
+            // macOS: app state, caches, mail — enormous and never a project.
+            | "Library"
     ) || name.starts_with('.')
+}
+
+/// Watch roots that cover `projects`: for a project under `home`, the
+/// top-level folder beneath home that holds it (`~/Droco` for
+/// `~/Droco/Silos/aiq`) — one recursive watch that also catches the
+/// reorganisations people actually do *within* such a folder. Never `home`
+/// itself (a recursive watch over a whole home spans caches, mail and browser
+/// profiles, and on Linux exhausts inotify), never hidden folders or
+/// `~/Library`, and never anything above home.
+///
+/// For a project outside home, its parent — unless that parent is a
+/// filesystem or mount-point root (`/`, `/Volumes`, `/mnt`, …), in which case
+/// the project itself. Roots nested inside another root are dropped.
+pub fn watch_roots_for(projects: &[PathBuf], home: &Path) -> Vec<PathBuf> {
+    use std::path::Component;
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for p in projects {
+        if home.starts_with(p) {
+            continue; // home itself, or above it
+        }
+        let root = match p.strip_prefix(home) {
+            Ok(rel) => match rel.components().next() {
+                Some(Component::Normal(first)) => {
+                    let name = first.to_string_lossy();
+                    if name.starts_with('.') || name == "Library" {
+                        continue;
+                    }
+                    home.join(first)
+                }
+                _ => continue,
+            },
+            Err(_) => match p.parent() {
+                Some(parent) if !is_mount_level(parent) => parent.to_path_buf(),
+                _ => p.clone(),
+            },
+        };
+        roots.push(root);
+    }
+    roots.sort();
+    roots.dedup();
+    let mut out: Vec<PathBuf> = Vec::new();
+    for r in roots {
+        if !out.iter().any(|o| r.starts_with(o)) {
+            out.push(r);
+        }
+    }
+    out
+}
+
+fn is_mount_level(p: &Path) -> bool {
+    p.parent().is_none()
+        || matches!(
+            p.to_str(),
+            Some(
+                "/Volumes" | "/mnt" | "/media" | "/Users" | "/home" | "/private" | "/tmp" | "/var"
+            )
+        )
 }
 
 /// Check one tool's patterns against a project directory.
@@ -152,7 +218,7 @@ mod tests {
         // A skippable dir (node_modules) containing a decoy artifact — ignored.
         std::fs::create_dir_all(root.path().join("node_modules/.claude")).unwrap();
 
-        let (found, truncated) = walk_for_projects(root.path(), 5, &reg);
+        let (found, truncated) = walk_for_projects(root.path(), 5, &reg, None);
         assert!(!truncated);
         assert_eq!(
             found,
@@ -161,7 +227,7 @@ mod tests {
         );
 
         // Too-shallow depth can't reach a project 3 levels down.
-        let (shallow, _) = walk_for_projects(root.path(), 1, &reg);
+        let (shallow, _) = walk_for_projects(root.path(), 1, &reg, None);
         assert!(
             shallow.is_empty(),
             "depth 1 shouldn't reach a depth-3 project"
@@ -187,5 +253,58 @@ mod tests {
         let registry = ToolRegistry::new().unwrap();
         let results = detect_tools(dir.path(), &registry);
         assert!(results.is_empty());
+    }
+
+    /// The v0.10 onboarding bug: `~/.claude/` (Claude Code's global config)
+    /// made $HOME a "project", so the walk stopped there and `init` proposed
+    /// watching `/Users`. Home must be walked INTO, never counted.
+    #[test]
+    fn home_is_walked_into_never_counted_as_a_project() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".claude")).unwrap();
+        std::fs::write(home.path().join("CLAUDE.md"), "global").unwrap();
+        let proj = home.path().join("Droco/Silos/aiq");
+        std::fs::create_dir_all(proj.join(".claude")).unwrap();
+        std::fs::create_dir_all(home.path().join("Library/Caches/huge/.claude")).unwrap();
+
+        let reg = ToolRegistry::new().unwrap();
+        let (found, _) = walk_for_projects(home.path(), 4, &reg, Some(home.path()));
+        assert_eq!(
+            found,
+            vec![proj.clone()],
+            "home is not a project; Library is skipped"
+        );
+
+        let roots = watch_roots_for(&found, home.path());
+        assert_eq!(roots, vec![home.path().join("Droco")]);
+    }
+
+    #[test]
+    fn watch_roots_never_include_home_or_above() {
+        let home = Path::new("/Users/me");
+        let projects: Vec<PathBuf> = [
+            "/Users/me",                 // sessions started in home
+            "/Users",                    // above home
+            "/Users/me/Droco",           // a workspace that is itself a project
+            "/Users/me/Droco/Silos/aiq", // nested under it → collapses into ~/Droco
+            "/Users/me/Desktop/scratch",
+            "/Users/me/.config/nvim", // hidden → never a watch root
+            "/Users/me/Library/Mobile Documents/x",
+            "/Volumes/Ext/work/app", // outside home → its parent
+            "/Volumes/Ext2",         // parent is a mount level → itself
+        ]
+        .map(PathBuf::from)
+        .to_vec();
+        assert_eq!(
+            watch_roots_for(&projects, home),
+            [
+                "/Users/me/Desktop",
+                "/Users/me/Droco",
+                "/Volumes/Ext/work",
+                "/Volumes/Ext2"
+            ]
+            .map(PathBuf::from)
+            .to_vec()
+        );
     }
 }

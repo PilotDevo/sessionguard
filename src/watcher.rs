@@ -62,7 +62,8 @@ pub enum SessionEvent {
 
 /// Filesystem watcher that emits session-relevant events.
 pub struct FsWatcher {
-    _watcher: RecommendedWatcher,
+    watcher: RecommendedWatcher,
+    watched: Vec<PathBuf>,
     pub events: mpsc::Receiver<SessionEvent>,
 }
 
@@ -82,7 +83,7 @@ impl FsWatcher {
         let buffer = Mutex::new(RenameBuffer::new(RENAME_PAIRING_TTL));
         let event_tx = tx.clone();
 
-        let mut watcher =
+        let watcher =
             notify::recommended_watcher(move |res: std::result::Result<Event, notify::Error>| {
                 match res {
                     Ok(event) => {
@@ -111,36 +112,80 @@ impl FsWatcher {
                 }
             })?;
 
-        for root in watch_roots {
-            if root.is_dir() {
-                info!(path = %root.display(), "watching directory");
-                watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
-                    // On Linux, recursive watches consume one inotify watch per
-                    // directory; a big tree exhausts the kernel budget and the
-                    // raw ENOSPC ("No space left on device") sends operators
-                    // chasing disk space. Name the real fix instead.
-                    if matches!(e.kind, notify::ErrorKind::Io(ref io) if io.raw_os_error() == Some(28))
-                    {
-                        notify::Error::generic(&format!(
-                            "ran out of inotify watches while watching {} — raise the limit: \
-                             `sudo sysctl fs.inotify.max_user_watches=524288`, or narrow \
-                             watch_roots",
-                            root.display()
-                        ))
-                    } else {
-                        e
-                    }
-                })?;
-            } else {
-                debug!(path = %root.display(), "skipping non-existent watch root");
+        let mut me = Self {
+            watcher,
+            watched: Vec::new(),
+            events: rx,
+        };
+        me.update_roots(watch_roots)?;
+        Ok(me)
+    }
+
+    /// Change which roots are watched, IN PLACE: the same underlying watcher
+    /// and the same event channel keep running throughout.
+    ///
+    /// The daemon used to reload by building a new `FsWatcher` and dropping
+    /// the old one, which dropped every event still queued in the old
+    /// channel. `sessionguard watch` sends that reload signal, so a project
+    /// moved right after being watched — exactly what `dogfood.sh` does — had
+    /// its move silently discarded. Adding and removing paths on one watcher
+    /// can't lose anything.
+    pub fn update_roots(&mut self, roots: &[PathBuf]) -> Result<()> {
+        for old in self.watched.clone() {
+            if !roots.contains(&old) {
+                let _ = self.watcher.unwatch(&old);
+                self.watched.retain(|w| w != &old);
             }
         }
-
-        Ok(Self {
-            _watcher: watcher,
-            events: rx,
-        })
+        let mut first_err = None;
+        for root in roots {
+            if self.watched.contains(root) {
+                continue;
+            }
+            if !root.is_dir() {
+                debug!(path = %root.display(), "skipping non-existent watch root");
+                continue;
+            }
+            match watch_one(&mut self.watcher, root) {
+                Ok(()) => {
+                    info!(path = %root.display(), "watching directory");
+                    self.watched.push(root.clone());
+                }
+                Err(e) => {
+                    warn!(path = %root.display(), error = %e, "could not watch directory");
+                    first_err.get_or_insert(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e.into()),
+            None => Ok(()),
+        }
     }
+
+    /// The roots currently being watched.
+    pub fn watched(&self) -> &[PathBuf] {
+        &self.watched
+    }
+}
+
+/// Watch one root recursively, naming the real fix when Linux runs out of
+/// inotify watches instead of surfacing a misleading "No space left on device".
+fn watch_one(watcher: &mut RecommendedWatcher, root: &std::path::Path) -> notify::Result<()> {
+    watcher.watch(root, RecursiveMode::Recursive).map_err(|e| {
+        // On Linux, recursive watches consume one inotify watch per
+        // directory; a big tree exhausts the kernel budget and the raw ENOSPC
+        // ("No space left on device") sends operators chasing disk space.
+        if matches!(e.kind, notify::ErrorKind::Io(ref io) if io.raw_os_error() == Some(28)) {
+            notify::Error::generic(&format!(
+                "ran out of inotify watches while watching {} — raise the limit: \
+                 `sudo sysctl fs.inotify.max_user_watches=524288`, or narrow watch_roots",
+                root.display()
+            ))
+        } else {
+            e
+        }
+    })
 }
 
 // ── Rename pairing ───────────────────────────────────────────────────────────
